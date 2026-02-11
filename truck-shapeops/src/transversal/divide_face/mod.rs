@@ -62,7 +62,12 @@ where
     let mut map = HashMap::default();
     loops.iter().try_for_each(|wire| {
         let poly = create_parameter_boundary(face, wire, &mut map, tol)?;
-        match poly.area() > 0.0 {
+        let area = poly.area();
+        // Skip degenerate loops with negligible area (coplanar artifacts)
+        if area.abs() < tol {
+            return Some(());
+        }
+        match area > 0.0 {
             true => pre_faces.push(vec![WireChunk { poly, wire }]),
             false => negative_wires.push(WireChunk { poly, wire }),
         }
@@ -70,12 +75,23 @@ where
     })?;
     negative_wires.into_iter().try_for_each(|chunk| {
         let pt = chunk.poly.front();
-        let op = pre_faces.iter_mut().find(|face| face[0].poly.include(pt))?;
-        op.push(chunk);
+        let idx = pre_faces.iter().position(|face| face[0].poly.include(pt));
+        if let Some(i) = idx {
+            let outer_area = pre_faces[i][0].poly.area();
+            let chunk_area = chunk.poly.area();
+            // When inner loop exactly matches outer boundary (areas cancel),
+            // the face is consumed by the intersection — remove it.
+            if (outer_area + chunk_area).abs() < tol {
+                pre_faces[i].clear();
+            } else {
+                pre_faces[i].push(chunk);
+            }
+        }
         Some(())
     })?;
     let vec: Vec<_> = pre_faces
         .into_iter()
+        .filter(|pre_face| !pre_face.is_empty())
         .map(|pre_face| {
             let surface = face.surface();
             let op = pre_face
@@ -89,12 +105,17 @@ where
                 .into_iter()
                 .map(|chunk| chunk.wire.deref().clone())
                 .collect();
-            let mut new_face = Face::debug_new(wires, surface);
-            if !face.orientation() {
-                new_face.invert();
+            match Face::try_new(wires, surface) {
+                Ok(mut new_face) => {
+                    if !face.orientation() {
+                        new_face.invert();
+                    }
+                    Some((new_face, status))
+                }
+                Err(_) => None, // Skip faces with degenerate wires
             }
-            (new_face, status)
         })
+        .flatten()
         .collect();
     Some(vec)
 }

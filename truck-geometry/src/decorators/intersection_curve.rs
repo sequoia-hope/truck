@@ -30,9 +30,24 @@ where
             let n0 = surface0.normal(uv0.0, uv0.1);
             let n1 = surface1.normal(uv1.0, uv1.1);
             let mat = Matrix3::from_cols(n0, n1, normal).transpose();
-            let inv = mat.invert()?;
-            let pt = inv * Vector3::new(pt0.dot(n0), pt1.dot(n1), point.dot(normal));
-            point = Point3::from_vec(pt);
+            match mat.invert() {
+                Some(inv) => {
+                    let pt =
+                        inv * Vector3::new(pt0.dot(n0), pt1.dot(n1), point.dot(normal));
+                    point = Point3::from_vec(pt);
+                }
+                None => {
+                    // Jacobian singular — check for coplanarity.
+                    // When surfaces are coplanar, normals are parallel and points coincide,
+                    // so the initial parameter guess is already valid.
+                    if pt0.near(&pt1) && n0.cross(n1).magnitude() < TOLERANCE {
+                        let mid = pt0.midpoint(pt1);
+                        return Some((mid, Point2::from(uv0), Point2::from(uv1)));
+                    } else {
+                        return None;
+                    }
+                }
+            }
         }
     }
     #[cfg(all(test, debug_assertions))]
