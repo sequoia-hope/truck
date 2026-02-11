@@ -387,9 +387,11 @@ impl<P: ControlPoint<f64>> ParametricCurve for BSplineCurve<P> {
     }
     #[inline(always)]
     fn parameter_range(&self) -> ParameterRange {
+        let degree = self.degree();
+        let n_cv = self.control_points.len();
         (
-            Bound::Included(self.knot_vec[0]),
-            Bound::Included(self.knot_vec[self.knot_vec.len() - 1]),
+            Bound::Included(self.knot_vec[degree]),
+            Bound::Included(self.knot_vec[n_cv]),
         )
     }
 }
@@ -1497,4 +1499,40 @@ fn cubic_bezier_interpolation_test() {
     assert_near!(bspcurve.back(), pt1);
     assert_near!(der.front(), der0);
     assert_near!(der.back(), der1);
+}
+
+#[test]
+fn parameter_range_non_clamped_knots() {
+    // Non-clamped knot vector with degree 2 and 4 control points.
+    // knots = n_cv + degree + 1 = 4 + 2 + 1 = 7 knots.
+    // The valid parameter domain is [knot[degree], knot[n_cv]] = [2.0, 4.0].
+    let knot_vec = KnotVec::from(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let ctrl_pts = vec![
+        Point2::new(0.0, 0.0),
+        Point2::new(1.0, 1.0),
+        Point2::new(2.0, 0.0),
+        Point2::new(3.0, 1.0),
+    ];
+    let bspcurve = BSplineCurve::new(knot_vec, ctrl_pts);
+    assert_eq!(bspcurve.degree(), 2);
+    let range = bspcurve.parameter_range();
+    // Should be [knot[2], knot[4]] = [2.0, 4.0], NOT [0.0, 6.0]
+    assert_eq!(range, (Bound::Included(2.0), Bound::Included(4.0)));
+}
+
+#[test]
+fn parameter_range_clamped_knots_unchanged() {
+    // Clamped knot vector: the fix should not change behavior for clamped knots.
+    let knot_vec = KnotVec::uniform_knot(2, 3);
+    // uniform_knot(2, 3) = [0,0,0, 1/3, 2/3, 1,1,1] — 8 knots, 5 control points, degree 2
+    let ctrl_pts = vec![
+        Point2::new(0.0, 0.0),
+        Point2::new(0.5, 1.0),
+        Point2::new(1.0, 1.0),
+        Point2::new(1.5, 0.5),
+        Point2::new(2.0, 0.0),
+    ];
+    let bspcurve = BSplineCurve::new(knot_vec, ctrl_pts);
+    let range = bspcurve.parameter_range();
+    assert_eq!(range, (Bound::Included(0.0), Bound::Included(1.0)));
 }

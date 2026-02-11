@@ -159,6 +159,11 @@ fn collide_seg_triangle(seg: [Point3; 2], tri: [Point3; 3]) -> Option<Point3> {
     if dotapnor * dotaqnor > 0.0 {
         return None;
     }
+    // Coplanar case: both endpoints lie in (or very near) the triangle plane.
+    // No single crossing point exists, return None to avoid 0.0/0.0 = NaN.
+    if dotapnor.abs() < TOLERANCE2 && dotaqnor.abs() < TOLERANCE2 {
+        return None;
+    }
     let h = seg[0] + dotapnor / (dotapnor - dotaqnor) * (seg[1] - seg[0]);
     if f64::signum(ab.cross(nor).dot(h - tri[0]) + TOLERANCE2)
         + f64::signum(bc.cross(nor).dot(h - tri[1]) + TOLERANCE2)
@@ -272,4 +277,19 @@ fn collide_triangles_test() {
         Point3::new(1.0, 1.0, 1.0),
     ];
     assert!(collide_triangles(tri0, tri1).is_none());
+}
+
+#[test]
+fn collide_seg_triangle_coplanar_no_nan() {
+    // Regression test: segment lying in the triangle plane caused 0.0/0.0 = NaN.
+    let tri = [
+        Point3::origin(),
+        Point3::new(1.0, 0.0, 0.0),
+        Point3::new(0.0, 1.0, 0.0),
+    ];
+    // Segment fully in the z=0 plane (coplanar with triangle)
+    let seg = [Point3::new(0.1, 0.1, 0.0), Point3::new(0.2, 0.2, 0.0)];
+    let result = collide_seg_triangle(seg, tri);
+    // Coplanar segment has no single crossing point — should return None, not NaN
+    assert!(result.is_none());
 }

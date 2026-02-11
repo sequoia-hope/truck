@@ -234,7 +234,19 @@ impl IncludeCurve<Curve> for Surface {
                 Curve::IntersectionCurve(_) => unimplemented!(),
             },
             Surface::RevolutedCurve(surface) => match surface.entity_curve() {
-                Curve::Line(curve) => self.include(&Curve::BSplineCurve(curve.to_bspline())),
+                Curve::Line(entity_curve) => {
+                    let surface = RevolutedCurve::by_revolution(
+                        entity_curve.to_bspline(),
+                        surface.origin(),
+                        surface.axis(),
+                    );
+                    match curve {
+                        Curve::Line(curve) => surface.include(&curve.to_bspline()),
+                        Curve::BSplineCurve(curve) => surface.include(curve),
+                        Curve::NurbsCurve(curve) => surface.include(curve),
+                        Curve::IntersectionCurve(_) => unimplemented!(),
+                    }
+                }
                 Curve::BSplineCurve(entity_curve) => {
                     let surface = RevolutedCurve::by_revolution(
                         entity_curve,
@@ -264,6 +276,29 @@ impl IncludeCurve<Curve> for Surface {
                 Curve::IntersectionCurve(_) => unimplemented!(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn include_curve_revoluted_line_no_stack_overflow() {
+        // Regression test for issue #75: RevolutedCurve<Line> caused infinite
+        // recursion in IncludeCurve::include because the Line branch called
+        // self.include() instead of unwrapping the surface.
+        let line = Line(Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 0.0, 1.0));
+        let origin = Point3::origin();
+        let axis = Vector3::unit_z();
+        let entity_curve = Curve::Line(line.clone());
+        let revolved = RevolutedCurve::by_revolution(entity_curve, origin, axis);
+        let surface = Surface::RevolutedCurve(Processor::new(revolved));
+
+        // A line on the revolved surface (at angle=0)
+        let test_curve = Curve::Line(line);
+        // This would stack overflow before the fix
+        let _ = surface.include(&test_curve);
     }
 }
 
