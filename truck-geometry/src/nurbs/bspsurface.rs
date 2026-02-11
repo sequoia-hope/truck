@@ -1,7 +1,15 @@
 use super::*;
 use crate::errors::Error;
+use std::cell::RefCell;
 use std::iter::FusedIterator;
 use std::ops::*;
+
+// Thread-local buffers to avoid heap allocation in hot BSplineSurface evaluation paths.
+// Each surface evaluation needs two basis vectors (u and v) alive simultaneously.
+thread_local! {
+    static UBASIS_BUF: RefCell<Vec<f64>> = RefCell::new(Vec::new());
+    static VBASIS_BUF: RefCell<Vec<f64>> = RefCell::new(Vec::new());
+}
 
 impl<P> BSplineSurface<P> {
     /// constructor.
@@ -592,13 +600,19 @@ impl<P: ControlPoint<f64>> ParametricSurface for BSplineSurface<P> {
             knot_vecs: (ref uknot_vec, ref vknot_vec),
             ref control_points,
         } = self;
-        let basis0 = uknot_vec.bspline_basis_functions(degree0, u);
-        let basis1 = vknot_vec.bspline_basis_functions(degree1, v);
-        let closure = move |sum: P, (vec, b0): (&Vec<P>, f64)| {
-            let closure = move |sum: P, (pt, b1): (&P, &f64)| sum + pt.to_vec() * (b0 * b1);
-            vec.iter().zip(&basis1).fold(sum, closure)
-        };
-        control_points.iter().zip(basis0).fold(P::origin(), closure)
+        UBASIS_BUF.with(|ub| {
+            VBASIS_BUF.with(|vb| {
+                let mut basis0 = ub.borrow_mut();
+                let mut basis1 = vb.borrow_mut();
+                uknot_vec.bspline_basis_functions_into(degree0, u, &mut basis0);
+                vknot_vec.bspline_basis_functions_into(degree1, v, &mut basis1);
+                let closure = |sum: P, (vec, &b0): (&Vec<P>, &f64)| {
+                    let closure = |sum: P, (pt, &b1): (&P, &f64)| sum + pt.to_vec() * (b0 * b1);
+                    vec.iter().zip(basis1.iter()).fold(sum, closure)
+                };
+                control_points.iter().zip(basis0.iter()).fold(P::origin(), closure)
+            })
+        })
     }
     /// Substitutes derived B-spline surface by the first parameter `u`.
     /// # Examples
@@ -628,20 +642,26 @@ impl<P: ControlPoint<f64>> ParametricSurface for BSplineSurface<P> {
     fn uder(&self, u: f64, v: f64) -> P::Diff {
         let (degree0, degree1) = self.degrees();
         let (uknot_vec, vknot_vec) = self.knot_vecs();
-        let basis0 = uknot_vec.bspline_basis_functions(degree0 - 1, u);
-        let basis1 = vknot_vec.bspline_basis_functions(degree1, v);
-        let closure = move |sum: P::Diff, (i, b0): (usize, f64)| {
-            let coef = inv_or_zero(uknot_vec[i + degree0] - uknot_vec[i]);
-            let closure = |sum: P::Diff, (j, b1): (usize, &f64)| {
-                sum + self.udelta_control_points(i, j) * coef * b0 * *b1
-            };
-            basis1.iter().enumerate().fold(sum, closure)
-        };
-        basis0
-            .into_iter()
-            .enumerate()
-            .fold(P::Diff::zero(), closure)
-            * degree0 as f64
+        UBASIS_BUF.with(|ub| {
+            VBASIS_BUF.with(|vb| {
+                let mut basis0 = ub.borrow_mut();
+                let mut basis1 = vb.borrow_mut();
+                uknot_vec.bspline_basis_functions_into(degree0 - 1, u, &mut basis0);
+                vknot_vec.bspline_basis_functions_into(degree1, v, &mut basis1);
+                let closure = |sum: P::Diff, (i, &b0): (usize, &f64)| {
+                    let coef = inv_or_zero(uknot_vec[i + degree0] - uknot_vec[i]);
+                    let closure = |sum: P::Diff, (j, &b1): (usize, &f64)| {
+                        sum + self.udelta_control_points(i, j) * coef * b0 * b1
+                    };
+                    basis1.iter().enumerate().fold(sum, closure)
+                };
+                basis0
+                    .iter()
+                    .enumerate()
+                    .fold(P::Diff::zero(), closure)
+                    * degree0 as f64
+            })
+        })
     }
     /// Substitutes derived B-spline surface by the first parameter `v`.
     /// # Examples
@@ -671,20 +691,26 @@ impl<P: ControlPoint<f64>> ParametricSurface for BSplineSurface<P> {
     fn vder(&self, u: f64, v: f64) -> P::Diff {
         let (degree0, degree1) = self.degrees();
         let (uknot_vec, vknot_vec) = self.knot_vecs();
-        let basis0 = uknot_vec.bspline_basis_functions(degree0, u);
-        let basis1 = vknot_vec.bspline_basis_functions(degree1 - 1, v);
-        let closure = move |sum: P::Diff, (i, b0): (usize, f64)| {
-            let coef = inv_or_zero(vknot_vec[i + degree1] - vknot_vec[i]);
-            let closure = |sum: P::Diff, (j, b1): (usize, &f64)| {
-                sum + self.vdelta_control_points(j, i) * coef * b0 * *b1
-            };
-            basis0.iter().enumerate().fold(sum, closure)
-        };
-        basis1
-            .into_iter()
-            .enumerate()
-            .fold(P::Diff::zero(), closure)
-            * degree1 as f64
+        UBASIS_BUF.with(|ub| {
+            VBASIS_BUF.with(|vb| {
+                let mut basis0 = ub.borrow_mut();
+                let mut basis1 = vb.borrow_mut();
+                uknot_vec.bspline_basis_functions_into(degree0, u, &mut basis0);
+                vknot_vec.bspline_basis_functions_into(degree1 - 1, v, &mut basis1);
+                let closure = |sum: P::Diff, (i, &b0): (usize, &f64)| {
+                    let coef = inv_or_zero(vknot_vec[i + degree1] - vknot_vec[i]);
+                    let closure = |sum: P::Diff, (j, &b1): (usize, &f64)| {
+                        sum + self.vdelta_control_points(j, i) * coef * b0 * b1
+                    };
+                    basis0.iter().enumerate().fold(sum, closure)
+                };
+                basis1
+                    .iter()
+                    .enumerate()
+                    .fold(P::Diff::zero(), closure)
+                    * degree1 as f64
+            })
+        })
     }
 
     /// Substitutes 2nd-ord derived B-spline surface by the first parameter `u`.
@@ -720,20 +746,26 @@ impl<P: ControlPoint<f64>> ParametricSurface for BSplineSurface<P> {
             return P::Diff::zero();
         }
         let (uknot_vec, vknot_vec) = self.knot_vecs();
-        let basis0 = uknot_vec.bspline_basis_functions(degree0 - 2, u);
-        let basis1 = vknot_vec.bspline_basis_functions(degree1, v);
-        let closure = move |sum: P::Diff, (i, b0): (usize, f64)| {
-            let coef = inv_or_zero(uknot_vec[i + degree0 - 1] - uknot_vec[i]);
-            let closure = |sum: P::Diff, (j, b1): (usize, &f64)| {
-                sum + self.udelta2_control_points(i, j) * coef * b0 * *b1
-            };
-            basis1.iter().enumerate().fold(sum, closure)
-        };
-        basis0
-            .into_iter()
-            .enumerate()
-            .fold(P::Diff::zero(), closure)
-            * degree0 as f64
+        UBASIS_BUF.with(|ub| {
+            VBASIS_BUF.with(|vb| {
+                let mut basis0 = ub.borrow_mut();
+                let mut basis1 = vb.borrow_mut();
+                uknot_vec.bspline_basis_functions_into(degree0 - 2, u, &mut basis0);
+                vknot_vec.bspline_basis_functions_into(degree1, v, &mut basis1);
+                let closure = |sum: P::Diff, (i, &b0): (usize, &f64)| {
+                    let coef = inv_or_zero(uknot_vec[i + degree0 - 1] - uknot_vec[i]);
+                    let closure = |sum: P::Diff, (j, &b1): (usize, &f64)| {
+                        sum + self.udelta2_control_points(i, j) * coef * b0 * b1
+                    };
+                    basis1.iter().enumerate().fold(sum, closure)
+                };
+                basis0
+                    .iter()
+                    .enumerate()
+                    .fold(P::Diff::zero(), closure)
+                    * degree0 as f64
+            })
+        })
     }
 
     /// Substitutes 2nd-ord derived B-spline surface by the second parameter `v`.
@@ -769,20 +801,26 @@ impl<P: ControlPoint<f64>> ParametricSurface for BSplineSurface<P> {
             return P::Diff::zero();
         }
         let (uknot_vec, vknot_vec) = self.knot_vecs();
-        let basis0 = uknot_vec.bspline_basis_functions(degree0, u);
-        let basis1 = vknot_vec.bspline_basis_functions(degree1 - 2, v);
-        let closure = move |sum: P::Diff, (j, b0): (usize, f64)| {
-            let coef = inv_or_zero(vknot_vec[j + degree1 - 1] - vknot_vec[j]);
-            let closure = |sum: P::Diff, (i, b1): (usize, &f64)| {
-                sum + self.vdelta2_control_points(i, j) * coef * b0 * *b1
-            };
-            basis0.iter().enumerate().fold(sum, closure)
-        };
-        basis1
-            .into_iter()
-            .enumerate()
-            .fold(P::Diff::zero(), closure)
-            * degree1 as f64
+        UBASIS_BUF.with(|ub| {
+            VBASIS_BUF.with(|vb| {
+                let mut basis0 = ub.borrow_mut();
+                let mut basis1 = vb.borrow_mut();
+                uknot_vec.bspline_basis_functions_into(degree0, u, &mut basis0);
+                vknot_vec.bspline_basis_functions_into(degree1 - 2, v, &mut basis1);
+                let closure = |sum: P::Diff, (j, &b0): (usize, &f64)| {
+                    let coef = inv_or_zero(vknot_vec[j + degree1 - 1] - vknot_vec[j]);
+                    let closure = |sum: P::Diff, (i, &b1): (usize, &f64)| {
+                        sum + self.vdelta2_control_points(i, j) * coef * b0 * b1
+                    };
+                    basis0.iter().enumerate().fold(sum, closure)
+                };
+                basis1
+                    .iter()
+                    .enumerate()
+                    .fold(P::Diff::zero(), closure)
+                    * degree1 as f64
+            })
+        })
     }
 
     /// Substitutes 2nd-ord derived B-spline surface by the both parameters `u, v`.
@@ -818,25 +856,31 @@ impl<P: ControlPoint<f64>> ParametricSurface for BSplineSurface<P> {
             knot_vecs: (ref uknot_vec, ref vknot_vec),
             ref control_points,
         } = self;
-        let basis0 = uknot_vec.bspline_basis_functions(degree0 - 1, u);
-        let basis1 = vknot_vec.bspline_basis_functions(degree1 - 1, v);
-        let closure = |sum: P::Diff, (i, vec): (usize, &Vec<P>)| {
-            let coef0 = inv_or_zero(uknot_vec[i + degree0] - uknot_vec[i]);
-            let coef1 = inv_or_zero(uknot_vec[i + degree0 + 1] - uknot_vec[i + 1]);
-            let b0 = basis0[i] * coef0 - basis0[i + 1] * coef1;
-            let closure = |sum: P::Diff, (j, pt): (usize, &P)| {
-                let coef0 = inv_or_zero(vknot_vec[j + degree1] - vknot_vec[j]);
-                let coef1 = inv_or_zero(vknot_vec[j + degree1 + 1] - vknot_vec[j + 1]);
-                sum + pt.to_vec() * (basis1[j] * coef0 - basis1[j + 1] * coef1) * b0
-            };
-            vec.iter().enumerate().fold(sum, closure)
-        };
-        control_points
-            .iter()
-            .enumerate()
-            .fold(P::Diff::zero(), closure)
-            * degree0 as f64
-            * degree1 as f64
+        UBASIS_BUF.with(|ub| {
+            VBASIS_BUF.with(|vb| {
+                let mut basis0 = ub.borrow_mut();
+                let mut basis1 = vb.borrow_mut();
+                uknot_vec.bspline_basis_functions_into(degree0 - 1, u, &mut basis0);
+                vknot_vec.bspline_basis_functions_into(degree1 - 1, v, &mut basis1);
+                let closure = |sum: P::Diff, (i, vec): (usize, &Vec<P>)| {
+                    let coef0 = inv_or_zero(uknot_vec[i + degree0] - uknot_vec[i]);
+                    let coef1 = inv_or_zero(uknot_vec[i + degree0 + 1] - uknot_vec[i + 1]);
+                    let b0 = basis0[i] * coef0 - basis0[i + 1] * coef1;
+                    let closure = |sum: P::Diff, (j, pt): (usize, &P)| {
+                        let coef0 = inv_or_zero(vknot_vec[j + degree1] - vknot_vec[j]);
+                        let coef1 = inv_or_zero(vknot_vec[j + degree1 + 1] - vknot_vec[j + 1]);
+                        sum + pt.to_vec() * (basis1[j] * coef0 - basis1[j + 1] * coef1) * b0
+                    };
+                    vec.iter().enumerate().fold(sum, closure)
+                };
+                control_points
+                    .iter()
+                    .enumerate()
+                    .fold(P::Diff::zero(), closure)
+                    * degree0 as f64
+                    * degree1 as f64
+            })
+        })
     }
     #[inline(always)]
     fn parameter_range(&self) -> (ParameterRange, ParameterRange) { self.parameter_range() }

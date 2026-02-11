@@ -1,6 +1,11 @@
 use super::*;
 use crate::errors::Error;
+use std::cell::RefCell;
 use std::ops::*;
+
+thread_local! {
+    static CURVE_BASIS_BUF: RefCell<Vec<f64>> = RefCell::new(Vec::new());
+}
 
 impl<P> BSplineCurve<P> {
     /// constructor.
@@ -295,14 +300,15 @@ impl<P: ControlPoint<f64>> ParametricCurve for BSplineCurve<P> {
     /// ```
     #[inline(always)]
     fn subs(&self, t: f64) -> P {
-        let basis = self
-            .knot_vec
-            .try_bspline_basis_functions(self.degree(), t)
-            .unwrap();
-        self.control_points
-            .iter()
-            .zip(basis)
-            .fold(P::origin(), |sum, (pt, basis)| sum + pt.to_vec() * basis)
+        CURVE_BASIS_BUF.with(|buf| {
+            let mut basis = buf.borrow_mut();
+            self.knot_vec
+                .bspline_basis_functions_into(self.degree(), t, &mut basis);
+            self.control_points
+                .iter()
+                .zip(basis.iter())
+                .fold(P::origin(), |sum, (pt, &b)| sum + pt.to_vec() * b)
+        })
     }
     /// Substitutes to the derived B-spline curve.
     /// # Examples
@@ -323,16 +329,19 @@ impl<P: ControlPoint<f64>> ParametricCurve for BSplineCurve<P> {
     fn der(&self, t: f64) -> P::Diff {
         let k = self.degree();
         let knot_vec = self.knot_vec();
-        let closure = move |sum: P::Diff, (i, b): (usize, f64)| {
-            let coef = inv_or_zero(knot_vec[i + k] - knot_vec[i]);
-            sum + self.delta_control_points(i) * b * coef
-        };
-        knot_vec
-            .bspline_basis_functions(k - 1, t)
-            .into_iter()
-            .enumerate()
-            .fold(P::Diff::zero(), closure)
-            * k as f64
+        CURVE_BASIS_BUF.with(|buf| {
+            let mut basis = buf.borrow_mut();
+            knot_vec.bspline_basis_functions_into(k - 1, t, &mut basis);
+            let closure = |sum: P::Diff, (i, &b): (usize, &f64)| {
+                let coef = inv_or_zero(knot_vec[i + k] - knot_vec[i]);
+                sum + self.delta_control_points(i) * b * coef
+            };
+            basis
+                .iter()
+                .enumerate()
+                .fold(P::Diff::zero(), closure)
+                * k as f64
+        })
     }
     /// Substitutes to the 2nd-ord derived B-spline curve.
     /// # Examples
@@ -361,17 +370,20 @@ impl<P: ControlPoint<f64>> ParametricCurve for BSplineCurve<P> {
             return P::Diff::zero();
         }
         let knot_vec = self.knot_vec();
-        let closure = move |sum: P::Diff, (i, b): (usize, f64)| {
-            let coef = inv_or_zero(knot_vec[i + k - 1] - knot_vec[i]);
-            sum + self.delta2_control_points(i) * b * coef
-        };
-        knot_vec
-            .bspline_basis_functions(k - 2, t)
-            .into_iter()
-            .enumerate()
-            .fold(P::Diff::zero(), closure)
-            * k as f64
-            * (k - 1) as f64
+        CURVE_BASIS_BUF.with(|buf| {
+            let mut basis = buf.borrow_mut();
+            knot_vec.bspline_basis_functions_into(k - 2, t, &mut basis);
+            let closure = |sum: P::Diff, (i, &b): (usize, &f64)| {
+                let coef = inv_or_zero(knot_vec[i + k - 1] - knot_vec[i]);
+                sum + self.delta2_control_points(i) * b * coef
+            };
+            basis
+                .iter()
+                .enumerate()
+                .fold(P::Diff::zero(), closure)
+                * k as f64
+                * (k - 1) as f64
+        })
     }
     #[inline(always)]
     fn parameter_range(&self) -> ParameterRange {

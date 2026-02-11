@@ -200,6 +200,22 @@ impl KnotVec {
             return Err(Error::TooLargeDegree(n + 1, degree));
         }
 
+        let mut buf = Vec::with_capacity(n - degree);
+        self.bspline_basis_functions_into(degree, t, &mut buf);
+        Ok(buf)
+    }
+
+    /// Computes B-spline basis functions into a caller-provided buffer,
+    /// avoiding heap allocation on repeated calls.
+    ///
+    /// The buffer is cleared and filled with the basis function values.
+    /// After the call, `buf.len() == self.len() - 1 - degree`.
+    ///
+    /// # Panics
+    /// Panics if the knot vector range is zero or degree exceeds knot vector length.
+    pub fn bspline_basis_functions_into(&self, degree: usize, t: f64, buf: &mut Vec<f64>) {
+        let n = self.len() - 1;
+
         let idx = {
             let idx = self
                 .floor(t)
@@ -210,8 +226,10 @@ impl KnotVec {
                 idx
             }
         };
-        let mut res = vec![0.0; n];
-        res[idx] = 1.0;
+
+        buf.clear();
+        buf.resize(n, 0.0);
+        buf[idx] = 1.0;
 
         for k in 1..=degree {
             let base = if idx < k { 0 } else { idx - k };
@@ -221,13 +239,12 @@ impl KnotVec {
             for i in base..=max {
                 let delta = self[i + k + 1] - self[i + 1];
                 let b = inv_or_zero(delta) * (self[i + k + 1] - t);
-                res[i] = a * res[i] + b * res[i + 1];
+                buf[i] = a * buf[i] + b * buf[i + 1];
                 a = 1.0 - b;
             }
         }
 
-        res.truncate(n - degree);
-        Ok(res)
+        buf.truncate(n - degree);
     }
 
     #[doc(hidden)]
@@ -239,9 +256,10 @@ impl KnotVec {
 
         let mut res = vec![0.0; m];
         let mut max = vec![0.0; m];
+        let mut vals = Vec::new();
         for i in 1..N {
             let t = self[0] + range * (i as f64) / (N as f64);
-            let vals = self.try_bspline_basis_functions(degree, t).unwrap();
+            self.bspline_basis_functions_into(degree, t, &mut vals);
             for j in 0..m {
                 if max[j] < vals[j] {
                     max[j] = vals[j];

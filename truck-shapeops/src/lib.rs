@@ -17,4 +17,5 @@ mod healing;
 pub use healing::{RobustSplitClosedEdgesAndFaces, SplitClosedEdgesAndFaces};
 mod transversal;
 pub use transversal::{and, or, ShapeOpsCurve, ShapeOpsSurface};
+#[allow(dead_code)]
 mod alternative;
