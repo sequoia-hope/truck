@@ -477,8 +477,19 @@ where
             )
             .into_iter()
             .try_for_each(|(polyline, intersection_curve)| {
-                let mut intersection_curve = intersection_curve?.into();
-                let status = ShapesOpStatus::from_is_curve(&intersection_curve)?;
+                // Skip intersection curves that failed to construct (e.g., coplanar
+                // face pairs where double_projection can't converge). The unsplit
+                // fragments will be classified by coplanar detection or ray-cast.
+                let intersection_curve = match intersection_curve {
+                    Some(ic) => ic,
+                    None => return Some(()),
+                };
+                let mut intersection_curve: IntersectionCurve<_, S> =
+                    intersection_curve.into();
+                let status = match ShapesOpStatus::from_is_curve(&intersection_curve) {
+                    Some(s) => s,
+                    None => return Some(()),
+                };
                 let (status0, status1) = match (ori0, ori1) {
                     (true, true) => (status, status.not()),
                     (true, false) => (status.not(), status.not()),

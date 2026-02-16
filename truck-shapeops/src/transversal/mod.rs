@@ -1,3 +1,4 @@
+pub(crate) mod coplanar;
 mod divide_face;
 mod faces_classification;
 mod integrate;

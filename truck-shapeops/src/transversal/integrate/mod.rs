@@ -66,6 +66,18 @@ fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     cls1.integrate_by_component();
     let [mut and0, mut or0, unknown0] = cls0.and_or_unknown();
     unknown0.into_iter().try_for_each(|face| {
+        // Try coplanar classification first
+        if let Some(action) =
+            coplanar::classify_coplanar_fragment(&face, shell1, true, tol)
+        {
+            match action {
+                coplanar::CoplanarAction::Remove => {} // drop the face
+                coplanar::CoplanarAction::And => and0.push(face),
+                coplanar::CoplanarAction::Or => or0.push(face),
+            }
+            return Some(());
+        }
+        // Fall back to original ray-cast (no offset — offset breaks non-coplanar cases)
         let pt = face.boundaries()[0].vertex_iter().next().unwrap().point();
         let dir = hash::take_one_unit(pt);
         let count = poly_shell1.iter().try_fold(0, |count, face| {
@@ -81,6 +93,18 @@ fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     })?;
     let [mut and1, mut or1, unknown1] = cls1.and_or_unknown();
     unknown1.into_iter().try_for_each(|face| {
+        // Try coplanar classification first
+        if let Some(action) =
+            coplanar::classify_coplanar_fragment(&face, shell0, false, tol)
+        {
+            match action {
+                coplanar::CoplanarAction::Remove => {} // drop the face
+                coplanar::CoplanarAction::And => and1.push(face),
+                coplanar::CoplanarAction::Or => or1.push(face),
+            }
+            return Some(());
+        }
+        // Fall back to original ray-cast
         let pt = face.boundaries()[0].vertex_iter().next().unwrap().point();
         let dir = hash::take_one_unit(pt);
         let count = poly_shell0.iter().try_fold(0, |count, face| {
