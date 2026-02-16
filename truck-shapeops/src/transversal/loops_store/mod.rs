@@ -367,14 +367,45 @@ impl<C> LoopsStore<Point3, C> {
             }
             ParameterKind::Inner(_) => {
                 let curve = self[loops_index][wire_index][edge_index].curve();
-                let (pt, t, _) =
-                    curve_surface_projection(&curve, None, another_surface, None, v.point(), 100)?;
+                // Primary: exact curve-surface projection (Newton iteration)
+                let result = curve_surface_projection(
+                    &curve, None, another_surface, None, v.point(), 100,
+                ).or_else(|| {
+                    // Fallback: nearest point on curve when Newton fails at
+                    // coplanar face boundaries (l.dot(n) → 0 causes divergence)
+                    let t = curve.search_nearest_parameter(v.point(), None, 100)?;
+                    let pt = curve.subs(t);
+                    use truck_base::tolerance::TOLERANCE;
+                    if (pt - v.point()).magnitude() > TOLERANCE.sqrt() {
+                        return None;
+                    }
+                    let (u, vp) = another_surface.search_nearest_parameter(pt, None, 100)?;
+                    Some((pt, t, Point2::new(u, vp)))
+                });
+                let (pt, t, _) = result?;
                 v.set_point(pt);
-                let edge = self[loops_index][wire_index][edge_index].absolute_clone();
-                let edge_id = edge.id();
-                let (edge0, edge1) = edge.cut_with_parameter(v, t)?;
-                let new_wire: Wire<_, _> = vec![edge0, edge1].into();
-                self.swap_edge_into_wire(edge_id, &new_wire);
+
+                // If t is at a curve boundary, snap vertex instead of cutting
+                let (t0, t1) = curve.range_tuple();
+                use truck_base::tolerance::TOLERANCE;
+                if t < t0 + TOLERANCE || t1 - TOLERANCE < t {
+                    let old_vertex = if (t - t0).abs() < (t - t1).abs() {
+                        self[loops_index][wire_index][edge_index]
+                            .absolute_front()
+                            .clone()
+                    } else {
+                        self[loops_index][wire_index][edge_index]
+                            .absolute_back()
+                            .clone()
+                    };
+                    self.change_vertex(&old_vertex, v, emap);
+                } else {
+                    let edge = self[loops_index][wire_index][edge_index].absolute_clone();
+                    let edge_id = edge.id();
+                    let (edge0, edge1) = edge.cut_with_parameter(v, t)?;
+                    let new_wire: Wire<_, _> = vec![edge0, edge1].into();
+                    self.swap_edge_into_wire(edge_id, &new_wire);
+                }
             }
         }
         Some(())
