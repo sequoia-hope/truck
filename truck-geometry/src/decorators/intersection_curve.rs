@@ -31,9 +31,27 @@ where
     };
     let (x, y) = hint0.or_else(|| surface0.search_nearest_parameter(plane_point, hint0, trials))?;
     let (z, w) = hint1.or_else(|| surface1.search_nearest_parameter(plane_point, hint1, trials))?;
-    let Vector4 { x, y, z, w } = newton::solve(function, Vector4 { x, y, z, w }, trials).ok()?;
-    let point = surface0.subs(x, y).midpoint(surface1.subs(z, w));
-    Some((point, Point2::new(x, y), Point2::new(z, w)))
+    match newton::solve(function, Vector4 { x, y, z, w }, trials) {
+        Ok(Vector4 { x, y, z, w }) => {
+            let point = surface0.subs(x, y).midpoint(surface1.subs(z, w));
+            Some((point, Point2::new(x, y), Point2::new(z, w)))
+        }
+        Err(_) => {
+            // Newton solver failed (singular Jacobian). Check for coplanarity:
+            // when surfaces are coplanar, normals are parallel and points coincide,
+            // so the initial parameter guess is already valid.
+            let pt0 = surface0.subs(x, y);
+            let pt1 = surface1.subs(z, w);
+            let n0 = surface0.normal(x, y);
+            let n1 = surface1.normal(z, w);
+            if pt0.near(&pt1) && n0.cross(n1).magnitude() < TOLERANCE {
+                let mid = pt0.midpoint(pt1);
+                Some((mid, Point2::new(x, y), Point2::new(z, w)))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 impl<C, S0, S1> IntersectionCurve<C, S0, S1> {
@@ -217,7 +235,11 @@ where
 {
     type Point = Point3;
     type Vector = Vector3;
-    fn subs(&self, t: f64) -> Point3 { self.search_triple(t, 100).unwrap().0 }
+    fn subs(&self, t: f64) -> Point3 {
+        self.search_triple(t, 100)
+            .map(|triple| triple.0)
+            .unwrap_or_else(|| self.leader().subs(t))
+    }
     fn der(&self, t: f64) -> Vector3 {
         let IntersectionCurve {
             surface0,
@@ -225,7 +247,10 @@ where
             leader,
         } = self;
         let [l, l_der, l_der2] = leader.ders(2, t).to_array::<3>();
-        let (c, uv0, uv1) = self.search_triple(t, 100).unwrap();
+        let (c, uv0, uv1) = match self.search_triple(t, 100) {
+            Some(triple) => triple,
+            None => return l_der,
+        };
         let (n0, n1) = (surface0.normal(uv0.x, uv0.y), surface1.normal(uv1.x, uv1.y));
         let n = n0.cross(n1);
         let k = (l_der.magnitude2() - (c - l).dot(l_der2)) / n.dot(l_der);

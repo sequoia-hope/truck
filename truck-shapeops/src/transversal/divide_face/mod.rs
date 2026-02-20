@@ -105,12 +105,21 @@ where
                 .into_iter()
                 .map(|chunk| chunk.wire.deref().clone())
                 .collect();
-            let mut new_face = Face::debug_new(wires, surface);
-            if !face.orientation() {
-                new_face.invert();
+            match Face::try_new(wires, surface) {
+                Ok(mut new_face) => {
+                    if !face.orientation() {
+                        new_face.invert();
+                    }
+                    Some((new_face, status))
+                }
+                Err(_e) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[boolean] Face::try_new failed in divide_one_face: {:?}", _e);
+                    None
+                }
             }
-            (new_face, status)
         })
+        .flatten()
         .collect();
     Some(vec)
 }
@@ -161,13 +170,14 @@ where
                 // for weld_coincident_edges to find shared Vertex objects.
                 let wires: Vec<Wire<Point3, C>> =
                     loops.iter().map(|bw| bw.deref().clone()).collect();
-                let rebuilt = Face::debug_new(wires, face.surface());
-                let rebuilt = if !face.orientation() {
-                    let mut f = rebuilt;
-                    f.invert();
-                    f
-                } else {
-                    rebuilt
+                let rebuilt = match Face::try_new(wires, face.surface()) {
+                    Ok(mut f) => {
+                        if !face.orientation() {
+                            f.invert();
+                        }
+                        f
+                    }
+                    Err(_) => face.clone(),
                 };
                 if is_coplanar {
                     coplanar_fragment_ids.push(rebuilt.id());
