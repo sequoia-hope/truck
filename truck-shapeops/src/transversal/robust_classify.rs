@@ -6,7 +6,6 @@
 /// Returns positive if `d` is below the oriented plane of `(a, b, c)` (CW
 /// when viewed from d), negative if above (CCW from d), zero if coplanar.
 /// Uses Shewchuk's adaptive precision arithmetic for exact sign.
-#[allow(dead_code)]
 pub(crate) fn robust_orient3d(a: [f64; 3], b: [f64; 3], c: [f64; 3], d: [f64; 3]) -> f64 {
     robust::orient3d(
         robust::Coord3D {
@@ -55,7 +54,6 @@ pub(crate) fn robust_orient2d(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
 ///
 /// Uses robust_orient3d to classify the point relative to the triangle plane,
 /// and robust_orient2d for the projected 2D containment test.
-#[allow(dead_code)]
 pub(crate) fn robust_ray_triangle_cross(
     ray_origin: [f64; 3],
     ray_dir: [f64; 3],

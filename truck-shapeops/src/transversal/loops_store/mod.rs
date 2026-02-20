@@ -34,9 +34,13 @@ pub struct BoundaryWire<P, C> {
 
 impl<P, C> BoundaryWire<P, C> {
     #[inline(always)]
-    pub fn new(wire: Wire<P, C>, status: ShapesOpStatus) -> Self { Self { wire, status } }
+    pub fn new(wire: Wire<P, C>, status: ShapesOpStatus) -> Self {
+        Self { wire, status }
+    }
     #[inline(always)]
-    pub fn status(&self) -> ShapesOpStatus { self.status }
+    pub fn status(&self) -> ShapesOpStatus {
+        self.status
+    }
     #[inline(always)]
     pub fn invert(&mut self) {
         self.wire.invert();
@@ -56,7 +60,8 @@ impl ShapesOpStatus {
     where
         C: ParametricCurve3D + BoundedCurve,
         S0: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
-        S1: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>, {
+        S1: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
+    {
         let (t0, t1) = curve.range_tuple();
         let t = (t0 + t1) / 2.0;
         let (_, pt0, pt1) = curve.search_triple(t, 100)?;
@@ -73,12 +78,16 @@ impl ShapesOpStatus {
 impl<P, C> std::ops::Deref for BoundaryWire<P, C> {
     type Target = Wire<P, C>;
     #[inline(always)]
-    fn deref(&self) -> &Self::Target { &self.wire }
+    fn deref(&self) -> &Self::Target {
+        &self.wire
+    }
 }
 
 impl<P, C> std::ops::DerefMut for BoundaryWire<P, C> {
     #[inline(always)]
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.wire }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.wire
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -89,23 +98,31 @@ pub struct LoopsStore<P, C>(Vec<Loops<P, C>>);
 impl<P, C> std::ops::Deref for Loops<P, C> {
     type Target = Vec<BoundaryWire<P, C>>;
     #[inline(always)]
-    fn deref(&self) -> &Self::Target { &self.0 }
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl<P, C> std::ops::DerefMut for Loops<P, C> {
     #[inline(always)]
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 impl<P, C> std::ops::Deref for LoopsStore<P, C> {
     type Target = Vec<Loops<P, C>>;
     #[inline(always)]
-    fn deref(&self) -> &Self::Target { &self.0 }
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl<P, C> std::ops::DerefMut for LoopsStore<P, C> {
     #[inline(always)]
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 impl<P, C> FromIterator<BoundaryWire<P, C>> for Loops<P, C> {
@@ -134,7 +151,9 @@ impl<'a, P: 'a, C: 'a, S: 'a> FromIterator<&'a Face<P, C, S>> for LoopsStore<P, 
 impl<'a, P, C> IntoIterator for &'a LoopsStore<P, C> {
     type Item = <&'a Vec<Loops<P, C>> as IntoIterator>::Item;
     type IntoIter = <&'a Vec<Loops<P, C>> as IntoIterator>::IntoIter;
-    fn into_iter(self) -> Self::IntoIter { self.0.iter() }
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 #[derive(Clone, Debug, Copy, PartialEq)]
@@ -160,7 +179,9 @@ impl ParameterKind {
 
 impl<P: Copy, C: Clone> Loops<P, C> {
     fn search_parameter(&self, pt: P) -> Option<(usize, usize, ParameterKind)>
-    where C: BoundedCurve<Point = P> + SearchParameter<D1, Point = P> {
+    where
+        C: BoundedCurve<Point = P> + SearchParameter<D1, Point = P>,
+    {
         self.iter()
             .enumerate()
             .flat_map(move |(i, wire)| wire.iter().enumerate().map(move |(j, edge)| (i, j, edge)))
@@ -448,7 +469,8 @@ fn is_midpoint_on_face_boundary<C, S>(mid: Point3, face: &Face<Point3, C, S>, to
 fn create_independent_loop<P, C, D>(mut poly_curve0: C) -> Wire<P, D>
 where
     C: Cut<Point = P>,
-    D: From<C>, {
+    D: From<C>,
+{
     let (t0, t1) = poly_curve0.range_tuple();
     let t = (t0 + t1) / 2.0;
     let poly_curve1 = poly_curve0.cut(t);
@@ -821,13 +843,25 @@ where
                     (false, false) => (status.not(), status),
                 };
                 if polyline.front().near(&polyline.back()) {
-                    // Wrap in catch_unwind: degenerate intersection curves from
-                    // coplanar-adjacent face pairs can panic in parameter_division.
-                    let geom_wire =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            Some(create_independent_loop(intersection_curve))
-                        }));
-                    if let Ok(Some(geom_wire)) = geom_wire {
+                    // Pre-validate: skip degenerate closed ICs where all points
+                    // collapse to essentially the same location.
+                    let is_degenerate = {
+                        let pts: &Vec<Point3> = &polyline.0;
+                        if pts.len() < 2 {
+                            true
+                        } else {
+                            let center = pts[0];
+                            pts.iter().all(|p| (*p - center).magnitude() < tol)
+                        }
+                    };
+                    if is_degenerate {
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "[boolean] Skipping degenerate closed IC: {} points within tol",
+                            polyline.0.len()
+                        );
+                    } else {
+                        let geom_wire = create_independent_loop(intersection_curve);
                         let poly_wire = create_independent_loop(polyline);
                         poly_loops_store0[face_index0]
                             .add_independent_loop(BoundaryWire::new(poly_wire.clone(), status0));

@@ -40,19 +40,20 @@ impl BooleanTolerance {
 
     /// Derive per-stage tolerances from a model tolerance.
     ///
-    /// Currently all stages use `tau_model` directly, matching the proven
-    /// single-tolerance behavior. The struct allows per-stage overrides for
-    /// specific use cases (e.g., tighter mesh for small features).
-    ///
-    /// Note: `tau_coplanar` must remain close to `tau_model` because the
-    /// coplanar normal check uses `1.0 - tol` as threshold. Large values
-    /// (e.g., 5x) would accept nearly-perpendicular faces as coplanar.
+    /// Each stage gets a tolerance scaled to its specific needs:
+    /// - `tau_mesh`: same as model (triangulation needs model-level precision)
+    /// - `tau_weld`: 0.4x model (conservative: slightly wider than the internal
+    ///   default of `tol * 0.2`, but well below the feature-size failure threshold
+    ///   of ~0.10 * min_edge. A 2x multiplier was too aggressive and merged
+    ///   vertices across small features like narrow bosses.)
+    /// - `tau_coplanar`: 5x model (angular threshold uses `tol * tol` approximation,
+    ///   so `5 * 0.005 = 0.025` → `0.025² = 0.000625 rad ≈ 0.036°` threshold)
     pub fn from_model_tol(tau_model: f64) -> Self {
         Self {
             tau_model,
             tau_mesh: tau_model,
-            tau_weld: tau_model,
-            tau_coplanar: tau_model,
+            tau_weld: 0.4 * tau_model,
+            tau_coplanar: 5.0 * tau_model,
         }
     }
 }
@@ -65,9 +66,11 @@ pub trait ShapeOpsSurface:
     + SearchNearestParameter<D2, Point = Point3>
     + Invertible
     + Send
-    + Sync {
+    + Sync
+{
 }
-impl<S> ShapeOpsSurface for S where S: ParametricSurface3D
+impl<S> ShapeOpsSurface for S where
+    S: ParametricSurface3D
         + ParameterDivision2D
         + SearchParameter<D2, Point = Point3>
         + SearchNearestParameter<D2, Point = Point3>
@@ -87,9 +90,11 @@ pub trait ShapeOpsCurve<S: ShapeOpsSurface>:
     + SearchParameter<D1, Point = Point3>
     + SearchNearestParameter<D1, Point = Point3>
     + Send
-    + Sync {
+    + Sync
+{
 }
-impl<C, S: ShapeOpsSurface> ShapeOpsCurve<S> for C where C: ParametricCurve3D
+impl<C, S: ShapeOpsSurface> ShapeOpsCurve<S> for C where
+    C: ParametricCurve3D
         + ParameterDivision1D<Point = Point3>
         + Cut
         + Invertible
@@ -101,16 +106,53 @@ impl<C, S: ShapeOpsSurface> ShapeOpsCurve<S> for C where C: ParametricCurve3D
 {
 }
 
-/// Ray-cast from a point against a triangulated shell. Returns the signed
-/// crossing count, or None if the ray grazes an edge.
+/// Ray-cast from a point against a triangulated shell using robust geometric
+/// predicates (Shewchuk's adaptive precision arithmetic).
+///
+/// Returns the signed crossing count, or `None` if any triangle produces a
+/// degenerate (edge-grazing) configuration.
 pub(crate) fn try_ray_cast(
     pt: Point3,
     dir: Vector3,
     poly_shell: &Shell<Point3, PolylineCurve<Point3>, Option<PolygonMesh>>,
 ) -> Option<isize> {
+    use super::robust_classify::robust_ray_triangle_cross;
+
+    let ray_origin = [pt.x, pt.y, pt.z];
+    let ray_dir = [dir.x, dir.y, dir.z];
+
     poly_shell.iter().try_fold(0isize, |count, face| {
         let poly = face.surface()?;
-        Some(count + poly.signed_crossing_faces(pt, dir))
+        let positions = poly.positions();
+        let mut face_count = 0isize;
+        // Iterate all faces (tri, quad, n-gon) and fan-triangulate
+        for face_verts in poly.face_iter() {
+            for i in 2..face_verts.len() {
+                let p0 = positions[face_verts[0].pos];
+                let p1 = positions[face_verts[i - 1].pos];
+                let p2 = positions[face_verts[i].pos];
+                let tri = [[p0.x, p0.y, p0.z], [p1.x, p1.y, p1.z], [p2.x, p2.y, p2.z]];
+                let crossing = robust_ray_triangle_cross(ray_origin, ray_dir, tri)?;
+                // Determine sign: if ray direction dot triangle normal is positive,
+                // count +1; if negative, count -1.
+                if crossing == 1 {
+                    let e1 = [p1.x - p0.x, p1.y - p0.y, p1.z - p0.z];
+                    let e2 = [p2.x - p0.x, p2.y - p0.y, p2.z - p0.z];
+                    let normal = [
+                        e1[1] * e2[2] - e1[2] * e2[1],
+                        e1[2] * e2[0] - e1[0] * e2[2],
+                        e1[0] * e2[1] - e1[1] * e2[0],
+                    ];
+                    let dot = normal[0] * dir.x + normal[1] * dir.y + normal[2] * dir.z;
+                    if dot > 0.0 {
+                        face_count += 1;
+                    } else {
+                        face_count -= 1;
+                    }
+                }
+            }
+        }
+        Some(count + face_count)
     })
 }
 
@@ -419,14 +461,18 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
         })
         .ok_or(BooleanStageError::Classification)?;
     Ok(ClassifiedShellBuckets {
-        and0: altshell_to_shell(&and0, tols.tau_model)
-            .ok_or(BooleanStageError::ShellAssembly("altshell_to_shell(and0)".into()))?,
-        or0: altshell_to_shell(&or0, tols.tau_model)
-            .ok_or(BooleanStageError::ShellAssembly("altshell_to_shell(or0)".into()))?,
-        and1: altshell_to_shell(&and1, tols.tau_model)
-            .ok_or(BooleanStageError::ShellAssembly("altshell_to_shell(and1)".into()))?,
-        or1: altshell_to_shell(&or1, tols.tau_model)
-            .ok_or(BooleanStageError::ShellAssembly("altshell_to_shell(or1)".into()))?,
+        and0: altshell_to_shell(&and0, tols.tau_model).ok_or(BooleanStageError::ShellAssembly(
+            "altshell_to_shell(and0)".into(),
+        ))?,
+        or0: altshell_to_shell(&or0, tols.tau_model).ok_or(BooleanStageError::ShellAssembly(
+            "altshell_to_shell(or0)".into(),
+        ))?,
+        and1: altshell_to_shell(&and1, tols.tau_model).ok_or(BooleanStageError::ShellAssembly(
+            "altshell_to_shell(and1)".into(),
+        ))?,
+        or1: altshell_to_shell(&or1, tols.tau_model).ok_or(BooleanStageError::ShellAssembly(
+            "altshell_to_shell(or1)".into(),
+        ))?,
     })
 }
 
@@ -635,8 +681,7 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                                 .or_else(|| canonical.get(&(bid, fid)));
                             match canon {
                                 Some(c) if c.id() != edge.id() => {
-                                    let same_dir =
-                                        abs_edge.front().id() == c.absolute_front().id();
+                                    let same_dir = abs_edge.front().id() == c.absolute_front().id();
                                     if same_dir == edge.orientation() {
                                         c.clone()
                                     } else {

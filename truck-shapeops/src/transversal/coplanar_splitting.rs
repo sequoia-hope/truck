@@ -64,7 +64,10 @@ pub(crate) fn check_coplanar_faces<C, S>(
     }
 
     let dot = n0.dot(n1);
-    if dot.abs() <= 1.0 - tol {
+    // Normals must be (anti-)parallel: angle between them < tol radians.
+    // Using the small-angle approximation: 1 - cos(θ) ≈ θ²/2, so
+    // (1 - |dot|) > tol * tol means angle > ~sqrt(2) * tol.
+    if (1.0 - dot.abs()) > tol * tol {
         return None;
     }
 
@@ -310,7 +313,10 @@ mod tests {
         let face1 = [[1.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0]];
 
         let edges_cross = edges_intersect_2d(&face0, &face1, 0.01);
-        assert!(!edges_cross, "Shared-edge faces should not have crossing edges");
+        assert!(
+            !edges_cross,
+            "Shared-edge faces should not have crossing edges"
+        );
     }
 
     /// Two faces sharing only a point.

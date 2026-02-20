@@ -114,7 +114,10 @@ where
                 }
                 Err(_e) => {
                     #[cfg(debug_assertions)]
-                    eprintln!("[boolean] Face::try_new failed in divide_one_face: {:?}", _e);
+                    eprintln!(
+                        "[boolean] Face::try_new failed in divide_one_face: {:?}",
+                        _e
+                    );
                     None
                 }
             }
@@ -183,30 +186,50 @@ where
                 }
                 res.push(rebuilt, ShapesOpStatus::Unknown);
             } else {
-                // Wrap divide_one_face in catch_unwind: degenerate
-                // intersection curves (from coplanar-adjacent face pairs)
-                // can panic in parameter_division / search_triple. When
-                // that happens, fall back to the undivided face.
-                let divide_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    divide_one_face(face, loops, tol)
-                }));
-                match divide_result {
-                    Ok(Some(vec)) => {
-                        vec.into_iter().for_each(|(face, status)| {
-                            if is_coplanar {
-                                coplanar_fragment_ids.push(face.id());
-                            }
-                            res.push(face, status);
-                        });
+                // Pre-validate: check for degenerate loops that would cause
+                // panics in parameter_division. If any wire has near-zero
+                // spatial extent, skip division and use the undivided face.
+                let has_degenerate_loop = loops.iter().any(|wire| {
+                    let pts: Vec<Point3> = wire.vertex_iter().map(|v| v.point()).collect();
+                    if pts.len() < 2 {
+                        return true;
                     }
-                    Ok(None) => return None,
-                    Err(_) => {
-                        // Panic caught: use undivided face with Unknown status
-                        // so that ray-cast classification handles it later.
-                        if is_coplanar {
-                            coplanar_fragment_ids.push(face.id());
+                    let (mut min_x, mut max_x) = (f64::MAX, f64::MIN);
+                    let (mut min_y, mut max_y) = (f64::MAX, f64::MIN);
+                    let (mut min_z, mut max_z) = (f64::MAX, f64::MIN);
+                    for p in &pts {
+                        min_x = min_x.min(p.x);
+                        max_x = max_x.max(p.x);
+                        min_y = min_y.min(p.y);
+                        max_y = max_y.max(p.y);
+                        min_z = min_z.min(p.z);
+                        max_z = max_z.max(p.z);
+                    }
+                    let extent = (max_x - min_x).max(max_y - min_y).max(max_z - min_z);
+                    extent < tol * 0.1
+                });
+
+                if has_degenerate_loop {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[boolean] Skipping degenerate loop in divide_face \
+                         — using undivided face"
+                    );
+                    if is_coplanar {
+                        coplanar_fragment_ids.push(face.id());
+                    }
+                    res.push(face.clone(), ShapesOpStatus::Unknown);
+                } else {
+                    match divide_one_face(face, loops, tol) {
+                        Some(vec) => {
+                            vec.into_iter().for_each(|(face, status)| {
+                                if is_coplanar {
+                                    coplanar_fragment_ids.push(face.id());
+                                }
+                                res.push(face, status);
+                            });
                         }
-                        res.push(face.clone(), ShapesOpStatus::Unknown);
+                        None => return None,
                     }
                 }
             }

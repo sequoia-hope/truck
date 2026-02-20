@@ -200,10 +200,20 @@ fn face_sample_info<C, S: ShapeOpsSurface>(face: &Face<Point3, C, S>) -> Option<
 
 /// Check whether two faces are coplanar. Returns `Some(same_sense)` if they are,
 /// `None` if not.
+///
+/// Angular threshold: `(1 - |dot|) > tol²` approximates `angle > tol` radians.
+/// For `tol = 0.025`: threshold = 0.000625 rad ≈ 0.036°.
+/// For `tol = 0.05`: threshold = 0.0025 rad ≈ 0.14°.
+///
+/// The previous `|dot| <= 1.0 - tol` formula was mathematically incorrect for
+/// separated tolerances: with `tol = 0.25` (from 5× model), it would accept
+/// faces at up to ~75° as "parallel", producing false coplanar detections.
 fn check_coplanar(info0: &FaceSampleInfo, info1: &FaceSampleInfo, tol: f64) -> Option<bool> {
     let dot = info0.normal.dot(info1.normal);
-    // Normals must be (anti-)parallel
-    if dot.abs() <= 1.0 - tol {
+    // Normals must be (anti-)parallel: angle between them < tol radians.
+    // Using the small-angle approximation: 1 - cos(θ) ≈ θ²/2, so
+    // (1 - |dot|) > tol * tol means angle > ~sqrt(2) * tol.
+    if (1.0 - dot.abs()) > tol * tol {
         return None;
     }
     // Points must lie on the same plane (use tol directly, not sqrt(tol),

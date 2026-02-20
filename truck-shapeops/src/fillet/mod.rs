@@ -168,10 +168,14 @@ fn unit_circle_arc(angle: Rad<f64>, w0: f64, w1: f64) -> NurbsCurve<Vector4> {
 }
 
 #[inline(always)]
-fn unit_circle_knot_vec() -> KnotVec { KnotVec::uniform_knot(2, 4) }
+fn unit_circle_knot_vec() -> KnotVec {
+    KnotVec::uniform_knot(2, 4)
+}
 
 #[inline(always)]
-const fn number_of_cpts_of_unit_circle() -> usize { 6 }
+const fn number_of_cpts_of_unit_circle() -> usize {
+    6
+}
 
 #[test]
 fn unit_circle_info() {
