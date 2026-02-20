@@ -151,7 +151,7 @@ pub fn and<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         and_shell = res;
     }
     let boundaries = and_shell.connected_components();
-    Some(Solid::new(boundaries))
+    Solid::try_new(boundaries).ok()
 }
 
 /// OR operation between two solids.
@@ -174,7 +174,7 @@ pub fn or<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         or_shell = res;
     }
     let boundaries = or_shell.connected_components();
-    Some(Solid::new(boundaries))
+    Solid::try_new(boundaries).ok()
 }
 
 #[cfg(test)]

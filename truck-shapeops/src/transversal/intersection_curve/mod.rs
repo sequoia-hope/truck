@@ -24,6 +24,10 @@ where
     S1: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
 {
     pub fn try_new(surface0: S0, surface1: S1, poly: PolylineCurve<Point3>) -> Option<Self> {
+        // Degenerate polylines with fewer than 2 points cannot form a valid curve
+        if poly.len() < 2 {
+            return None;
+        }
         let ic = IntersectionCurve::new(&surface0, &surface1, poly);
         let poly = ic.leader();
         let len = poly.len();
