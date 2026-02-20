@@ -651,11 +651,19 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                 })
                 .collect();
             let surface = face.surface();
-            let mut new_face = Face::new(new_wires, surface);
-            if !ori {
-                new_face.invert();
+            match Face::try_new(new_wires, surface) {
+                Ok(mut new_face) => {
+                    if !ori {
+                        new_face.invert();
+                    }
+                    new_face
+                }
+                Err(_) => {
+                    // Phase 2 edge substitution produced a non-simple wire.
+                    // Fall back to the original face unchanged.
+                    face.clone()
+                }
             }
-            new_face
         })
         .collect();
 
