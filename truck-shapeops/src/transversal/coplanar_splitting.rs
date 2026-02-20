@@ -128,6 +128,13 @@ pub(crate) fn check_coplanar_faces<C, S>(
             .map(|&v| project_to_2d(v, origin, u_axis, v_axis))
             .collect();
 
+        // Check if polygons share boundary vertices (handles identical/coincident faces)
+        let share_boundary = polygons_share_boundary(&proj0, &proj1, tol * 10.0)
+            && polygons_share_boundary(&proj1, &proj0, tol * 10.0);
+        if share_boundary {
+            return Some(same_sense);
+        }
+
         let any_v1_in_0 = proj1.iter().any(|pt| point_in_polygon_2d(*pt, &proj0));
         let any_v0_in_1 = proj0.iter().any(|pt| point_in_polygon_2d(*pt, &proj1));
         let edges_cross = edges_intersect_2d(&proj0, &proj1, tol);
@@ -178,6 +185,32 @@ fn edges_intersect_2d(poly_a: &[[f64; 2]], poly_b: &[[f64; 2]], tol: f64) -> boo
             let u = ((cx - ax) * (by - ay) - (cy - ay) * (bx - ax)) / denom;
             // Interior intersection (not at endpoints — endpoints mean shared edge, not overlap)
             if t > tol && t < 1.0 - tol && u > tol && u < 1.0 - tol {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Minimum distance from point to a line segment in 2D.
+fn point_to_segment_dist_2d(pt: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let ap = [pt[0] - a[0], pt[1] - a[1]];
+    let len2 = ab[0] * ab[0] + ab[1] * ab[1];
+    if len2 < 1e-30 {
+        return (ap[0] * ap[0] + ap[1] * ap[1]).sqrt();
+    }
+    let t = ((ap[0] * ab[0] + ap[1] * ab[1]) / len2).clamp(0.0, 1.0);
+    let proj = [a[0] + t * ab[0], a[1] + t * ab[1]];
+    ((pt[0] - proj[0]).powi(2) + (pt[1] - proj[1]).powi(2)).sqrt()
+}
+
+/// Check if any vertex of polygon A lies on or very near the boundary of polygon B.
+fn polygons_share_boundary(poly_a: &[[f64; 2]], poly_b: &[[f64; 2]], tol: f64) -> bool {
+    for &pt in poly_a {
+        for k in 0..poly_b.len() {
+            let l = (k + 1) % poly_b.len();
+            if point_to_segment_dist_2d(pt, poly_b[k], poly_b[l]) < tol {
                 return true;
             }
         }

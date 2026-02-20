@@ -216,7 +216,9 @@ fn altshell_to_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         |c| match c {
             Alternative::FirstType(c) => Some(c.clone()),
             Alternative::SecondType(ic) => {
-                let bsp = BSplineCurve::quadratic_approximation(ic, ic.range_tuple(), tol, 100)?;
+                let range = ic.range_tuple();
+                let bsp = BSplineCurve::cubic_approximation(ic, range, tol, tol * 1000.0, 100)
+                    .or_else(|| BSplineCurve::quadratic_approximation(ic, range, tol, 100))?;
                 Some(
                     IntersectionCurve::new(ic.surface0().clone(), ic.surface1().clone(), bsp)
                         .into(),
@@ -484,11 +486,24 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                         })
                         .collect();
                     let surface = face.surface();
-                    let mut new_face = Face::new(new_wires, surface);
-                    if !ori {
-                        new_face.invert();
+                    // Use try_new to avoid panic on non-simple wires after
+                    // vertex unification; fall back to the original face.
+                    match Face::try_new(new_wires, surface) {
+                        Ok(mut new_face) => {
+                            if !ori {
+                                new_face.invert();
+                            }
+                            new_face
+                        }
+                        Err(_e) => {
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[weld] Face::try_new failed after vertex unification: {:?}",
+                                _e
+                            );
+                            face.clone()
+                        }
                     }
-                    new_face
                 })
                 .collect();
             *shell = new_faces.into_iter().collect();

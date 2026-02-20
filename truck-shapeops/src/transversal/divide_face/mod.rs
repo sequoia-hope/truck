@@ -92,7 +92,7 @@ where
     let vec: Vec<_> = pre_faces
         .into_iter()
         .filter(|pre_face| !pre_face.is_empty())
-        .map(|pre_face| {
+        .filter_map(|pre_face| {
             let surface = face.surface();
             let op = pre_face
                 .iter()
@@ -119,7 +119,6 @@ where
                 }
             }
         })
-        .flatten()
         .collect();
     Some(vec)
 }
