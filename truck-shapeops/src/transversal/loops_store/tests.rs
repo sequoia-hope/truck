@@ -129,7 +129,7 @@ fn independent_intersection() {
         geom_loops_store0,
         geom_loops_store1,
         ..
-    } = create_loops_stores(&geom_shell0, &poly_shell0, &geom_shell1, &poly_shell1).unwrap();
+    } = create_loops_stores(&geom_shell0, &poly_shell0, &geom_shell1, &poly_shell1, TOL).unwrap();
 
     // check the topology
     let vertex_format = VertexDisplayFormat::AsPoint;
@@ -362,7 +362,7 @@ fn rotated_intersection() {
         geom_loops_store0,
         geom_loops_store1,
         ..
-    } = create_loops_stores(&geom_shell0, &poly_shell0, &geom_shell1, &poly_shell1).unwrap();
+    } = create_loops_stores(&geom_shell0, &poly_shell0, &geom_shell1, &poly_shell1, TOL).unwrap();
 
     let vertex_format = VertexDisplayFormat::AsPoint;
     let edge_id_format = EdgeDisplayFormat::VerticesTupleAndID { vertex_format };
@@ -611,7 +611,7 @@ fn crossing_edges() {
         geom_loops_store0,
         geom_loops_store1,
         ..
-    } = create_loops_stores(&geom_shell0, &poly_shell0, &geom_shell1, &poly_shell1).unwrap();
+    } = create_loops_stores(&geom_shell0, &poly_shell0, &geom_shell1, &poly_shell1, TOL).unwrap();
 
     let vertex_format = VertexDisplayFormat::AsPoint;
     let edge_id_format = EdgeDisplayFormat::VerticesTupleAndID { vertex_format };

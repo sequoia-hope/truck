@@ -438,6 +438,10 @@ pub struct LoopsStoreQuadruple<C> {
     pub poly_loops_store0: LoopsStore<Point3, PolylineCurve>,
     pub geom_loops_store1: LoopsStore<Point3, C>,
     pub poly_loops_store1: LoopsStore<Point3, PolylineCurve>,
+    /// Face indices in shell0 that are coplanar with some face in shell1.
+    pub coplanar_faces0: rustc_hash::FxHashSet<usize>,
+    /// Face indices in shell1 that are coplanar with some face in shell0.
+    pub coplanar_faces1: rustc_hash::FxHashSet<usize>,
 }
 
 pub fn create_loops_stores<C, S>(
@@ -445,6 +449,7 @@ pub fn create_loops_stores<C, S>(
     poly_shell0: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
     geom_shell1: &Shell<Point3, C, S>,
     poly_shell1: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
+    tol: f64,
 ) -> Option<LoopsStoreQuadruple<C>>
 where
     C: SearchNearestParameter<D1, Point = Point3>
@@ -459,9 +464,34 @@ where
     let mut poly_loops_store1: LoopsStore<_, _> = poly_shell1.face_iter().collect();
     let store0_len = geom_loops_store0.len();
     let store1_len = geom_loops_store1.len();
+    // Pre-identify coplanar face pairs for asymmetric classification later.
+    let mut coplanar_faces0 = rustc_hash::FxHashSet::default();
+    let mut coplanar_faces1 = rustc_hash::FxHashSet::default();
+    for i in 0..store0_len {
+        for j in 0..store1_len {
+            if coplanar_splitting::check_coplanar_faces(&geom_shell0[i], &geom_shell1[j], tol)
+                .is_some()
+            {
+                coplanar_faces0.insert(i);
+                coplanar_faces1.insert(j);
+            }
+        }
+    }
     (0..store0_len)
         .flat_map(move |i| (0..store1_len).map(move |j| (i, j)))
         .try_for_each(|(face_index0, face_index1)| {
+            // Skip when THIS SPECIFIC pair is coplanar.
+            if coplanar_faces0.contains(&face_index0)
+                && coplanar_faces1.contains(&face_index1)
+                && coplanar_splitting::check_coplanar_faces(
+                    &geom_shell0[face_index0],
+                    &geom_shell1[face_index1],
+                    tol,
+                )
+                .is_some()
+            {
+                return Some(());
+            }
             let ori0 = geom_shell0[face_index0].orientation();
             let ori1 = geom_shell1[face_index1].orientation();
             let surface0 = geom_shell0[face_index0].surface();
@@ -571,6 +601,8 @@ where
         poly_loops_store0,
         geom_loops_store1,
         poly_loops_store1,
+        coplanar_faces0,
+        coplanar_faces1,
     })
 }
 

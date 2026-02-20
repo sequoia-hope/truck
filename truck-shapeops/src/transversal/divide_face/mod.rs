@@ -62,7 +62,12 @@ where
     let mut map = HashMap::default();
     loops.iter().try_for_each(|wire| {
         let poly = create_parameter_boundary(face, wire, &mut map, tol)?;
-        match poly.area() > 0.0 {
+        let area = poly.area();
+        // Skip degenerate loops with negligible area (coplanar artifacts)
+        if area.abs() < tol {
+            return Some(());
+        }
+        match area > 0.0 {
             true => pre_faces.push(vec![WireChunk { poly, wire }]),
             false => negative_wires.push(WireChunk { poly, wire }),
         }
@@ -70,12 +75,23 @@ where
     })?;
     negative_wires.into_iter().try_for_each(|chunk| {
         let pt = chunk.poly.front();
-        let op = pre_faces.iter_mut().find(|face| face[0].poly.include(pt))?;
-        op.push(chunk);
+        let idx = pre_faces.iter().position(|face| face[0].poly.include(pt));
+        if let Some(i) = idx {
+            let outer_area = pre_faces[i][0].poly.area();
+            let chunk_area = chunk.poly.area();
+            // When inner loop exactly matches outer boundary (areas cancel),
+            // the face is consumed by the intersection — remove it.
+            if (outer_area + chunk_area).abs() < tol {
+                pre_faces[i].clear();
+            } else {
+                pre_faces[i].push(chunk);
+            }
+        }
         Some(())
     })?;
     let vec: Vec<_> = pre_faces
         .into_iter()
+        .filter(|pre_face| !pre_face.is_empty())
         .map(|pre_face| {
             let surface = face.surface();
             let op = pre_face
@@ -99,6 +115,7 @@ where
     Some(vec)
 }
 
+#[allow(dead_code)]
 pub fn divide_faces<C, S>(
     shell: &Shell<Point3, C, S>,
     loops_store: &LoopsStore<Point3, C>,
@@ -108,24 +125,85 @@ where
     C: BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
     S: Clone + SearchParameter<D2, Point = Point3>,
 {
+    let (cls, _) =
+        divide_faces_with_coplanar(shell, loops_store, tol, &rustc_hash::FxHashSet::default())?;
+    Some(cls)
+}
+
+/// Like `divide_faces` but tracks fragments from coplanar faces.
+/// Returns (classification, coplanar_fragment_face_ids) so the caller can re-force
+/// coplanar fragments to Unknown after `integrate_by_component`.
+#[allow(clippy::type_complexity)]
+pub fn divide_faces_with_coplanar<C, S>(
+    shell: &Shell<Point3, C, S>,
+    loops_store: &LoopsStore<Point3, C>,
+    tol: f64,
+    coplanar_faces: &rustc_hash::FxHashSet<usize>,
+) -> Option<(FacesClassification<Point3, C, S>, Vec<FaceID<S>>)>
+where
+    C: BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
+    S: Clone + SearchParameter<D2, Point = Point3>,
+{
     let mut res = FacesClassification::<Point3, C, S>::default();
+    let mut coplanar_fragment_ids = Vec::new();
     shell
         .iter()
         .zip(loops_store)
-        .try_for_each(|(face, loops)| {
+        .enumerate()
+        .try_for_each(|(idx, (face, loops))| {
+            let is_coplanar = coplanar_faces.contains(&idx);
             if loops
                 .iter()
                 .all(|wire| wire.status() == ShapesOpStatus::Unknown)
             {
-                res.push(face.clone(), ShapesOpStatus::Unknown);
+                // Rebuild from loops_store wires (not face.clone()) to preserve
+                // vertex substitutions from add_polygon_vertex. This is needed
+                // for weld_coincident_edges to find shared Vertex objects.
+                let wires: Vec<Wire<Point3, C>> =
+                    loops.iter().map(|bw| bw.deref().clone()).collect();
+                let rebuilt = Face::debug_new(wires, face.surface());
+                let rebuilt = if !face.orientation() {
+                    let mut f = rebuilt;
+                    f.invert();
+                    f
+                } else {
+                    rebuilt
+                };
+                if is_coplanar {
+                    coplanar_fragment_ids.push(rebuilt.id());
+                }
+                res.push(rebuilt, ShapesOpStatus::Unknown);
             } else {
-                let vec = divide_one_face(face, loops, tol)?;
-                vec.into_iter()
-                    .for_each(|(face, status)| res.push(face, status));
+                // Wrap divide_one_face in catch_unwind: degenerate
+                // intersection curves (from coplanar-adjacent face pairs)
+                // can panic in parameter_division / search_triple. When
+                // that happens, fall back to the undivided face.
+                let divide_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    divide_one_face(face, loops, tol)
+                }));
+                match divide_result {
+                    Ok(Some(vec)) => {
+                        vec.into_iter().for_each(|(face, status)| {
+                            if is_coplanar {
+                                coplanar_fragment_ids.push(face.id());
+                            }
+                            res.push(face, status);
+                        });
+                    }
+                    Ok(None) => return None,
+                    Err(_) => {
+                        // Panic caught: use undivided face with Unknown status
+                        // so that ray-cast classification handles it later.
+                        if is_coplanar {
+                            coplanar_fragment_ids.push(face.id());
+                        }
+                        res.push(face.clone(), ShapesOpStatus::Unknown);
+                    }
+                }
             }
             Some(())
         })?;
-    Some(res)
+    Some((res, coplanar_fragment_ids))
 }
 
 #[cfg(test)]

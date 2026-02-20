@@ -242,14 +242,32 @@ fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     let loops_store::LoopsStoreQuadruple {
         geom_loops_store0: loops_store0,
         geom_loops_store1: loops_store1,
+        coplanar_faces0,
+        coplanar_faces1,
         ..
-    } = loops_store::create_loops_stores(&altshell0, &poly_shell0, &altshell1, &poly_shell1)?;
-    let mut cls0 = divide_face::divide_faces(&altshell0, &loops_store0, tol)?;
+    } = loops_store::create_loops_stores(&altshell0, &poly_shell0, &altshell1, &poly_shell1, tol)?;
+    let (mut cls0, coplanar_fids0) =
+        divide_face::divide_faces_with_coplanar(&altshell0, &loops_store0, tol, &coplanar_faces0)?;
     cls0.integrate_by_component();
-    let mut cls1 = divide_face::divide_faces(&altshell1, &loops_store1, tol)?;
+    let (mut cls1, coplanar_fids1) =
+        divide_face::divide_faces_with_coplanar(&altshell1, &loops_store1, tol, &coplanar_faces1)?;
     cls1.integrate_by_component();
+    // Reset overlapping coplanar fragments to Unknown for re-classification.
+    // Pass the original shells (not altshells) since coplanar classification
+    // only needs surface operations.
+    cls0.reset_overlapping_coplanar(&coplanar_fids0, shell1, true, tol);
+    cls1.reset_overlapping_coplanar(&coplanar_fids1, shell0, false, tol);
     let [mut and0, mut or0, unknown0] = cls0.and_or_unknown();
     unknown0.into_iter().try_for_each(|face| {
+        // Try coplanar classification first (against original shell).
+        if let Some(action) = coplanar::classify_coplanar_fragment(&face, shell1, true, tol) {
+            match action {
+                coplanar::CoplanarAction::Remove => {}
+                coplanar::CoplanarAction::And => and0.push(face),
+                coplanar::CoplanarAction::Or => or0.push(face),
+            }
+            return Some(());
+        }
         let count = ray_cast_classify(&face, &poly_shell1)?;
         if count == 1 {
             and0.push(face);
@@ -260,6 +278,15 @@ fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     })?;
     let [mut and1, mut or1, unknown1] = cls1.and_or_unknown();
     unknown1.into_iter().try_for_each(|face| {
+        // Try coplanar classification first (against original shell).
+        if let Some(action) = coplanar::classify_coplanar_fragment(&face, shell0, false, tol) {
+            match action {
+                coplanar::CoplanarAction::Remove => {}
+                coplanar::CoplanarAction::And => and1.push(face),
+                coplanar::CoplanarAction::Or => or1.push(face),
+            }
+            return Some(());
+        }
         let count = ray_cast_classify(&face, &poly_shell0)?;
         if count == 1 {
             and1.push(face);
