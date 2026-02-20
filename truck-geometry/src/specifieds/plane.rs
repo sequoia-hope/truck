@@ -186,8 +186,28 @@ impl IncludeCurve<NurbsCurve<Vector4>> for Plane {
 
 impl ParameterDivision2D for Plane {
     #[inline(always)]
-    fn parameter_division(&self, range: ((f64, f64), (f64, f64)), _: f64) -> (Vec<f64>, Vec<f64>) {
-        (vec![range.0 .0, range.0 .1], vec![range.1 .0, range.1 .1])
+    fn parameter_division(
+        &self,
+        range: ((f64, f64), (f64, f64)),
+        tol: f64,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let u_span = range.0 .1 - range.0 .0;
+        let v_span = range.1 .1 - range.1 .0;
+        // Convert parameter-space spans to world-space by multiplying by axis
+        // magnitudes. This ensures planes with large axes get proportionally
+        // finer triangulation for accurate intersection.
+        let u_world = u_span * (self.p - self.o).magnitude().max(1e-12);
+        let v_world = v_span * (self.q - self.o).magnitude().max(1e-12);
+        let safe_tol = if tol > 1e-12 { tol } else { 0.05 };
+        let n_u = ((u_world / safe_tol).sqrt().ceil() as usize).clamp(2, 64);
+        let n_v = ((v_world / safe_tol).sqrt().ceil() as usize).clamp(2, 64);
+        let us: Vec<f64> = (0..=n_u)
+            .map(|i| range.0 .0 + u_span * (i as f64 / n_u as f64))
+            .collect();
+        let vs: Vec<f64> = (0..=n_v)
+            .map(|i| range.1 .0 + v_span * (i as f64 / n_v as f64))
+            .collect();
+        (us, vs)
     }
 }
 
@@ -250,4 +270,29 @@ impl From<Plane> for BSplineSurface<Point3> {
 
 impl ToSameGeometry<BSplineSurface<Point3>> for Plane {
     fn to_same_geometry(&self) -> BSplineSurface<Point3> { (*self).into() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plane_adaptive_parameter_division() {
+        let plane = Plane::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(10.0, 0.0, 0.0),
+            Point3::new(0.0, 10.0, 0.0),
+        );
+        let range = ((0.0, 1.0), (0.0, 1.0));
+        let (us, vs) = plane.parameter_division(range, 0.05);
+        // World extent is 10.0 in each direction, tol=0.05
+        // n = ceil(sqrt(10.0 / 0.05)) = ceil(sqrt(200)) = ceil(14.14) = 15
+        assert!(us.len() > 2, "expected adaptive subdivision, got {} u-divisions", us.len());
+        assert!(vs.len() > 2, "expected adaptive subdivision, got {} v-divisions", vs.len());
+        // Endpoints must match range
+        assert!((us[0] - 0.0).abs() < 1e-12);
+        assert!((us[us.len() - 1] - 1.0).abs() < 1e-12);
+        assert!((vs[0] - 0.0).abs() < 1e-12);
+        assert!((vs[vs.len() - 1] - 1.0).abs() < 1e-12);
+    }
 }
