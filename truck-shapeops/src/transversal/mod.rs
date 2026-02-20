@@ -8,6 +8,7 @@ mod loops_store;
 mod polyline_construction;
 pub(crate) mod robust_classify;
 pub use integrate::{
-    and, and_result, difference, difference_result, or, or_result, BooleanStageError,
-    ShapeOpsCurve, ShapeOpsSurface,
+    and, and_result, and_result_with_tol, and_with_tol, difference, difference_result,
+    difference_result_with_tol, difference_with_tol, or, or_result, or_result_with_tol,
+    or_with_tol, BooleanStageError, BooleanTolerance, ShapeOpsCurve, ShapeOpsSurface,
 };

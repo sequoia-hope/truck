@@ -5,6 +5,58 @@ use truck_geometry::prelude::*;
 use truck_meshalgo::prelude::*;
 use truck_topology::*;
 
+/// Per-stage tolerance configuration for boolean operations.
+///
+/// Different stages of the boolean pipeline have different precision needs:
+/// - Mesh collision needs coarser tolerance (speed)
+/// - Intersection curves need model-level precision
+/// - Vertex welding needs wider tolerance to close gaps
+/// - Coplanar detection needs wider tolerance for normal/distance comparison
+///
+/// Using a single `tol` for all stages causes failures when the tolerance
+/// is appropriate for one stage but too large/small for another.
+#[derive(Clone, Debug)]
+pub struct BooleanTolerance {
+    /// Main coincidence/intersection tolerance (model precision).
+    pub tau_model: f64,
+    /// Mesh collision resolution tolerance (triangulation accuracy).
+    pub tau_mesh: f64,
+    /// Vertex unification tolerance in `weld_coincident_edges`.
+    pub tau_weld: f64,
+    /// Coplanar face detection threshold (normal parallelism + plane distance).
+    pub tau_coplanar: f64,
+}
+
+impl BooleanTolerance {
+    /// All stages use the same tolerance. Matches legacy single-tol behavior.
+    pub fn uniform(tol: f64) -> Self {
+        Self {
+            tau_model: tol,
+            tau_mesh: tol,
+            tau_weld: tol,
+            tau_coplanar: tol,
+        }
+    }
+
+    /// Derive per-stage tolerances from a model tolerance.
+    ///
+    /// Currently all stages use `tau_model` directly, matching the proven
+    /// single-tolerance behavior. The struct allows per-stage overrides for
+    /// specific use cases (e.g., tighter mesh for small features).
+    ///
+    /// Note: `tau_coplanar` must remain close to `tau_model` because the
+    /// coplanar normal check uses `1.0 - tol` as threshold. Large values
+    /// (e.g., 5x) would accept nearly-perpendicular faces as coplanar.
+    pub fn from_model_tol(tau_model: f64) -> Self {
+        Self {
+            tau_model,
+            tau_mesh: tau_model,
+            tau_weld: tau_model,
+            tau_coplanar: tau_model,
+        }
+    }
+}
+
 /// Only solids consisting of faces whose surface is implemented this trait can be used for set operations.
 pub trait ShapeOpsSurface:
     ParametricSurface3D
@@ -265,14 +317,23 @@ struct ClassifiedShellBuckets<P, C, S> {
     or1: Shell<P, C, S>,
 }
 
+#[allow(dead_code)]
 fn classify_one_pair_of_shells_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell0: &Shell<Point3, C, S>,
     shell1: &Shell<Point3, C, S>,
     tol: f64,
 ) -> std::result::Result<ClassifiedShellBuckets<Point3, C, S>, BooleanStageError> {
-    nonpositive_tolerance!(tol);
-    let poly_shell0 = shell0.triangulation(tol);
-    let poly_shell1 = shell1.triangulation(tol);
+    classify_one_pair_of_shells_result_with_tol(shell0, shell1, &BooleanTolerance::uniform(tol))
+}
+
+fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell0: &Shell<Point3, C, S>,
+    shell1: &Shell<Point3, C, S>,
+    tols: &BooleanTolerance,
+) -> std::result::Result<ClassifiedShellBuckets<Point3, C, S>, BooleanStageError> {
+    nonpositive_tolerance!(tols.tau_model);
+    let poly_shell0 = shell0.triangulation(tols.tau_mesh);
+    let poly_shell1 = shell1.triangulation(tols.tau_mesh);
     let altshell0: AltCurveShell<C, S> =
         shell0.mapped(|x| *x, |c| Alternative::FirstType(c.clone()), Clone::clone);
     let altshell1: AltCurveShell<C, S> =
@@ -283,24 +344,41 @@ fn classify_one_pair_of_shells_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         coplanar_faces0,
         coplanar_faces1,
         ..
-    } = loops_store::create_loops_stores(&altshell0, &poly_shell0, &altshell1, &poly_shell1, tol)
-        .ok_or(BooleanStageError::LoopsStoreCreation)?;
-    let (mut cls0, coplanar_fids0) =
-        divide_face::divide_faces_with_coplanar(&altshell0, &loops_store0, tol, &coplanar_faces0)
-            .ok_or(BooleanStageError::FaceDivision)?;
+    } = loops_store::create_loops_stores(
+        &altshell0,
+        &poly_shell0,
+        &altshell1,
+        &poly_shell1,
+        tols.tau_model,
+        Some(tols.tau_coplanar),
+    )
+    .ok_or(BooleanStageError::LoopsStoreCreation)?;
+    let (mut cls0, coplanar_fids0) = divide_face::divide_faces_with_coplanar(
+        &altshell0,
+        &loops_store0,
+        tols.tau_model,
+        &coplanar_faces0,
+    )
+    .ok_or(BooleanStageError::FaceDivision)?;
     cls0.integrate_by_component();
-    let (mut cls1, coplanar_fids1) =
-        divide_face::divide_faces_with_coplanar(&altshell1, &loops_store1, tol, &coplanar_faces1)
-            .ok_or(BooleanStageError::FaceDivision)?;
+    let (mut cls1, coplanar_fids1) = divide_face::divide_faces_with_coplanar(
+        &altshell1,
+        &loops_store1,
+        tols.tau_model,
+        &coplanar_faces1,
+    )
+    .ok_or(BooleanStageError::FaceDivision)?;
     cls1.integrate_by_component();
     // Reset overlapping coplanar fragments to Unknown for re-classification.
-    cls0.reset_overlapping_coplanar(&coplanar_fids0, shell1, true, tol);
-    cls1.reset_overlapping_coplanar(&coplanar_fids1, shell0, false, tol);
+    cls0.reset_overlapping_coplanar(&coplanar_fids0, shell1, true, tols.tau_coplanar);
+    cls1.reset_overlapping_coplanar(&coplanar_fids1, shell0, false, tols.tau_coplanar);
     let [mut and0, mut or0, unknown0] = cls0.and_or_unknown();
     unknown0
         .into_iter()
         .try_for_each(|face| {
-            if let Some(action) = coplanar::classify_coplanar_fragment(&face, shell1, true, tol) {
+            if let Some(action) =
+                coplanar::classify_coplanar_fragment(&face, shell1, true, tols.tau_coplanar)
+            {
                 match action {
                     coplanar::CoplanarAction::Remove => {}
                     coplanar::CoplanarAction::And => and0.push(face),
@@ -321,7 +399,9 @@ fn classify_one_pair_of_shells_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     unknown1
         .into_iter()
         .try_for_each(|face| {
-            if let Some(action) = coplanar::classify_coplanar_fragment(&face, shell0, false, tol) {
+            if let Some(action) =
+                coplanar::classify_coplanar_fragment(&face, shell0, false, tols.tau_coplanar)
+            {
                 match action {
                     coplanar::CoplanarAction::Remove => {}
                     coplanar::CoplanarAction::And => and1.push(face),
@@ -339,13 +419,13 @@ fn classify_one_pair_of_shells_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         })
         .ok_or(BooleanStageError::Classification)?;
     Ok(ClassifiedShellBuckets {
-        and0: altshell_to_shell(&and0, tol)
+        and0: altshell_to_shell(&and0, tols.tau_model)
             .ok_or(BooleanStageError::ShellAssembly("altshell_to_shell(and0)".into()))?,
-        or0: altshell_to_shell(&or0, tol)
+        or0: altshell_to_shell(&or0, tols.tau_model)
             .ok_or(BooleanStageError::ShellAssembly("altshell_to_shell(or0)".into()))?,
-        and1: altshell_to_shell(&and1, tol)
+        and1: altshell_to_shell(&and1, tols.tau_model)
             .ok_or(BooleanStageError::ShellAssembly("altshell_to_shell(and1)".into()))?,
-        or1: altshell_to_shell(&or1, tol)
+        or1: altshell_to_shell(&or1, tols.tau_model)
             .ok_or(BooleanStageError::ShellAssembly("altshell_to_shell(or1)".into()))?,
     })
 }
@@ -355,12 +435,20 @@ fn process_one_pair_of_shells_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell1: &Shell<Point3, C, S>,
     tol: f64,
 ) -> std::result::Result<[Shell<Point3, C, S>; 2], BooleanStageError> {
+    process_one_pair_of_shells_result_with_tol(shell0, shell1, &BooleanTolerance::uniform(tol))
+}
+
+fn process_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell0: &Shell<Point3, C, S>,
+    shell1: &Shell<Point3, C, S>,
+    tols: &BooleanTolerance,
+) -> std::result::Result<[Shell<Point3, C, S>; 2], BooleanStageError> {
     let ClassifiedShellBuckets {
         mut and0,
         mut or0,
         mut and1,
         mut or1,
-    } = classify_one_pair_of_shells_result(shell0, shell1, tol)?;
+    } = classify_one_pair_of_shells_result_with_tol(shell0, shell1, tols)?;
     and0.append(&mut and1);
     or0.append(&mut or1);
     Ok([and0, or0])
@@ -580,20 +668,29 @@ pub fn and_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid1: &Solid<Point3, C, S>,
     tol: f64,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
+    and_result_with_tol(solid0, solid1, &BooleanTolerance::uniform(tol))
+}
+
+/// AND operation with per-stage tolerance control.
+pub fn and_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    solid1: &Solid<Point3, C, S>,
+    tols: &BooleanTolerance,
+) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
     let mut iter0 = solid0.boundaries().iter();
     let mut iter1 = solid1.boundaries().iter();
     let shell0 = iter0.next().unwrap();
     let shell1 = iter1.next().unwrap();
-    let [mut and_shell, _] = process_one_pair_of_shells_result(shell0, shell1, tol)?;
+    let [mut and_shell, _] = process_one_pair_of_shells_result_with_tol(shell0, shell1, tols)?;
     for shell in iter0 {
-        let [res, _] = process_one_pair_of_shells_result(&and_shell, shell, tol)?;
+        let [res, _] = process_one_pair_of_shells_result_with_tol(&and_shell, shell, tols)?;
         and_shell = res;
     }
     for shell in iter1 {
-        let [res, _] = process_one_pair_of_shells_result(&and_shell, shell, tol)?;
+        let [res, _] = process_one_pair_of_shells_result_with_tol(&and_shell, shell, tols)?;
         and_shell = res;
     }
-    weld_coincident_edges(&mut and_shell, tol, None);
+    weld_coincident_edges(&mut and_shell, tols.tau_model, None);
     let boundaries = and_shell.connected_components();
     Solid::try_new(boundaries)
         .map_err(|e| BooleanStageError::ShellAssembly(format!("Solid::try_new failed: {:?}", e)))
@@ -608,26 +705,44 @@ pub fn and<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     and_result(solid0, solid1, tol).ok()
 }
 
+/// AND operation with per-stage tolerance control.
+pub fn and_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    solid1: &Solid<Point3, C, S>,
+    tols: &BooleanTolerance,
+) -> Option<Solid<Point3, C, S>> {
+    and_result_with_tol(solid0, solid1, tols).ok()
+}
+
 /// OR operation between two solids, returning a structured error on failure.
 pub fn or_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid0: &Solid<Point3, C, S>,
     solid1: &Solid<Point3, C, S>,
     tol: f64,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
+    or_result_with_tol(solid0, solid1, &BooleanTolerance::uniform(tol))
+}
+
+/// OR operation with per-stage tolerance control.
+pub fn or_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    solid1: &Solid<Point3, C, S>,
+    tols: &BooleanTolerance,
+) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
     let mut iter0 = solid0.boundaries().iter();
     let mut iter1 = solid1.boundaries().iter();
     let shell0 = iter0.next().unwrap();
     let shell1 = iter1.next().unwrap();
-    let [_, mut or_shell] = process_one_pair_of_shells_result(shell0, shell1, tol)?;
+    let [_, mut or_shell] = process_one_pair_of_shells_result_with_tol(shell0, shell1, tols)?;
     for shell in iter0 {
-        let [_, res] = process_one_pair_of_shells_result(&or_shell, shell, tol)?;
+        let [_, res] = process_one_pair_of_shells_result_with_tol(&or_shell, shell, tols)?;
         or_shell = res;
     }
     for shell in iter1 {
-        let [_, res] = process_one_pair_of_shells_result(&or_shell, shell, tol)?;
+        let [_, res] = process_one_pair_of_shells_result_with_tol(&or_shell, shell, tols)?;
         or_shell = res;
     }
-    weld_coincident_edges(&mut or_shell, tol, None);
+    weld_coincident_edges(&mut or_shell, tols.tau_model, None);
     let boundaries = or_shell.connected_components();
     Solid::try_new(boundaries)
         .map_err(|e| BooleanStageError::ShellAssembly(format!("Solid::try_new failed: {:?}", e)))
@@ -642,6 +757,15 @@ pub fn or<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     or_result(solid0, solid1, tol).ok()
 }
 
+/// OR operation with per-stage tolerance control.
+pub fn or_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    solid1: &Solid<Point3, C, S>,
+    tols: &BooleanTolerance,
+) -> Option<Solid<Point3, C, S>> {
+    or_result_with_tol(solid0, solid1, tols).ok()
+}
+
 /// Difference operation: A \ B, returning a structured error on failure.
 /// Selects faces of A outside B (Or), plus faces of B inside A (And) with inverted orientation.
 pub fn difference_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
@@ -649,12 +773,21 @@ pub fn difference_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid1: &Solid<Point3, C, S>,
     tol: f64,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
+    difference_result_with_tol(solid0, solid1, &BooleanTolerance::uniform(tol))
+}
+
+/// Difference operation with per-stage tolerance control.
+pub fn difference_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    solid1: &Solid<Point3, C, S>,
+    tols: &BooleanTolerance,
+) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
     let mut iter0 = solid0.boundaries().iter();
     let mut iter1 = solid1.boundaries().iter();
     let shell0 = iter0.next().unwrap();
     let shell1 = iter1.next().unwrap();
     let ClassifiedShellBuckets { or0, and1, .. } =
-        classify_one_pair_of_shells_result(shell0, shell1, tol)?;
+        classify_one_pair_of_shells_result_with_tol(shell0, shell1, tols)?;
     // Difference = or0 (A faces outside B) + inverted and1 (B faces inside A, flipped)
     let mut diff_faces: Vec<Face<Point3, C, S>> = or0.into_iter().collect();
     for face in and1.into_iter() {
@@ -663,7 +796,7 @@ pub fn difference_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     let mut diff_shell: Shell<Point3, C, S> = diff_faces.into_iter().collect();
     // Handle additional boundary shells (multi-shell solids)
     for shell in iter0 {
-        let classified = classify_one_pair_of_shells_result(&diff_shell, shell, tol)?;
+        let classified = classify_one_pair_of_shells_result_with_tol(&diff_shell, shell, tols)?;
         let mut faces: Vec<Face<Point3, C, S>> = classified.or0.into_iter().collect();
         for face in classified.and1.into_iter() {
             faces.push(face.inverse());
@@ -671,14 +804,14 @@ pub fn difference_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         diff_shell = faces.into_iter().collect();
     }
     for shell in iter1 {
-        let classified = classify_one_pair_of_shells_result(&diff_shell, shell, tol)?;
+        let classified = classify_one_pair_of_shells_result_with_tol(&diff_shell, shell, tols)?;
         let mut faces: Vec<Face<Point3, C, S>> = classified.or0.into_iter().collect();
         for face in classified.and1.into_iter() {
             faces.push(face.inverse());
         }
         diff_shell = faces.into_iter().collect();
     }
-    weld_coincident_edges(&mut diff_shell, tol, None);
+    weld_coincident_edges(&mut diff_shell, tols.tau_model, None);
     let boundaries = diff_shell.connected_components();
     Solid::try_new(boundaries)
         .map_err(|e| BooleanStageError::ShellAssembly(format!("Solid::try_new failed: {:?}", e)))
@@ -692,6 +825,15 @@ pub fn difference<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     tol: f64,
 ) -> Option<Solid<Point3, C, S>> {
     difference_result(solid0, solid1, tol).ok()
+}
+
+/// Difference operation with per-stage tolerance control.
+pub fn difference_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    solid1: &Solid<Point3, C, S>,
+    tols: &BooleanTolerance,
+) -> Option<Solid<Point3, C, S>> {
+    difference_result_with_tol(solid0, solid1, tols).ok()
 }
 
 #[cfg(test)]

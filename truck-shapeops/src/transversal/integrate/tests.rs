@@ -717,3 +717,139 @@ fn coplanar_chained_union() {
         shell.len()
     );
 }
+
+/// 10x10x10 box minus 10x10x5 tool aligned to one face (mutual containment).
+///
+/// When the tool shares a full face with the target (e.g., the tool's top
+/// face has the same 10x10 extent as the target's top face), both j_in_i
+/// and i_in_j are true. Without the mutual-containment fix, both adjacency
+/// skip branches fire, suppressing ALL intersection curves and producing
+/// Unknown faces -> NotClosedShell.
+#[test]
+fn full_face_rect_difference() {
+    // Target: 10x10x10 box at origin
+    let v = builder::vertex(Point3::origin());
+    let e = builder::tsweep(&v, Vector3::unit_x() * 10.0);
+    let f = builder::tsweep(&e, Vector3::unit_y() * 10.0);
+    let cube: Solid = builder::tsweep(&f, Vector3::unit_z() * 10.0);
+
+    // Tool: 10x10x5 box starting at z=5, so its bottom face (z=5, 10x10)
+    // is NOT coplanar with any target face, but its TOP face (z=10, 10x10)
+    // has the same extent as the target's top face (z=10, 10x10).
+    let v2 = builder::vertex(Point3::new(0.0, 0.0, 5.0));
+    let e2 = builder::tsweep(&v2, Vector3::unit_x() * 10.0);
+    let f2 = builder::tsweep(&e2, Vector3::unit_y() * 10.0);
+    let mut tool: Solid = builder::tsweep(&f2, Vector3::unit_z() * 5.0);
+    tool.not();
+
+    let result = crate::and(&cube, &tool, 0.05);
+    assert!(
+        result.is_some(),
+        "Full-face rect difference (mutual containment) should succeed"
+    );
+
+    let solid = result.unwrap();
+    let shell = &solid.boundaries()[0];
+    // The result should be a 10x10x5 box (bottom half), which has 6 faces.
+    assert!(
+        shell.len() >= 6,
+        "Full-face difference should produce at least 6 faces (got {})",
+        shell.len()
+    );
+
+    // Verify the result is a closed manifold
+    use truck_topology::shell::ShellCondition;
+    assert_eq!(
+        shell.shell_condition(),
+        ShellCondition::Closed,
+        "Full-face difference result must be a closed manifold"
+    );
+}
+
+/// Same-extent subtraction where tool and target share the full top AND
+/// lateral faces have the same projected extent on the coplanar plane.
+/// This creates the most aggressive mutual containment scenario:
+/// the tool occupies the exact same footprint on the shared coplanar face.
+///
+/// Uses and_result to get structured error reporting.
+#[test]
+fn full_face_rect_difference_result() {
+    // Target: 10x10x10 box
+    let v = builder::vertex(Point3::origin());
+    let e = builder::tsweep(&v, Vector3::unit_x() * 10.0);
+    let f = builder::tsweep(&e, Vector3::unit_y() * 10.0);
+    let cube: Solid = builder::tsweep(&f, Vector3::unit_z() * 10.0);
+
+    // Tool: same 10x10 footprint, extends from z=5 to z=10.
+    let v2 = builder::vertex(Point3::new(0.0, 0.0, 5.0));
+    let e2 = builder::tsweep(&v2, Vector3::unit_x() * 10.0);
+    let f2 = builder::tsweep(&e2, Vector3::unit_y() * 10.0);
+    let mut tool: Solid = builder::tsweep(&f2, Vector3::unit_z() * 5.0);
+    tool.not();
+
+    let result = crate::and_result(&cube, &tool, 0.05);
+    assert!(
+        result.is_ok(),
+        "Full-face rect difference should return Ok, got: {:?}",
+        result.err()
+    );
+
+    let solid = result.unwrap();
+    let shell = &solid.boundaries()[0];
+    use truck_topology::shell::ShellCondition;
+    assert_eq!(
+        shell.shell_condition(),
+        ShellCondition::Closed,
+        "Full-face difference result must be a closed manifold"
+    );
+}
+
+/// Two boxes with same-extent lateral faces: mutual containment on a side.
+///
+/// Box A: [0,10] x [0,10] x [0,10]
+/// Box B: [0,10] x [0,10] x [5,15]
+/// Their y=0 and y=10 faces have the same x and z extent where they overlap,
+/// creating mutual containment on those lateral coplanar faces.
+#[test]
+fn mutual_containment_coplanar() {
+    let box_a: Solid = {
+        let v = builder::vertex(Point3::origin());
+        let e = builder::tsweep(&v, Vector3::unit_x() * 10.0);
+        let f = builder::tsweep(&e, Vector3::unit_y() * 10.0);
+        builder::tsweep(&f, Vector3::unit_z() * 10.0)
+    };
+
+    // Box B shares the x-extent and y-extent with Box A but is offset in z.
+    // The z=10 face of A is coplanar with the z=10 face of B — but B's
+    // z=10 face is at a different z. Actually, let's use a simpler setup:
+    // Box B sits flush on top of Box A, sharing the z=10 face.
+    let box_b: Solid = {
+        let v = builder::vertex(Point3::new(0.0, 0.0, 10.0));
+        let e = builder::tsweep(&v, Vector3::unit_x() * 10.0);
+        let f = builder::tsweep(&e, Vector3::unit_y() * 10.0);
+        builder::tsweep(&f, Vector3::unit_z() * 10.0)
+    };
+
+    // Union: should produce a 10x10x20 box
+    let result = crate::or(&box_a, &box_b, 0.05);
+    assert!(
+        result.is_some(),
+        "Mutual containment coplanar union should succeed"
+    );
+
+    let solid = result.unwrap();
+    let shell = &solid.boundaries()[0];
+    // Two stacked boxes merged should produce exactly 6 faces (one merged box)
+    // or at minimum a closed manifold.
+    use truck_topology::shell::ShellCondition;
+    assert_eq!(
+        shell.shell_condition(),
+        ShellCondition::Closed,
+        "Mutual containment union result must be a closed manifold"
+    );
+    assert!(
+        shell.len() >= 6,
+        "Mutual containment union should produce at least 6 faces (got {})",
+        shell.len()
+    );
+}

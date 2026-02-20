@@ -644,6 +644,7 @@ pub fn create_loops_stores<C, S>(
     geom_shell1: &Shell<Point3, C, S>,
     poly_shell1: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
     tol: f64,
+    coplanar_tol: Option<f64>,
 ) -> Option<LoopsStoreQuadruple<C>>
 where
     C: SearchNearestParameter<D1, Point = Point3>
@@ -652,6 +653,7 @@ where
         + From<IntersectionCurve<PolylineCurve, S, S>>,
     S: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
 {
+    let coplanar_tol = coplanar_tol.unwrap_or(tol);
     let mut geom_loops_store0: LoopsStore<_, _> = geom_shell0.face_iter().collect();
     let mut poly_loops_store0: LoopsStore<_, _> = poly_shell0.face_iter().collect();
     let mut geom_loops_store1: LoopsStore<_, _> = geom_shell1.face_iter().collect();
@@ -665,8 +667,12 @@ where
     let mut coplanar_pairs: Vec<(usize, usize)> = Vec::new();
     for i in 0..store0_len {
         for j in 0..store1_len {
-            if coplanar_splitting::check_coplanar_faces(&geom_shell0[i], &geom_shell1[j], tol)
-                .is_some()
+            if coplanar_splitting::check_coplanar_faces(
+                &geom_shell0[i],
+                &geom_shell1[j],
+                coplanar_tol,
+            )
+            .is_some()
             {
                 coplanar_faces0.insert(i);
                 coplanar_faces1.insert(j);
@@ -736,8 +742,15 @@ where
             let j_in_i = poly_j_2d.iter().all(|pt| point_in_polygon(*pt, &poly_i_2d));
             let i_in_j = poly_i_2d.iter().all(|pt| point_in_polygon(*pt, &poly_j_2d));
 
-            if j_in_i {
-                // face j (shell1) is fully contained in face i (shell0).
+            // When BOTH j_in_i and i_in_j are true, the faces have the same
+            // extent (mutual containment). Neither is strictly contained in
+            // the other, so we must NOT skip any adjacency — the coplanar
+            // face pair itself is already handled downstream, and intersection
+            // curves from adjacent faces are legitimate. Skipping both
+            // directions would suppress ALL intersection curves, producing
+            // Unknown faces and NotClosedShell errors.
+            if j_in_i && !i_in_j {
+                // face j (shell1) is strictly contained in face i (shell0).
                 // Skip (i, k) for all faces k in shell1 adjacent to j.
                 for k in 0..store1_len {
                     if k == j {
@@ -748,8 +761,8 @@ where
                     }
                 }
             }
-            if i_in_j {
-                // face i (shell0) is fully contained in face j (shell1).
+            if i_in_j && !j_in_i {
+                // face i (shell0) is strictly contained in face j (shell1).
                 // Skip (k, j) for all faces k in shell0 adjacent to i.
                 for k in 0..store0_len {
                     if k == i {
