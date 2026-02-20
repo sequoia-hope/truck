@@ -126,22 +126,7 @@ where
     Some(vec)
 }
 
-#[allow(dead_code)]
-pub fn divide_faces<C, S>(
-    shell: &Shell<Point3, C, S>,
-    loops_store: &LoopsStore<Point3, C>,
-    tol: f64,
-) -> Option<FacesClassification<Point3, C, S>>
-where
-    C: BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
-    S: Clone + SearchParameter<D2, Point = Point3>,
-{
-    let (cls, _) =
-        divide_faces_with_coplanar(shell, loops_store, tol, &rustc_hash::FxHashSet::default())?;
-    Some(cls)
-}
-
-/// Like `divide_faces` but tracks fragments from coplanar faces.
+/// Divide faces and track fragments from coplanar faces.
 /// Returns (classification, coplanar_fragment_face_ids) so the caller can re-force
 /// coplanar fragments to Unknown after `integrate_by_component`.
 #[allow(clippy::type_complexity)]

@@ -46,14 +46,15 @@ impl BooleanTolerance {
     ///   default of `tol * 0.2`, but well below the feature-size failure threshold
     ///   of ~0.10 * min_edge. A 2x multiplier was too aggressive and merged
     ///   vertices across small features like narrow bosses.)
-    /// - `tau_coplanar`: 5x model (angular threshold uses `tol * tol` approximation,
-    ///   so `5 * 0.005 = 0.025` → `0.025² = 0.000625 rad ≈ 0.036°` threshold)
+    /// - `tau_coplanar`: same as model — the coplanar distance check uses `tol`
+    ///   directly (not squared), so a multiplier causes false coplanar detection
+    ///   when faces are merely close (e.g., separated by cut_eps offset).
     pub fn from_model_tol(tau_model: f64) -> Self {
         Self {
             tau_model,
             tau_mesh: tau_model,
             tau_weld: 0.4 * tau_model,
-            tau_coplanar: 5.0 * tau_model,
+            tau_coplanar: tau_model,
         }
     }
 }
@@ -359,15 +360,6 @@ struct ClassifiedShellBuckets<P, C, S> {
     or1: Shell<P, C, S>,
 }
 
-#[allow(dead_code)]
-fn classify_one_pair_of_shells_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
-    shell0: &Shell<Point3, C, S>,
-    shell1: &Shell<Point3, C, S>,
-    tol: f64,
-) -> std::result::Result<ClassifiedShellBuckets<Point3, C, S>, BooleanStageError> {
-    classify_one_pair_of_shells_result_with_tol(shell0, shell1, &BooleanTolerance::uniform(tol))
-}
-
 fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell0: &Shell<Point3, C, S>,
     shell1: &Shell<Point3, C, S>,
@@ -476,14 +468,6 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
     })
 }
 
-fn process_one_pair_of_shells_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
-    shell0: &Shell<Point3, C, S>,
-    shell1: &Shell<Point3, C, S>,
-    tol: f64,
-) -> std::result::Result<[Shell<Point3, C, S>; 2], BooleanStageError> {
-    process_one_pair_of_shells_result_with_tol(shell0, shell1, &BooleanTolerance::uniform(tol))
-}
-
 fn process_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell0: &Shell<Point3, C, S>,
     shell1: &Shell<Point3, C, S>,
@@ -498,15 +482,6 @@ fn process_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSu
     and0.append(&mut and1);
     or0.append(&mut or1);
     Ok([and0, or0])
-}
-
-#[allow(dead_code)]
-fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
-    shell0: &Shell<Point3, C, S>,
-    shell1: &Shell<Point3, C, S>,
-    tol: f64,
-) -> Option<[Shell<Point3, C, S>; 2]> {
-    process_one_pair_of_shells_result(shell0, shell1, tol).ok()
 }
 
 /// Weld coincident edges in a shell: when two different Edge objects connect

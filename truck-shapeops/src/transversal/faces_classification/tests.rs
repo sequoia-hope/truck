@@ -114,9 +114,21 @@ fn independent_intersection() {
         ..
     } = loops_store::create_loops_stores(&shell0, &poly_shell0, &shell1, &poly_shell1, TOL, None)
         .unwrap();
-    let mut cls0 = divide_face::divide_faces(&shell0, &loops_store0, TOL).unwrap();
+    let (mut cls0, _) = divide_face::divide_faces_with_coplanar(
+        &shell0,
+        &loops_store0,
+        TOL,
+        &rustc_hash::FxHashSet::default(),
+    )
+    .unwrap();
     cls0.integrate_by_component();
-    let mut cls1 = divide_face::divide_faces(&shell1, &loops_store1, TOL).unwrap();
+    let (mut cls1, _) = divide_face::divide_faces_with_coplanar(
+        &shell1,
+        &loops_store1,
+        TOL,
+        &rustc_hash::FxHashSet::default(),
+    )
+    .unwrap();
     cls1.integrate_by_component();
 
     let [mut and, mut or, _] = cls0.and_or_unknown();

@@ -648,12 +648,11 @@ fn determine_injection_status(
     }
 }
 
-#[allow(dead_code)]
 pub struct LoopsStoreQuadruple<C> {
     pub geom_loops_store0: LoopsStore<Point3, C>,
-    pub poly_loops_store0: LoopsStore<Point3, PolylineCurve>,
+    pub _poly_loops_store0: LoopsStore<Point3, PolylineCurve>,
     pub geom_loops_store1: LoopsStore<Point3, C>,
-    pub poly_loops_store1: LoopsStore<Point3, PolylineCurve>,
+    pub _poly_loops_store1: LoopsStore<Point3, PolylineCurve>,
     /// Face indices in shell0 that are coplanar with some face in shell1.
     pub coplanar_faces0: rustc_hash::FxHashSet<usize>,
     /// Face indices in shell1 that are coplanar with some face in shell0.
@@ -985,9 +984,9 @@ where
 
     Some(LoopsStoreQuadruple {
         geom_loops_store0,
-        poly_loops_store0,
+        _poly_loops_store0: poly_loops_store0,
         geom_loops_store1,
-        poly_loops_store1,
+        _poly_loops_store1: poly_loops_store1,
         coplanar_faces0,
         coplanar_faces1,
     })
