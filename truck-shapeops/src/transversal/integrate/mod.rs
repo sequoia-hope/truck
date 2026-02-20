@@ -49,6 +49,161 @@ impl<C, S: ShapeOpsSurface> ShapeOpsCurve<S> for C where C: ParametricCurve3D
 {
 }
 
+/// Ray-cast from a point against a triangulated shell. Returns the signed
+/// crossing count, or None if the ray grazes an edge.
+pub(crate) fn try_ray_cast(
+    pt: Point3,
+    dir: Vector3,
+    poly_shell: &Shell<Point3, PolylineCurve<Point3>, Option<PolygonMesh>>,
+) -> Option<isize> {
+    poly_shell.iter().try_fold(0isize, |count, face| {
+        let poly = face.surface()?;
+        Some(count + poly.signed_crossing_faces(pt, dir))
+    })
+}
+
+/// Compute the maximum extent (bounding box diagonal) of a triangulated shell.
+/// Used for scale-adaptive perturbation in ray-cast classification.
+pub(crate) fn compute_shell_extent_poly(
+    poly_shell: &Shell<Point3, PolylineCurve<Point3>, Option<PolygonMesh>>,
+) -> f64 {
+    let (mut min_x, mut min_y, mut min_z) = (f64::MAX, f64::MAX, f64::MAX);
+    let (mut max_x, mut max_y, mut max_z) = (f64::MIN, f64::MIN, f64::MIN);
+    for face in poly_shell.iter() {
+        for wire in face.absolute_boundaries().iter() {
+            for v in wire.vertex_iter() {
+                let pt = v.point();
+                min_x = min_x.min(pt.x);
+                min_y = min_y.min(pt.y);
+                min_z = min_z.min(pt.z);
+                max_x = max_x.max(pt.x);
+                max_y = max_y.max(pt.y);
+                max_z = max_z.max(pt.z);
+            }
+        }
+    }
+    let dx = max_x - min_x;
+    let dy = max_y - min_y;
+    let dz = max_z - min_z;
+    dx.max(dy).max(dz).max(1.0)
+}
+
+/// Irrational ray directions that avoid grid alignment in triangulated meshes.
+/// Each direction has a dominant axis component plus small irrational offsets.
+pub(crate) fn irrational_ray_dirs() -> [Vector3; 4] {
+    let sqrt2 = std::f64::consts::SQRT_2;
+    let sqrt3 = 3.0f64.sqrt();
+    let sqrt5 = 5.0f64.sqrt();
+    let sqrt7 = 7.0f64.sqrt();
+    let sqrt11 = 11.0f64.sqrt();
+    let sqrt13 = 13.0f64.sqrt();
+    [
+        Vector3::new(1.0, sqrt2 / 10.0, sqrt3 / 10.0),
+        Vector3::new(sqrt2 / 10.0, 1.0, sqrt5 / 10.0),
+        Vector3::new(sqrt3 / 10.0, sqrt5 / 10.0, 1.0),
+        Vector3::new(sqrt7 / 10.0, sqrt11 / 10.0, sqrt13 / 10.0),
+    ]
+}
+
+/// Ray-cast a face against a triangulated shell to determine inside/outside.
+///
+/// Uses scale-adaptive perturbation and irrational ray directions with majority
+/// voting to avoid false classifications from grid-aligned triangulation.
+fn ray_cast_classify<C, S>(
+    face: &Face<Point3, C, S>,
+    poly_shell: &Shell<Point3, PolylineCurve<Point3>, Option<PolygonMesh>>,
+) -> Option<isize> {
+    let verts: Vec<_> = face.boundaries()[0]
+        .vertex_iter()
+        .map(|v| v.point())
+        .collect();
+
+    // Scale perturbation with model extent so it stays effective at any scale.
+    let extent = compute_shell_extent_poly(poly_shell);
+    let scale = extent.max(1.0);
+    let perturb = Vector3::new(
+        1.4142135623730951e-6 * scale,
+        1.7320508075688772e-6 * scale,
+        2.2360679774997896e-6 * scale,
+    );
+
+    let dirs = irrational_ray_dirs();
+
+    // Majority vote: cast all 4 irrational rays, take majority (need >=2 agreeing).
+    let majority_vote = |pt: Point3| -> Option<isize> {
+        let mut inside = 0u32;
+        let mut outside = 0u32;
+        for &d in &dirs {
+            if let Some(c) = try_ray_cast(pt, d, poly_shell) {
+                // Use parity (odd/even) of the absolute crossing count, not the
+                // sign. The parity is always correct: odd crossings = inside,
+                // even crossings = outside.
+                if c.unsigned_abs() % 2 == 1 {
+                    inside += 1;
+                } else {
+                    outside += 1;
+                }
+            }
+        }
+        if inside >= 2 {
+            Some(1)
+        } else if outside >= 2 {
+            Some(0)
+        } else {
+            None
+        }
+    };
+
+    // Bidirectional vote: try both +perturb and -perturb. If they agree, the
+    // result is reliable. If they disagree, the point is on the other shell's
+    // boundary surface — classify as outside (0).
+    let bidirectional_vote = |base: Point3| -> Option<isize> {
+        let pt_pos = base + perturb;
+        let pt_neg = base - perturb;
+        let vote_pos = majority_vote(pt_pos);
+        let vote_neg = majority_vote(pt_neg);
+        match (vote_pos, vote_neg) {
+            (Some(a), Some(b)) if a == b => Some(a),
+            (Some(_a), Some(_b)) => Some(0), // Disagree → on boundary → outside
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    };
+
+    // Strategy 1: Face centroid — best for split faces where vertices sit on
+    // splitting edges. Skip for ring faces (faces with holes).
+    let has_holes = face.boundaries().len() > 1;
+    let n = verts.len().max(1) as f64;
+    let centroid_v = verts.iter().fold(Vector3::new(0.0, 0.0, 0.0), |a, &p| {
+        a + (p - Point3::origin())
+    }) / n;
+    let centroid = Point3::origin() + centroid_v;
+
+    if !has_holes {
+        if let Some(c) = bidirectional_vote(centroid) {
+            return Some(c);
+        }
+    }
+
+    // Strategy 2: Boundary vertices — try each vertex (different grid positions).
+    for &v in &verts {
+        if let Some(c) = bidirectional_vote(v) {
+            return Some(c);
+        }
+    }
+
+    // Last resort: accept any single non-None result from any direction.
+    let centroid_perturbed = centroid + perturb;
+    for &d in &dirs {
+        if let Some(c) = try_ray_cast(centroid_perturbed, d, poly_shell) {
+            return Some(if c.unsigned_abs() % 2 == 1 { 1 } else { 0 });
+        }
+    }
+
+    None
+}
+
 type AltCurveShell<C, S> =
     Shell<Point3, Alternative<C, IntersectionCurve<PolylineCurve<Point3>, S, S>>, S>;
 
@@ -95,13 +250,8 @@ fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     cls1.integrate_by_component();
     let [mut and0, mut or0, unknown0] = cls0.and_or_unknown();
     unknown0.into_iter().try_for_each(|face| {
-        let pt = face.boundaries()[0].vertex_iter().next().unwrap().point();
-        let dir = hash::take_one_unit(pt);
-        let count = poly_shell1.iter().try_fold(0, |count, face| {
-            let poly = face.surface()?;
-            Some(count + poly.signed_crossing_faces(pt, dir))
-        })?;
-        if count >= 1 {
+        let count = ray_cast_classify(&face, &poly_shell1)?;
+        if count == 1 {
             and0.push(face);
         } else {
             or0.push(face);
@@ -110,13 +260,8 @@ fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     })?;
     let [mut and1, mut or1, unknown1] = cls1.and_or_unknown();
     unknown1.into_iter().try_for_each(|face| {
-        let pt = face.boundaries()[0].vertex_iter().next().unwrap().point();
-        let dir = hash::take_one_unit(pt);
-        let count = poly_shell0.iter().try_fold(0, |count, face| {
-            let poly = face.surface()?;
-            Some(count + poly.signed_crossing_faces(pt, dir))
-        })?;
-        if count >= 1 {
+        let count = ray_cast_classify(&face, &poly_shell0)?;
+        if count == 1 {
             and1.push(face);
         } else {
             or1.push(face);
