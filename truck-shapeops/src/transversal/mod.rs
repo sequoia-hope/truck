@@ -7,4 +7,7 @@ mod intersection_curve;
 mod loops_store;
 mod polyline_construction;
 pub(crate) mod robust_classify;
-pub use integrate::{and, or, ShapeOpsCurve, ShapeOpsSurface};
+pub use integrate::{
+    and, and_result, difference, difference_result, or, or_result, BooleanStageError,
+    ShapeOpsCurve, ShapeOpsSurface,
+};

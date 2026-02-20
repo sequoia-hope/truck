@@ -16,6 +16,9 @@
 mod healing;
 pub use healing::{RobustSplitClosedEdgesAndFaces, SplitClosedEdgesAndFaces};
 mod transversal;
-pub use transversal::{and, or, ShapeOpsCurve, ShapeOpsSurface};
+pub use transversal::{
+    and, and_result, difference, difference_result, or, or_result, BooleanStageError,
+    ShapeOpsCurve, ShapeOpsSurface,
+};
 mod alternative;
 mod fillet;

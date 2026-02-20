@@ -227,11 +227,47 @@ fn altshell_to_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     )
 }
 
-fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+/// Structured error type for boolean pipeline stages.
+#[derive(Debug)]
+pub enum BooleanStageError {
+    /// loops_store creation failed (intersection curve construction)
+    LoopsStoreCreation,
+    /// Face division failed (splitting faces along intersection curves)
+    FaceDivision,
+    /// Ray-cast classification of a face fragment was ambiguous
+    Classification,
+    /// Final shell assembly failed (Solid::try_new returned Err)
+    ShellAssembly(String),
+}
+
+impl std::fmt::Display for BooleanStageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LoopsStoreCreation => write!(f, "loops store creation failed"),
+            Self::FaceDivision => write!(f, "face division failed"),
+            Self::Classification => write!(f, "face classification ambiguous"),
+            Self::ShellAssembly(detail) => write!(f, "shell assembly failed: {}", detail),
+        }
+    }
+}
+
+/// The 4 classified face buckets from a shell pair boolean operation.
+struct ClassifiedShellBuckets<P, C, S> {
+    /// shell0 faces inside shell1 (And)
+    and0: Shell<P, C, S>,
+    /// shell0 faces outside shell1 (Or)
+    or0: Shell<P, C, S>,
+    /// shell1 faces inside shell0 (And)
+    and1: Shell<P, C, S>,
+    /// shell1 faces outside shell0 (Or)
+    or1: Shell<P, C, S>,
+}
+
+fn classify_one_pair_of_shells_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell0: &Shell<Point3, C, S>,
     shell1: &Shell<Point3, C, S>,
     tol: f64,
-) -> Option<[Shell<Point3, C, S>; 2]> {
+) -> std::result::Result<ClassifiedShellBuckets<Point3, C, S>, BooleanStageError> {
     nonpositive_tolerance!(tol);
     let poly_shell0 = shell0.triangulation(tol);
     let poly_shell1 = shell1.triangulation(tol);
@@ -245,62 +281,307 @@ fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         coplanar_faces0,
         coplanar_faces1,
         ..
-    } = loops_store::create_loops_stores(&altshell0, &poly_shell0, &altshell1, &poly_shell1, tol)?;
+    } = loops_store::create_loops_stores(&altshell0, &poly_shell0, &altshell1, &poly_shell1, tol)
+        .ok_or(BooleanStageError::LoopsStoreCreation)?;
     let (mut cls0, coplanar_fids0) =
-        divide_face::divide_faces_with_coplanar(&altshell0, &loops_store0, tol, &coplanar_faces0)?;
+        divide_face::divide_faces_with_coplanar(&altshell0, &loops_store0, tol, &coplanar_faces0)
+            .ok_or(BooleanStageError::FaceDivision)?;
     cls0.integrate_by_component();
     let (mut cls1, coplanar_fids1) =
-        divide_face::divide_faces_with_coplanar(&altshell1, &loops_store1, tol, &coplanar_faces1)?;
+        divide_face::divide_faces_with_coplanar(&altshell1, &loops_store1, tol, &coplanar_faces1)
+            .ok_or(BooleanStageError::FaceDivision)?;
     cls1.integrate_by_component();
     // Reset overlapping coplanar fragments to Unknown for re-classification.
-    // Pass the original shells (not altshells) since coplanar classification
-    // only needs surface operations.
     cls0.reset_overlapping_coplanar(&coplanar_fids0, shell1, true, tol);
     cls1.reset_overlapping_coplanar(&coplanar_fids1, shell0, false, tol);
     let [mut and0, mut or0, unknown0] = cls0.and_or_unknown();
-    unknown0.into_iter().try_for_each(|face| {
-        // Try coplanar classification first (against original shell).
-        if let Some(action) = coplanar::classify_coplanar_fragment(&face, shell1, true, tol) {
-            match action {
-                coplanar::CoplanarAction::Remove => {}
-                coplanar::CoplanarAction::And => and0.push(face),
-                coplanar::CoplanarAction::Or => or0.push(face),
+    unknown0
+        .into_iter()
+        .try_for_each(|face| {
+            if let Some(action) = coplanar::classify_coplanar_fragment(&face, shell1, true, tol) {
+                match action {
+                    coplanar::CoplanarAction::Remove => {}
+                    coplanar::CoplanarAction::And => and0.push(face),
+                    coplanar::CoplanarAction::Or => or0.push(face),
+                }
+                return Some(());
             }
-            return Some(());
-        }
-        let count = ray_cast_classify(&face, &poly_shell1)?;
-        if count == 1 {
-            and0.push(face);
-        } else {
-            or0.push(face);
-        }
-        Some(())
-    })?;
+            let count = ray_cast_classify(&face, &poly_shell1)?;
+            if count == 1 {
+                and0.push(face);
+            } else {
+                or0.push(face);
+            }
+            Some(())
+        })
+        .ok_or(BooleanStageError::Classification)?;
     let [mut and1, mut or1, unknown1] = cls1.and_or_unknown();
-    unknown1.into_iter().try_for_each(|face| {
-        // Try coplanar classification first (against original shell).
-        if let Some(action) = coplanar::classify_coplanar_fragment(&face, shell0, false, tol) {
-            match action {
-                coplanar::CoplanarAction::Remove => {}
-                coplanar::CoplanarAction::And => and1.push(face),
-                coplanar::CoplanarAction::Or => or1.push(face),
+    unknown1
+        .into_iter()
+        .try_for_each(|face| {
+            if let Some(action) = coplanar::classify_coplanar_fragment(&face, shell0, false, tol) {
+                match action {
+                    coplanar::CoplanarAction::Remove => {}
+                    coplanar::CoplanarAction::And => and1.push(face),
+                    coplanar::CoplanarAction::Or => or1.push(face),
+                }
+                return Some(());
             }
-            return Some(());
-        }
-        let count = ray_cast_classify(&face, &poly_shell0)?;
-        if count == 1 {
-            and1.push(face);
-        } else {
-            or1.push(face);
-        }
-        Some(())
-    })?;
+            let count = ray_cast_classify(&face, &poly_shell0)?;
+            if count == 1 {
+                and1.push(face);
+            } else {
+                or1.push(face);
+            }
+            Some(())
+        })
+        .ok_or(BooleanStageError::Classification)?;
+    Ok(ClassifiedShellBuckets {
+        and0: altshell_to_shell(&and0, tol)
+            .ok_or(BooleanStageError::ShellAssembly("altshell_to_shell(and0)".into()))?,
+        or0: altshell_to_shell(&or0, tol)
+            .ok_or(BooleanStageError::ShellAssembly("altshell_to_shell(or0)".into()))?,
+        and1: altshell_to_shell(&and1, tol)
+            .ok_or(BooleanStageError::ShellAssembly("altshell_to_shell(and1)".into()))?,
+        or1: altshell_to_shell(&or1, tol)
+            .ok_or(BooleanStageError::ShellAssembly("altshell_to_shell(or1)".into()))?,
+    })
+}
+
+fn process_one_pair_of_shells_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell0: &Shell<Point3, C, S>,
+    shell1: &Shell<Point3, C, S>,
+    tol: f64,
+) -> std::result::Result<[Shell<Point3, C, S>; 2], BooleanStageError> {
+    let ClassifiedShellBuckets {
+        mut and0,
+        mut or0,
+        mut and1,
+        mut or1,
+    } = classify_one_pair_of_shells_result(shell0, shell1, tol)?;
     and0.append(&mut and1);
     or0.append(&mut or1);
-    Some([
-        altshell_to_shell(&and0, tol)?,
-        altshell_to_shell(&or0, tol)?,
-    ])
+    Ok([and0, or0])
+}
+
+#[allow(dead_code)]
+fn process_one_pair_of_shells<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell0: &Shell<Point3, C, S>,
+    shell1: &Shell<Point3, C, S>,
+    tol: f64,
+) -> Option<[Shell<Point3, C, S>; 2]> {
+    process_one_pair_of_shells_result(shell0, shell1, tol).ok()
+}
+
+/// Weld coincident edges in a shell: when two different Edge objects connect
+/// the same Vertex pair (same Vertex pointers from `add_polygon_vertex`
+/// unification), replace one with the other so that adjacent faces share
+/// a single Edge identity → `ShellCondition::Closed`.
+///
+/// Three phases:
+///  0. Position-based vertex unification via spatial grid.
+///  1. Build canonical edge map by (front_vertex_id, back_vertex_id).
+///  2. Rebuild faces, replacing non-canonical edges with the canonical one.
+fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell: &mut Shell<Point3, C, S>,
+    tol: f64,
+    weld_tol: Option<f64>,
+) {
+    use rustc_hash::{FxHashMap, FxHashSet};
+    type Vid = VertexID<Point3>;
+
+    // Phase 0: Position-based vertex unification via spatial grid.
+    {
+        use truck_base::tolerance::TOLERANCE;
+        let unify_tol = weld_tol.unwrap_or_else(|| (tol * 0.2).max(TOLERANCE.sqrt()));
+
+        // Collect all unique vertices (by ID)
+        let mut all_verts: Vec<Vertex<Point3>> = Vec::new();
+        let mut seen: FxHashSet<Vid> = FxHashSet::default();
+        for face in shell.iter() {
+            for wire in face.absolute_boundaries().iter() {
+                for v in wire.vertex_iter() {
+                    if seen.insert(v.id()) {
+                        all_verts.push(v.clone());
+                    }
+                }
+            }
+        }
+
+        // Spatial grid: cell key -> list of canonical vertices in that cell
+        let cell = unify_tol;
+        let mut grid: FxHashMap<(i64, i64, i64), Vec<Vertex<Point3>>> = FxHashMap::default();
+        let mut unify_map: FxHashMap<Vid, Vertex<Point3>> = FxHashMap::default();
+
+        for v in &all_verts {
+            let pt = v.point();
+            let key = (
+                (pt.x / cell).round() as i64,
+                (pt.y / cell).round() as i64,
+                (pt.z / cell).round() as i64,
+            );
+            let mut found = None;
+            'search: for dx in -1i64..=1 {
+                for dy in -1i64..=1 {
+                    for dz in -1i64..=1 {
+                        let nkey = (key.0 + dx, key.1 + dy, key.2 + dz);
+                        if let Some(verts) = grid.get(&nkey) {
+                            for canon in verts {
+                                if (canon.point() - pt).magnitude() < unify_tol {
+                                    found = Some(canon.clone());
+                                    break 'search;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            match found {
+                Some(canon) if canon.id() != v.id() => {
+                    unify_map.insert(v.id(), canon);
+                }
+                None => {
+                    grid.entry(key).or_default().push(v.clone());
+                }
+                _ => {}
+            }
+        }
+
+        // Rebuild faces with unified vertices
+        if !unify_map.is_empty() {
+            let new_faces: Vec<Face<Point3, C, S>> = shell
+                .iter()
+                .map(|face| {
+                    let ori = face.orientation();
+                    let new_wires: Vec<Wire<Point3, C>> = face
+                        .absolute_boundaries()
+                        .iter()
+                        .map(|wire| {
+                            let edges: Vec<Edge<Point3, C>> = wire
+                                .iter()
+                                .filter_map(|edge| {
+                                    let abs = edge.absolute_clone();
+                                    let f = unify_map.get(&abs.front().id());
+                                    let b = unify_map.get(&abs.back().id());
+                                    if f.is_none() && b.is_none() {
+                                        return Some(edge.clone());
+                                    }
+                                    let new_front =
+                                        f.cloned().unwrap_or_else(|| abs.front().clone());
+                                    let new_back = b.cloned().unwrap_or_else(|| abs.back().clone());
+                                    // Skip degenerate edges where vertex unification
+                                    // collapsed both endpoints to the same vertex.
+                                    let new_abs =
+                                        Edge::try_new(&new_front, &new_back, abs.curve()).ok()?;
+                                    if edge.orientation() {
+                                        Some(new_abs)
+                                    } else {
+                                        Some(new_abs.inverse())
+                                    }
+                                })
+                                .collect();
+                            edges.into()
+                        })
+                        .collect();
+                    let surface = face.surface();
+                    let mut new_face = Face::new(new_wires, surface);
+                    if !ori {
+                        new_face.invert();
+                    }
+                    new_face
+                })
+                .collect();
+            *shell = new_faces.into_iter().collect();
+        }
+    }
+
+    // Phase 1: Build canonical edge map.
+    // For each unique vertex pair, store the first Edge encountered as canonical.
+    let mut canonical: FxHashMap<(Vid, Vid), Edge<Point3, C>> = FxHashMap::default();
+
+    for face in shell.iter() {
+        for wire in face.absolute_boundaries().iter() {
+            for edge in wire.iter() {
+                let abs = edge.absolute_clone();
+                let fid = abs.front().id();
+                let bid = abs.back().id();
+                if !canonical.contains_key(&(fid, bid)) && !canonical.contains_key(&(bid, fid)) {
+                    canonical.insert((fid, bid), abs);
+                }
+            }
+        }
+    }
+
+    // Phase 2: Rebuild faces, replacing non-canonical edges with canonical ones.
+    let new_faces: Vec<Face<Point3, C, S>> = shell
+        .iter()
+        .map(|face| {
+            let ori = face.orientation();
+            let new_wires: Vec<Wire<Point3, C>> = face
+                .absolute_boundaries()
+                .iter()
+                .map(|wire| {
+                    let edges: Vec<Edge<Point3, C>> = wire
+                        .iter()
+                        .map(|edge| {
+                            let abs_edge = edge.absolute_clone();
+                            let fid = abs_edge.front().id();
+                            let bid = abs_edge.back().id();
+                            let canon = canonical
+                                .get(&(fid, bid))
+                                .or_else(|| canonical.get(&(bid, fid)));
+                            match canon {
+                                Some(c) if c.id() != edge.id() => {
+                                    let same_dir =
+                                        abs_edge.front().id() == c.absolute_front().id();
+                                    if same_dir == edge.orientation() {
+                                        c.clone()
+                                    } else {
+                                        c.inverse()
+                                    }
+                                }
+                                _ => edge.clone(),
+                            }
+                        })
+                        .collect();
+                    edges.into()
+                })
+                .collect();
+            let surface = face.surface();
+            let mut new_face = Face::new(new_wires, surface);
+            if !ori {
+                new_face.invert();
+            }
+            new_face
+        })
+        .collect();
+
+    *shell = new_faces.into_iter().collect();
+}
+
+/// AND operation between two solids, returning a structured error on failure.
+pub fn and_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    solid1: &Solid<Point3, C, S>,
+    tol: f64,
+) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
+    let mut iter0 = solid0.boundaries().iter();
+    let mut iter1 = solid1.boundaries().iter();
+    let shell0 = iter0.next().unwrap();
+    let shell1 = iter1.next().unwrap();
+    let [mut and_shell, _] = process_one_pair_of_shells_result(shell0, shell1, tol)?;
+    for shell in iter0 {
+        let [res, _] = process_one_pair_of_shells_result(&and_shell, shell, tol)?;
+        and_shell = res;
+    }
+    for shell in iter1 {
+        let [res, _] = process_one_pair_of_shells_result(&and_shell, shell, tol)?;
+        and_shell = res;
+    }
+    weld_coincident_edges(&mut and_shell, tol, None);
+    let boundaries = and_shell.connected_components();
+    Solid::try_new(boundaries)
+        .map_err(|e| BooleanStageError::ShellAssembly(format!("Solid::try_new failed: {:?}", e)))
 }
 
 /// AND operation between two solids.
@@ -309,21 +590,32 @@ pub fn and<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid1: &Solid<Point3, C, S>,
     tol: f64,
 ) -> Option<Solid<Point3, C, S>> {
+    and_result(solid0, solid1, tol).ok()
+}
+
+/// OR operation between two solids, returning a structured error on failure.
+pub fn or_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    solid1: &Solid<Point3, C, S>,
+    tol: f64,
+) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
     let mut iter0 = solid0.boundaries().iter();
     let mut iter1 = solid1.boundaries().iter();
     let shell0 = iter0.next().unwrap();
     let shell1 = iter1.next().unwrap();
-    let [mut and_shell, _] = process_one_pair_of_shells(shell0, shell1, tol)?;
+    let [_, mut or_shell] = process_one_pair_of_shells_result(shell0, shell1, tol)?;
     for shell in iter0 {
-        let [res, _] = process_one_pair_of_shells(&and_shell, shell, tol)?;
-        and_shell = res;
+        let [_, res] = process_one_pair_of_shells_result(&or_shell, shell, tol)?;
+        or_shell = res;
     }
     for shell in iter1 {
-        let [res, _] = process_one_pair_of_shells(&and_shell, shell, tol)?;
-        and_shell = res;
+        let [_, res] = process_one_pair_of_shells_result(&or_shell, shell, tol)?;
+        or_shell = res;
     }
-    let boundaries = and_shell.connected_components();
-    Solid::try_new(boundaries).ok()
+    weld_coincident_edges(&mut or_shell, tol, None);
+    let boundaries = or_shell.connected_components();
+    Solid::try_new(boundaries)
+        .map_err(|e| BooleanStageError::ShellAssembly(format!("Solid::try_new failed: {:?}", e)))
 }
 
 /// OR operation between two solids.
@@ -332,21 +624,59 @@ pub fn or<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid1: &Solid<Point3, C, S>,
     tol: f64,
 ) -> Option<Solid<Point3, C, S>> {
+    or_result(solid0, solid1, tol).ok()
+}
+
+/// Difference operation: A \ B, returning a structured error on failure.
+/// Selects faces of A outside B (Or), plus faces of B inside A (And) with inverted orientation.
+pub fn difference_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    solid1: &Solid<Point3, C, S>,
+    tol: f64,
+) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
     let mut iter0 = solid0.boundaries().iter();
     let mut iter1 = solid1.boundaries().iter();
     let shell0 = iter0.next().unwrap();
     let shell1 = iter1.next().unwrap();
-    let [_, mut or_shell] = process_one_pair_of_shells(shell0, shell1, tol)?;
+    let ClassifiedShellBuckets { or0, and1, .. } =
+        classify_one_pair_of_shells_result(shell0, shell1, tol)?;
+    // Difference = or0 (A faces outside B) + inverted and1 (B faces inside A, flipped)
+    let mut diff_faces: Vec<Face<Point3, C, S>> = or0.into_iter().collect();
+    for face in and1.into_iter() {
+        diff_faces.push(face.inverse());
+    }
+    let mut diff_shell: Shell<Point3, C, S> = diff_faces.into_iter().collect();
+    // Handle additional boundary shells (multi-shell solids)
     for shell in iter0 {
-        let [_, res] = process_one_pair_of_shells(&or_shell, shell, tol)?;
-        or_shell = res;
+        let classified = classify_one_pair_of_shells_result(&diff_shell, shell, tol)?;
+        let mut faces: Vec<Face<Point3, C, S>> = classified.or0.into_iter().collect();
+        for face in classified.and1.into_iter() {
+            faces.push(face.inverse());
+        }
+        diff_shell = faces.into_iter().collect();
     }
     for shell in iter1 {
-        let [_, res] = process_one_pair_of_shells(&or_shell, shell, tol)?;
-        or_shell = res;
+        let classified = classify_one_pair_of_shells_result(&diff_shell, shell, tol)?;
+        let mut faces: Vec<Face<Point3, C, S>> = classified.or0.into_iter().collect();
+        for face in classified.and1.into_iter() {
+            faces.push(face.inverse());
+        }
+        diff_shell = faces.into_iter().collect();
     }
-    let boundaries = or_shell.connected_components();
-    Solid::try_new(boundaries).ok()
+    weld_coincident_edges(&mut diff_shell, tol, None);
+    let boundaries = diff_shell.connected_components();
+    Solid::try_new(boundaries)
+        .map_err(|e| BooleanStageError::ShellAssembly(format!("Solid::try_new failed: {:?}", e)))
+}
+
+/// Difference operation: A \ B.
+/// Selects faces of A outside B (Or), plus faces of B inside A (And) with inverted orientation.
+pub fn difference<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    solid1: &Solid<Point3, C, S>,
+    tol: f64,
+) -> Option<Solid<Point3, C, S>> {
+    difference_result(solid0, solid1, tol).ok()
 }
 
 #[cfg(test)]
