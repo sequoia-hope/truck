@@ -105,7 +105,7 @@ where
                 .into_iter()
                 .map(|chunk| chunk.wire.deref().clone())
                 .collect();
-            match Face::try_new(wires, surface) {
+            match Face::try_new(wires.clone(), surface.clone()) {
                 Ok(mut new_face) => {
                     if !face.orientation() {
                         new_face.invert();
@@ -113,6 +113,60 @@ where
                     Some((new_face, status))
                 }
                 Err(_e) => {
+                    // Try wire splitting: a non-simple wire may be recoverable
+                    // by splitting at the repeated vertex into two sub-wires.
+                    let ori = face.orientation();
+                    let mut split_wires: Vec<Wire<Point3, C>> = Vec::new();
+                    let mut any_split = false;
+                    for w in &wires {
+                        if w.is_simple() {
+                            split_wires.push(w.clone());
+                            continue;
+                        }
+                        let edges: Vec<_> = w.iter().cloned().collect();
+                        let mut seen = rustc_hash::FxHashMap::default();
+                        let mut done = false;
+                        for (i, edge) in edges.iter().enumerate() {
+                            let vid = edge.front().id();
+                            if let Some(&first_idx) = seen.get(&vid) {
+                                let inner: Vec<_> = edges[first_idx..i].to_vec();
+                                let outer: Vec<_> = edges[i..]
+                                    .iter()
+                                    .chain(edges[..first_idx].iter())
+                                    .cloned()
+                                    .collect();
+                                if !inner.is_empty() && !outer.is_empty() {
+                                    let iw: Wire<Point3, C> = inner.into_iter().collect();
+                                    let ow: Wire<Point3, C> = outer.into_iter().collect();
+                                    if iw.is_closed() && iw.is_simple()
+                                        && ow.is_closed() && ow.is_simple()
+                                    {
+                                        split_wires.push(ow);
+                                        split_wires.push(iw);
+                                        done = true;
+                                        any_split = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            seen.insert(vid, i);
+                        }
+                        if !done {
+                            split_wires.push(w.clone());
+                        }
+                    }
+                    if any_split {
+                        if let Ok(mut new_face) = Face::try_new(split_wires, surface) {
+                            if !ori {
+                                new_face.invert();
+                            }
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[boolean] divide_one_face: wire splitting recovered non-simple wire"
+                            );
+                            return Some((new_face, status));
+                        }
+                    }
                     #[cfg(debug_assertions)]
                     eprintln!(
                         "[boolean] Face::try_new failed in divide_one_face: {:?}",

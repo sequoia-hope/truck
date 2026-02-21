@@ -487,6 +487,92 @@ fn process_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSu
 /// Weld coincident edges in a shell: when two different Edge objects connect
 /// the same Vertex pair (same Vertex pointers from `add_polygon_vertex`
 /// unification), replace one with the other so that adjacent faces share
+/// Try to split a non-simple wire at a repeated vertex into two valid sub-wires.
+///
+/// When `weld_coincident_edges` unifies vertices, a wire may end up with a vertex
+/// appearing twice (forming a figure-8). This splits the wire at that vertex into
+/// two closed sub-wires, each of which is simple and closed.
+///
+/// Returns `Some(split_wires)` if splitting succeeded, `None` if the wire cannot
+/// be split into valid sub-wires.
+fn try_split_non_simple_wires<C: Clone, S: Clone>(
+    wires: &[Wire<Point3, C>],
+    surface: &S,
+    ori: bool,
+) -> Option<Face<Point3, C, S>> {
+    use rustc_hash::FxHashMap;
+    type Vid = VertexID<Point3>;
+
+    let mut new_wires: Vec<Wire<Point3, C>> = Vec::new();
+    let mut any_split = false;
+
+    for wire in wires {
+        if wire.is_simple() {
+            new_wires.push(wire.clone());
+            continue;
+        }
+
+        // Find the first repeated vertex
+        let edges: Vec<_> = wire.iter().cloned().collect();
+        let mut seen: FxHashMap<Vid, usize> = FxHashMap::default();
+        let mut split_done = false;
+
+        for (i, edge) in edges.iter().enumerate() {
+            let vid = edge.front().id();
+            if let Some(&first_idx) = seen.get(&vid) {
+                // Vertex appears at positions first_idx and i
+                // inner loop: edges[first_idx..i], outer loop: edges[i..] + edges[..first_idx]
+                let inner_edges: Vec<_> = edges[first_idx..i].to_vec();
+                let outer_edges: Vec<_> = edges[i..]
+                    .iter()
+                    .chain(edges[..first_idx].iter())
+                    .cloned()
+                    .collect();
+
+                if inner_edges.is_empty() || outer_edges.is_empty() {
+                    continue;
+                }
+
+                let inner_wire: Wire<Point3, C> = inner_edges.into_iter().collect();
+                let outer_wire: Wire<Point3, C> = outer_edges.into_iter().collect();
+
+                if inner_wire.is_closed()
+                    && inner_wire.is_simple()
+                    && outer_wire.is_closed()
+                    && outer_wire.is_simple()
+                {
+                    new_wires.push(outer_wire);
+                    new_wires.push(inner_wire);
+                    split_done = true;
+                    any_split = true;
+                    break;
+                }
+            }
+            seen.insert(vid, i);
+        }
+
+        if !split_done {
+            // Could not split — keep original wire
+            new_wires.push(wire.clone());
+        }
+    }
+
+    if !any_split {
+        return None;
+    }
+
+    // Try constructing the face with the split wires
+    match Face::try_new(new_wires, surface.clone()) {
+        Ok(mut new_face) => {
+            if !ori {
+                new_face.invert();
+            }
+            Some(new_face)
+        }
+        Err(_) => None,
+    }
+}
+
 /// a single Edge identity → `ShellCondition::Closed`.
 ///
 /// Three phases:
@@ -596,8 +682,9 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                         .collect();
                     let surface = face.surface();
                     // Use try_new to avoid panic on non-simple wires after
-                    // vertex unification; fall back to the original face.
-                    match Face::try_new(new_wires, surface) {
+                    // vertex unification; fall back to wire splitting, then
+                    // to the original face.
+                    match Face::try_new(new_wires.clone(), surface.clone()) {
                         Ok(mut new_face) => {
                             if !ori {
                                 new_face.invert();
@@ -605,12 +692,23 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                             new_face
                         }
                         Err(_e) => {
-                            #[cfg(debug_assertions)]
-                            eprintln!(
-                                "[weld] Face::try_new failed after vertex unification: {:?}",
-                                _e
-                            );
-                            face.clone()
+                            // Try wire splitting before falling back to original
+                            if let Some(split_face) =
+                                try_split_non_simple_wires(&new_wires, &surface, ori)
+                            {
+                                #[cfg(debug_assertions)]
+                                eprintln!(
+                                    "[weld] Phase 0: wire splitting recovered non-simple wire"
+                                );
+                                split_face
+                            } else {
+                                #[cfg(debug_assertions)]
+                                eprintln!(
+                                    "[weld] Face::try_new failed after vertex unification: {:?}",
+                                    _e
+                                );
+                                face.clone()
+                            }
                         }
                     }
                 })
@@ -671,7 +769,7 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                 })
                 .collect();
             let surface = face.surface();
-            match Face::try_new(new_wires, surface) {
+            match Face::try_new(new_wires.clone(), surface.clone()) {
                 Ok(mut new_face) => {
                     if !ori {
                         new_face.invert();
@@ -680,8 +778,16 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                 }
                 Err(_) => {
                     // Phase 2 edge substitution produced a non-simple wire.
-                    // Fall back to the original face unchanged.
-                    face.clone()
+                    // Try wire splitting before falling back to original.
+                    if let Some(split_face) =
+                        try_split_non_simple_wires(&new_wires, &surface, ori)
+                    {
+                        #[cfg(debug_assertions)]
+                        eprintln!("[weld] Phase 2: wire splitting recovered non-simple wire");
+                        split_face
+                    } else {
+                        face.clone()
+                    }
                 }
             }
         })
