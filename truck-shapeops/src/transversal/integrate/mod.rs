@@ -779,8 +779,7 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                 Err(_) => {
                     // Phase 2 edge substitution produced a non-simple wire.
                     // Try wire splitting before falling back to original.
-                    if let Some(split_face) =
-                        try_split_non_simple_wires(&new_wires, &surface, ori)
+                    if let Some(split_face) = try_split_non_simple_wires(&new_wires, &surface, ori)
                     {
                         #[cfg(debug_assertions)]
                         eprintln!("[weld] Phase 2: wire splitting recovered non-simple wire");

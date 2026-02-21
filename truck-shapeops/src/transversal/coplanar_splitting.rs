@@ -4,6 +4,7 @@
 //! `double_projection` diverges when normals are parallel), this module provides
 //! `check_coplanar_faces` to detect such pairs.
 
+use super::robust_classify::robust_orient2d;
 use truck_base::cgmath64::*;
 use truck_topology::*;
 
@@ -150,44 +151,52 @@ pub(crate) fn check_coplanar_faces<C, S>(
     Some(same_sense)
 }
 
-/// Ray-casting point-in-polygon test in 2D (non-test version for overlap detection).
+/// Winding-number point-in-polygon test in 2D using robust orientation predicates.
 fn point_in_polygon_2d(point: [f64; 2], polygon: &[[f64; 2]]) -> bool {
-    let mut inside = false;
+    let mut winding: i32 = 0;
     let n = polygon.len();
-    let mut j = n - 1;
     for i in 0..n {
-        let (xi, yi) = (polygon[i][0], polygon[i][1]);
-        let (xj, yj) = (polygon[j][0], polygon[j][1]);
-        if ((yi > point[1]) != (yj > point[1]))
-            && (point[0] < (xj - xi) * (point[1] - yi) / (yj - yi) + xi)
-        {
-            inside = !inside;
+        let j = (i + 1) % n;
+        let yi = polygon[i][1];
+        let yj = polygon[j][1];
+        if yi <= point[1] {
+            if yj > point[1] {
+                // Upward crossing — point is left of edge → winding += 1
+                if robust_orient2d(polygon[i], polygon[j], point) > 0.0 {
+                    winding += 1;
+                }
+            }
+        } else if yj <= point[1] {
+            // Downward crossing — point is right of edge → winding -= 1
+            if robust_orient2d(polygon[i], polygon[j], point) < 0.0 {
+                winding -= 1;
+            }
         }
-        j = i;
     }
-    inside
+    winding != 0
 }
 
-/// Check if any edge of polygon A intersects any edge of polygon B in 2D.
-/// Uses segment-segment intersection (O(n*m), fine for small face polygons).
-fn edges_intersect_2d(poly_a: &[[f64; 2]], poly_b: &[[f64; 2]], tol: f64) -> bool {
+/// Check if any edge of polygon A properly intersects any edge of polygon B in 2D.
+/// Uses four robust orientation tests per segment pair (O(n*m), fine for small face polygons).
+/// Only detects proper intersections (endpoints strictly on opposite sides), not
+/// shared-vertex or collinear overlaps, matching the original endpoint-exclusion semantics.
+fn edges_intersect_2d(poly_a: &[[f64; 2]], poly_b: &[[f64; 2]], _tol: f64) -> bool {
     for i in 0..poly_a.len() {
         let j = (i + 1) % poly_a.len();
-        let (ax, ay) = (poly_a[i][0], poly_a[i][1]);
-        let (bx, by) = (poly_a[j][0], poly_a[j][1]);
+        let a = poly_a[i];
+        let b = poly_a[j];
         for k in 0..poly_b.len() {
             let l = (k + 1) % poly_b.len();
-            let (cx, cy) = (poly_b[k][0], poly_b[k][1]);
-            let (dx, dy) = (poly_b[l][0], poly_b[l][1]);
-            // Segment AB vs segment CD
-            let denom = (bx - ax) * (dy - cy) - (by - ay) * (dx - cx);
-            if denom.abs() < 1e-15 {
-                continue; // Parallel
-            }
-            let t = ((cx - ax) * (dy - cy) - (cy - ay) * (dx - cx)) / denom;
-            let u = ((cx - ax) * (by - ay) - (cy - ay) * (bx - ax)) / denom;
-            // Interior intersection (not at endpoints — endpoints mean shared edge, not overlap)
-            if t > tol && t < 1.0 - tol && u > tol && u < 1.0 - tol {
+            let c = poly_b[k];
+            let d = poly_b[l];
+
+            let d1 = robust_orient2d(c, d, a);
+            let d2 = robust_orient2d(c, d, b);
+            let d3 = robust_orient2d(a, b, c);
+            let d4 = robust_orient2d(a, b, d);
+
+            // Proper intersection: endpoints strictly on opposite sides of each other's line
+            if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
                 return true;
             }
         }
@@ -329,6 +338,66 @@ mod tests {
         assert!(
             !edges_cross,
             "Point-only-sharing faces should not have crossing edges"
+        );
+    }
+
+    // ── Robust predicate tests ──
+
+    #[test]
+    fn test_robust_point_in_polygon_inside() {
+        let sq = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        assert!(
+            point_in_polygon_2d([0.5, 0.5], &sq),
+            "Center of unit square should be inside"
+        );
+    }
+
+    #[test]
+    fn test_robust_point_in_polygon_outside() {
+        let sq = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        assert!(
+            !point_in_polygon_2d([2.0, 0.5], &sq),
+            "Point far right of unit square should be outside"
+        );
+    }
+
+    #[test]
+    fn test_robust_point_on_edge_boundary() {
+        // Point exactly on the bottom edge of the unit square.
+        // With the winding number algorithm, the bottom edge (y=0) is
+        // "owned" — the upward edge [1,0]→[1,1] registers a crossing
+        // because yi <= point[1] (0 <= 0) and yj > point[1] (1 > 0),
+        // but the downward edge [0,1]→[0,0] does not cancel it.
+        // This is the standard winding number boundary convention.
+        let sq = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let on_bottom = point_in_polygon_2d([0.5, 0.0], &sq);
+        assert!(
+            on_bottom,
+            "Bottom edge is inside (winding number convention)"
+        );
+
+        // Top edge: y=1.0. The upward edge [1,0]→[1,1] has yj=1 which is
+        // NOT > 1.0, so no crossing is counted → outside.
+        let on_top = point_in_polygon_2d([0.5, 1.0], &sq);
+        assert!(!on_top, "Top edge is outside (winding number convention)");
+    }
+
+    #[test]
+    fn test_robust_edges_intersect() {
+        // Overlapping squares: edges cross
+        let a = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]];
+        let b = [[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]];
+        assert!(
+            edges_intersect_2d(&a, &b, 0.001),
+            "Overlapping squares should have crossing edges"
+        );
+
+        // Separated squares: no edge crossing
+        let c = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let d = [[5.0, 5.0], [6.0, 5.0], [6.0, 6.0], [5.0, 6.0]];
+        assert!(
+            !edges_intersect_2d(&c, &d, 0.001),
+            "Separated squares should not have crossing edges"
         );
     }
 }
