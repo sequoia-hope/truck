@@ -52,8 +52,9 @@ pub(crate) fn split_wire_recursive<C: Clone>(
         seen.entry(vid).or_default().push(i);
     }
 
-    // Count repeated vertices for diagnostics
-    let repeated: Vec<_> = seen.iter().filter(|(_, v)| v.len() >= 2).collect();
+    // Collect repeated vertices, sorted by first occurrence for deterministic iteration.
+    let mut repeated: Vec<_> = seen.iter().filter(|(_, v)| v.len() >= 2).collect();
+    repeated.sort_by_key(|(_, positions)| positions[0]);
 
     if repeated.is_empty() {
         // Wire is not simple but has no repeated front vertices — this means
@@ -68,11 +69,8 @@ pub(crate) fn split_wire_recursive<C: Clone>(
         return false;
     }
 
-    // Try splitting at each repeated vertex
-    for positions in seen.values() {
-        if positions.len() < 2 {
-            continue;
-        }
+    // Try splitting at each repeated vertex (deterministic order)
+    for (_, positions) in &repeated {
         // Try every pair of occurrences of this vertex
         for pi in 0..positions.len() {
             for pj in (pi + 1)..positions.len() {

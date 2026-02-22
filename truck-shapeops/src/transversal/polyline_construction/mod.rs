@@ -41,23 +41,60 @@ pub fn construct_polylines(lines: &[(Point3, Point3)]) -> Vec<PolylineCurve<Poin
         }
         res.push(PolylineCurve(wire.into()));
     }
-    // Canonicalize open polyline direction for deterministic boolean results.
+    // Canonicalize polyline direction for deterministic boolean results.
     // The graph walk starts at an arbitrary FxHashMap entry, so polyline
     // direction depends on hash iteration order. from_is_curve uses
     // leader().der(t) — the polyline tangent — to decide And vs Or status.
     // Flipping the polyline flips der(t), which flips the status.
-    // Fix: ensure lex-smallest endpoint comes first for open polylines.
     for poly in &mut res {
         if let (Some(&f), Some(&b)) = (poly.first(), poly.last()) {
-            if !f.near(&b) && (b.x, b.y, b.z) < (f.x, f.y, f.z) {
-                poly.reverse();
+            if f.near(&b) {
+                // CLOSED polyline: canonical direction via geometric criteria.
+                // 1. Find vertex with lexicographically smallest (x,y,z)
+                // 2. Rotate so that vertex is first
+                // 3. Pick direction where second vertex is lex-smaller
+                // This selects a unique representative from 2N equivalent forms
+                // (N rotations × 2 directions).
+                let n = poly.len() - 1; // unique vertex count (last == first)
+                if n >= 3 {
+                    let min_idx = (0..n)
+                        .min_by(|&a, &b| {
+                            let pa = poly[a];
+                            let pb = poly[b];
+                            (pa.x, pa.y, pa.z)
+                                .partial_cmp(&(pb.x, pb.y, pb.z))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .unwrap_or(0);
+                    if min_idx > 0 {
+                        let mut unique: Vec<_> = poly.0[..n].to_vec();
+                        unique.rotate_left(min_idx);
+                        unique.push(unique[0]);
+                        poly.0 = unique;
+                    }
+                    // Pick canonical direction: second vertex should be lex-smaller
+                    // than last unique vertex (the "backward" neighbor).
+                    let fwd = poly[1];
+                    let bwd = poly[n - 1];
+                    if (bwd.x, bwd.y, bwd.z) < (fwd.x, fwd.y, fwd.z) {
+                        let mut unique: Vec<_> = poly.0[..n].to_vec();
+                        unique[1..].reverse();
+                        unique.push(unique[0]);
+                        poly.0 = unique;
+                    }
+                }
+            } else {
+                // OPEN polyline: lex-smallest endpoint comes first.
+                if (b.x, b.y, b.z) < (f.x, f.y, f.z) {
+                    poly.reverse();
+                }
             }
         }
     }
     res
 }
 
-#[derive(Clone, Debug, Copy, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 struct PointIndex([i64; 3]);
 
 fn quantize(pt: Point3, spacing: f64) -> PointIndex {
@@ -77,7 +114,7 @@ impl Node {
     }
 
     fn pop_one_adjacency(&mut self) -> PointIndex {
-        let idx = *self.adjacency.iter().next().unwrap();
+        let idx = *self.adjacency.iter().min().unwrap();
         self.adjacency.remove(&idx);
         idx
     }
@@ -135,10 +172,11 @@ impl Graph {
         }
     }
 
-    #[inline(always)]
     fn get_one(&self) -> (PointIndex, &Node) {
-        let (idx, node) = self.iter().next().unwrap();
-        (*idx, node)
+        self.iter()
+            .min_by_key(|(idx, _)| **idx)
+            .map(|(idx, node)| (*idx, node))
+            .unwrap()
     }
 
     fn get_a_next_node(&mut self, idx: PointIndex) -> Option<(PointIndex, Point3)> {
