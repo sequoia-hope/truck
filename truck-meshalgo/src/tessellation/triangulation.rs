@@ -218,7 +218,21 @@ fn shell_create_polygon<S: PreMeshableSurface>(
         let boundary = PolyBoundary::new(preboundary, &surface, tol);
         trimming_tessellation(surface, &boundary, tol)
     });
-    let mut new_face = Face::debug_new(wires, polygon);
+    // Use new_unchecked for faces that may have non-simple or non-disjoint
+    // wires (from boolean pipeline's merged T-junction wires).
+    let all_closed = wires
+        .iter()
+        .all(|w| !w.is_empty() && w.is_closed());
+    let strict_ok = all_closed
+        && wires.iter().all(|w| w.is_simple())
+        && Wire::disjoint_wires(&wires);
+    let mut new_face = if strict_ok {
+        Face::debug_new(wires, polygon)
+    } else if all_closed {
+        Face::new_unchecked(wires, polygon)
+    } else {
+        Face::debug_new(wires, polygon)
+    };
     if !orientation {
         new_face.invert();
     }

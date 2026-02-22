@@ -566,8 +566,24 @@ impl<P, C, S> Shell<P, C, S> {
                     .map(|wire| wire.sub_try_mapped(&mut edge_map))
                     .collect::<Option<Vec<_>>>()?;
                 let surface = surface_mapping(&*face.surface.lock())?;
-                let mut new_face = Face::debug_new(wires, surface);
-                if !face.orientation() {
+                let ori = face.orientation();
+                // Use new_unchecked for faces with non-simple or non-disjoint
+                // wires (from boolean pipeline: merged T-junction wires or
+                // vertex unification creating shared vertices).
+                let all_closed = wires
+                    .iter()
+                    .all(|w| !w.is_empty() && w.is_closed());
+                let strict_ok = all_closed
+                    && wires.iter().all(|w| w.is_simple())
+                    && Wire::disjoint_wires(&wires);
+                let mut new_face = if strict_ok {
+                    Face::debug_new(wires, surface)
+                } else if all_closed {
+                    Face::new_unchecked(wires, surface)
+                } else {
+                    Face::debug_new(wires, surface)
+                };
+                if !ori {
                     new_face.invert();
                 }
                 Some(new_face)
@@ -660,8 +676,21 @@ impl<P, C, S> Shell<P, C, S> {
                     .map(|wire| wire.sub_mapped(&mut edge_map))
                     .collect();
                 let surface = surface_mapping(&*face.surface.lock());
-                let mut new_face = Face::debug_new(wires, surface);
-                if !face.orientation() {
+                let ori = face.orientation();
+                let all_closed = wires
+                    .iter()
+                    .all(|w| !w.is_empty() && w.is_closed());
+                let strict_ok = all_closed
+                    && wires.iter().all(|w| w.is_simple())
+                    && Wire::disjoint_wires(&wires);
+                let mut new_face = if strict_ok {
+                    Face::debug_new(wires, surface)
+                } else if all_closed {
+                    Face::new_unchecked(wires, surface)
+                } else {
+                    Face::debug_new(wires, surface)
+                };
+                if !ori {
                     new_face.invert();
                 }
                 new_face

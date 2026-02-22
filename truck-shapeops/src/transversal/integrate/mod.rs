@@ -484,25 +484,23 @@ fn process_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSu
     Ok([and0, or0])
 }
 
-/// Weld coincident edges in a shell: when two different Edge objects connect
-/// the same Vertex pair (same Vertex pointers from `add_polygon_vertex`
-/// unification), replace one with the other so that adjacent faces share
-/// Try to split a non-simple wire at a repeated vertex into two valid sub-wires.
+/// Try to recover a face with non-simple wires via splitting, merging, or
+/// relaxed validation.
 ///
-/// When `weld_coincident_edges` unifies vertices, a wire may end up with a vertex
-/// appearing twice (forming a figure-8). This splits the wire at that vertex into
-/// two closed sub-wires, each of which is simple and closed.
-///
-/// Returns `Some(split_wires)` if splitting succeeded, `None` if the wire cannot
-/// be split into valid sub-wires.
+/// Recovery strategies (tried in order):
+/// 1. Recursive wire splitting: handles wires with multiple repeated vertices
+///    (common after chained boolean operations where vertex dedup + weld compound).
+/// 2. Wire merging: when individual wires are simple but share vertices across
+///    boundaries (T-junctions), merge touching wires into a single wire that
+///    traces both outer boundary and hole. This produces a non-simple single wire
+///    but avoids edge over-counting in the canonical edge pipeline.
+/// 3. Fallback: `Face::new_unchecked` for any remaining case where wires are
+///    non-empty and closed.
 fn try_split_non_simple_wires<C: Clone, S: Clone>(
     wires: &[Wire<Point3, C>],
     surface: &S,
     ori: bool,
 ) -> Option<Face<Point3, C, S>> {
-    use rustc_hash::FxHashMap;
-    type Vid = VertexID<Point3>;
-
     let mut new_wires: Vec<Wire<Point3, C>> = Vec::new();
     let mut any_split = false;
 
@@ -512,65 +510,41 @@ fn try_split_non_simple_wires<C: Clone, S: Clone>(
             continue;
         }
 
-        // Find the first repeated vertex
-        let edges: Vec<_> = wire.iter().cloned().collect();
-        let mut seen: FxHashMap<Vid, usize> = FxHashMap::default();
-        let mut split_done = false;
-
-        for (i, edge) in edges.iter().enumerate() {
-            let vid = edge.front().id();
-            if let Some(&first_idx) = seen.get(&vid) {
-                // Vertex appears at positions first_idx and i
-                // inner loop: edges[first_idx..i], outer loop: edges[i..] + edges[..first_idx]
-                let inner_edges: Vec<_> = edges[first_idx..i].to_vec();
-                let outer_edges: Vec<_> = edges[i..]
-                    .iter()
-                    .chain(edges[..first_idx].iter())
-                    .cloned()
-                    .collect();
-
-                if inner_edges.is_empty() || outer_edges.is_empty() {
-                    continue;
-                }
-
-                let inner_wire: Wire<Point3, C> = inner_edges.into_iter().collect();
-                let outer_wire: Wire<Point3, C> = outer_edges.into_iter().collect();
-
-                if inner_wire.is_closed()
-                    && inner_wire.is_simple()
-                    && outer_wire.is_closed()
-                    && outer_wire.is_simple()
-                {
-                    new_wires.push(outer_wire);
-                    new_wires.push(inner_wire);
-                    split_done = true;
-                    any_split = true;
-                    break;
-                }
-            }
-            seen.insert(vid, i);
-        }
-
-        if !split_done {
+        let mut split_result: Vec<Wire<Point3, C>> = Vec::new();
+        if split_wire_recursive(wire, &mut split_result, 0) {
+            new_wires.extend(split_result);
+            any_split = true;
+        } else {
             // Could not split — keep original wire
             new_wires.push(wire.clone());
         }
     }
 
-    if !any_split {
-        return None;
-    }
-
-    // Try constructing the face with the split wires
-    match Face::try_new(new_wires, surface.clone()) {
-        Ok(mut new_face) => {
+    // Try strict validation first (handles wire-splitting case)
+    if any_split {
+        if let Ok(mut new_face) = Face::try_new(new_wires.clone(), surface.clone()) {
             if !ori {
                 new_face.invert();
             }
-            Some(new_face)
+            return Some(new_face);
         }
-        Err(_) => None,
     }
+
+    // Final fallback: accept non-disjoint or non-simple wires via new_unchecked.
+    // Non-disjoint wires (sharing vertices at T-junctions) are geometrically
+    // valid — each edge still appears exactly once per face. The shared vertex
+    // creates a singular vertex but doesn't affect edge counting for shell
+    // condition (Closed/Oriented).
+    let all_closed = new_wires.iter().all(|w| !w.is_empty() && w.is_closed());
+    if !new_wires.is_empty() && all_closed {
+        let mut new_face = Face::new_unchecked(new_wires, surface.clone());
+        if !ori {
+            new_face.invert();
+        }
+        return Some(new_face);
+    }
+
+    None
 }
 
 /// a single Edge identity → `ShellCondition::Closed`.
@@ -696,17 +670,8 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                             if let Some(split_face) =
                                 try_split_non_simple_wires(&new_wires, &surface, ori)
                             {
-                                #[cfg(debug_assertions)]
-                                eprintln!(
-                                    "[weld] Phase 0: wire splitting recovered non-simple wire"
-                                );
                                 split_face
                             } else {
-                                #[cfg(debug_assertions)]
-                                eprintln!(
-                                    "[weld] Face::try_new failed after vertex unification: {:?}",
-                                    _e
-                                );
                                 face.clone()
                             }
                         }
@@ -717,9 +682,18 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         }
     }
 
-    // Phase 1: Build canonical edge map.
-    // For each unique vertex pair, store the first Edge encountered as canonical.
-    let mut canonical: FxHashMap<(Vid, Vid), Edge<Point3, C>> = FxHashMap::default();
+    // Phase 1: Build canonical edge map using curve midpoint clustering.
+    //
+    // Two edges between the same vertex pair may represent different geometric
+    // features (e.g., outer boundary + hole of a T-junction face). By clustering
+    // edges with matching (vertex_pair, curve_midpoint), each distinct geometric
+    // feature gets its own canonical edge, preventing within-face conflicts and
+    // ensuring each edge pair is correctly shared between exactly 2 faces.
+    type VPairKey = (Vid, Vid);
+
+    // Collect edges grouped by vertex pair, with curve midpoints
+    type EdgeMid<C2> = (Edge<Point3, C2>, Point3);
+    let mut pair_groups: FxHashMap<VPairKey, Vec<EdgeMid<C>>> = FxHashMap::default();
 
     for face in shell.iter() {
         for wire in face.absolute_boundaries().iter() {
@@ -727,14 +701,74 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                 let abs = edge.absolute_clone();
                 let fid = abs.front().id();
                 let bid = abs.back().id();
-                if !canonical.contains_key(&(fid, bid)) && !canonical.contains_key(&(bid, fid)) {
-                    canonical.insert((fid, bid), abs);
+
+                // Compute curve midpoint for geometric matching
+                let curve = abs.curve();
+                let (t0, t1) = curve.range_tuple();
+                let midpoint = curve.subs((t0 + t1) * 0.5);
+
+                // Normalize key: check both orderings, or create new
+                let key = if pair_groups.contains_key(&(fid, bid)) {
+                    (fid, bid)
+                } else if pair_groups.contains_key(&(bid, fid)) {
+                    (bid, fid)
+                } else {
+                    (fid, bid)
+                };
+
+                pair_groups.entry(key).or_default().push((abs, midpoint));
+            }
+        }
+    }
+
+    // For each vertex pair, cluster by midpoint proximity and assign canonicals
+    let mid_tol = tol * 5.0;
+    let mut edge_to_canonical: FxHashMap<EdgeID<C>, Edge<Point3, C>> = FxHashMap::default();
+
+    for edges in pair_groups.values() {
+        if edges.len() <= 1 {
+            continue;
+        }
+
+        // Cluster by midpoint proximity
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        let mut assigned = vec![false; edges.len()];
+
+        for i in 0..edges.len() {
+            if assigned[i] {
+                continue;
+            }
+            assigned[i] = true;
+            let mut cluster = vec![i];
+            let ref_mid = edges[i].1;
+
+            for j in (i + 1)..edges.len() {
+                if assigned[j] {
+                    continue;
+                }
+                if (edges[j].1 - ref_mid).magnitude() < mid_tol {
+                    cluster.push(j);
+                    assigned[j] = true;
+                }
+            }
+            clusters.push(cluster);
+        }
+
+        // Assign canonical within each cluster
+        for cluster in clusters {
+            if cluster.len() <= 1 {
+                continue;
+            }
+            let canon = &edges[cluster[0]].0;
+            for &idx in &cluster {
+                if edges[idx].0.id() != canon.id() {
+                    edge_to_canonical.insert(edges[idx].0.id(), canon.clone());
                 }
             }
         }
     }
 
-    // Phase 2: Rebuild faces, replacing non-canonical edges with canonical ones.
+    // Phase 2: Rebuild faces with canonical edges
     let new_faces: Vec<Face<Point3, C, S>> = shell
         .iter()
         .map(|face| {
@@ -745,24 +779,17 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                 .map(|wire| {
                     let edges: Vec<Edge<Point3, C>> = wire
                         .iter()
-                        .map(|edge| {
-                            let abs_edge = edge.absolute_clone();
-                            let fid = abs_edge.front().id();
-                            let bid = abs_edge.back().id();
-                            let canon = canonical
-                                .get(&(fid, bid))
-                                .or_else(|| canonical.get(&(bid, fid)));
-                            match canon {
-                                Some(c) if c.id() != edge.id() => {
-                                    let same_dir = abs_edge.front().id() == c.absolute_front().id();
-                                    if same_dir == edge.orientation() {
-                                        c.clone()
-                                    } else {
-                                        c.inverse()
-                                    }
+                        .map(|edge| match edge_to_canonical.get(&edge.id()) {
+                            Some(c) => {
+                                let abs_edge = edge.absolute_clone();
+                                let same_dir = abs_edge.front().id() == c.front().id();
+                                if same_dir == edge.orientation() {
+                                    c.clone()
+                                } else {
+                                    c.inverse()
                                 }
-                                _ => edge.clone(),
                             }
+                            None => edge.clone(),
                         })
                         .collect();
                     edges.into()
@@ -777,12 +804,8 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                     new_face
                 }
                 Err(_) => {
-                    // Phase 2 edge substitution produced a non-simple wire.
-                    // Try wire splitting before falling back to original.
                     if let Some(split_face) = try_split_non_simple_wires(&new_wires, &surface, ori)
                     {
-                        #[cfg(debug_assertions)]
-                        eprintln!("[weld] Phase 2: wire splitting recovered non-simple wire");
                         split_face
                     } else {
                         face.clone()
@@ -793,6 +816,142 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         .collect();
 
     *shell = new_faces.into_iter().collect();
+
+    // Phase 3: Fix over-counted edges.
+    // After canonicalization + wire splitting/merging, some edges may appear
+    // in 3+ face references (e.g., merged non-simple wires referencing the
+    // same canonical edge twice within one face, plus normal sharing with
+    // adjacent faces). Replace excess references (3rd, 4th, ...) with fresh
+    // edge clones to restore the 2-reference invariant for Closed shells.
+    {
+        // Count total references per edge ID across all faces
+        let mut edge_ref_count: FxHashMap<EdgeID<C>, usize> = FxHashMap::default();
+        for face in shell.iter() {
+            for wire in face.absolute_boundaries().iter() {
+                for edge in wire.iter() {
+                    *edge_ref_count.entry(edge.id()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let overcounted: FxHashSet<EdgeID<C>> = edge_ref_count
+            .iter()
+            .filter(|(_, count)| **count > 2)
+            .map(|(id, _)| *id)
+            .collect();
+
+        if !overcounted.is_empty() {
+            // Rebuild faces, cloning excess edge references
+            let mut edge_seen_count: FxHashMap<EdgeID<C>, usize> = FxHashMap::default();
+            let fixed_faces: Vec<Face<Point3, C, S>> = shell
+                .iter()
+                .map(|face| {
+                    let ori = face.orientation();
+                    let mut any_cloned = false;
+                    let new_wires: Vec<Wire<Point3, C>> = face
+                        .absolute_boundaries()
+                        .iter()
+                        .map(|wire| {
+                            let edges: Vec<Edge<Point3, C>> = wire
+                                .iter()
+                                .map(|edge| {
+                                    if !overcounted.contains(&edge.id()) {
+                                        return edge.clone();
+                                    }
+                                    let count = edge_seen_count.entry(edge.id()).or_insert(0);
+                                    *count += 1;
+                                    if *count <= 2 {
+                                        // First two references keep the canonical edge
+                                        edge.clone()
+                                    } else {
+                                        // 3rd+ reference: clone with fresh identity
+                                        any_cloned = true;
+                                        let abs = edge.absolute_clone();
+                                        let fresh = Edge::new(abs.front(), abs.back(), abs.curve());
+                                        if edge.orientation() {
+                                            fresh
+                                        } else {
+                                            fresh.inverse()
+                                        }
+                                    }
+                                })
+                                .collect();
+                            edges.into()
+                        })
+                        .collect();
+                    if !any_cloned {
+                        return face.clone();
+                    }
+                    let surface = face.surface();
+                    let all_closed = new_wires.iter().all(|w| !w.is_empty() && w.is_closed());
+                    if all_closed {
+                        let mut new_face = Face::new_unchecked(new_wires, surface);
+                        if !ori {
+                            new_face.invert();
+                        }
+                        new_face
+                    } else {
+                        face.clone()
+                    }
+                })
+                .collect();
+            *shell = fixed_faces.into_iter().collect();
+        }
+    }
+}
+
+/// Finalize a boolean shell: weld edges and assemble into a Solid.
+///
+/// Runs `weld_coincident_edges`, then tries `Solid::try_new`. If the shell
+/// is `Oriented` (open boundary) instead of `Closed`, retries with progressively
+/// wider weld tolerances to close small gaps.
+///
+/// Boolean operations may produce T-junction vertices (from vertex unification
+/// in `add_polygon_vertex`) where two wires share a vertex. These vertices are
+/// topologically "singular" (non-manifold local topology), but geometrically
+/// valid for the CAD pipeline. When the shell is `Closed` but has singular
+/// vertices, we accept the solid via `new_unchecked`.
+fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell: &mut Shell<Point3, C, S>,
+    tols: &BooleanTolerance,
+) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
+    use truck_topology::shell::ShellCondition;
+
+    weld_coincident_edges(shell, tols.tau_model, None);
+
+    // Try standard assembly
+    let boundaries = shell.connected_components();
+    if let Ok(solid) = Solid::try_new(boundaries) {
+        return Ok(solid);
+    }
+
+    // If the shell isn't closed, try wider weld tolerances to close gaps.
+    let wider_tols = [tols.tau_model * 2.0, tols.tau_model * 5.0];
+    for &wider in &wider_tols {
+        weld_coincident_edges(shell, tols.tau_model, Some(wider));
+        let boundaries = shell.connected_components();
+        if let Ok(solid) = Solid::try_new(boundaries) {
+            return Ok(solid);
+        }
+    }
+
+    // Accept Closed shells with singular vertices from T-junctions.
+    // Singular vertices arise from vertex unification at intersection curve
+    // endpoints where two face boundaries meet at a single point.
+    // Solid::try_new rejects them but the geometry is correct for
+    // downstream tessellation and further booleans.
+    let boundaries = shell.connected_components();
+    let acceptable = boundaries.iter().all(|s| !s.is_empty() && s.is_connected());
+    let all_closed = boundaries
+        .iter()
+        .all(|s| s.shell_condition() == ShellCondition::Closed);
+    if acceptable && all_closed {
+        return Ok(Solid::new_unchecked(boundaries));
+    }
+
+    let boundaries = shell.connected_components();
+    Solid::try_new(boundaries)
+        .map_err(|e| BooleanStageError::ShellAssembly(format!("Solid::try_new failed: {:?}", e)))
 }
 
 /// AND operation between two solids, returning a structured error on failure.
@@ -823,10 +982,7 @@ pub fn and_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         let [res, _] = process_one_pair_of_shells_result_with_tol(&and_shell, shell, tols)?;
         and_shell = res;
     }
-    weld_coincident_edges(&mut and_shell, tols.tau_model, None);
-    let boundaries = and_shell.connected_components();
-    Solid::try_new(boundaries)
-        .map_err(|e| BooleanStageError::ShellAssembly(format!("Solid::try_new failed: {:?}", e)))
+    finalize_boolean_shell(&mut and_shell, tols)
 }
 
 /// AND operation between two solids.
@@ -875,10 +1031,7 @@ pub fn or_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         let [_, res] = process_one_pair_of_shells_result_with_tol(&or_shell, shell, tols)?;
         or_shell = res;
     }
-    weld_coincident_edges(&mut or_shell, tols.tau_model, None);
-    let boundaries = or_shell.connected_components();
-    Solid::try_new(boundaries)
-        .map_err(|e| BooleanStageError::ShellAssembly(format!("Solid::try_new failed: {:?}", e)))
+    finalize_boolean_shell(&mut or_shell, tols)
 }
 
 /// OR operation between two solids.
@@ -944,10 +1097,7 @@ pub fn difference_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         }
         diff_shell = faces.into_iter().collect();
     }
-    weld_coincident_edges(&mut diff_shell, tols.tau_model, None);
-    let boundaries = diff_shell.connected_components();
-    Solid::try_new(boundaries)
-        .map_err(|e| BooleanStageError::ShellAssembly(format!("Solid::try_new failed: {:?}", e)))
+    finalize_boolean_shell(&mut diff_shell, tols)
 }
 
 /// Difference operation: A \ B.

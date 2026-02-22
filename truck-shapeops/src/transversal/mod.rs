@@ -12,3 +12,112 @@ pub use integrate::{
     difference_result_with_tol, difference_with_tol, or, or_result, or_result_with_tol,
     or_with_tol, BooleanStageError, BooleanTolerance, ShapeOpsCurve, ShapeOpsSurface,
 };
+
+use truck_geometry::prelude::*;
+use truck_topology::*;
+
+/// Recursively split a non-simple wire at repeated vertices into simple sub-wires.
+///
+/// When `weld_coincident_edges` unifies vertices, a wire may end up with multiple
+/// vertices appearing twice (forming chained figure-8s). This recursively splits
+/// the wire at each repeated vertex until all sub-wires are simple and closed.
+///
+/// Returns `true` if the wire (and all its sub-wires) are successfully split into
+/// simple closed wires in `output`. Returns `false` on failure.
+pub(crate) fn split_wire_recursive<C: Clone>(
+    wire: &Wire<Point3, C>,
+    output: &mut Vec<Wire<Point3, C>>,
+    depth: usize,
+) -> bool {
+    use rustc_hash::FxHashMap;
+    type Vid = VertexID<Point3>;
+
+    // Base case: wire is already simple and closed
+    if wire.is_simple() && wire.is_closed() {
+        output.push(wire.clone());
+        return true;
+    }
+
+    // Guard against infinite recursion
+    if depth >= 10 {
+        return false;
+    }
+
+    let edges: Vec<_> = wire.iter().cloned().collect();
+
+    // Collect all repeated vertices and try each one
+    let mut seen: FxHashMap<Vid, Vec<usize>> = FxHashMap::default();
+    for (i, edge) in edges.iter().enumerate() {
+        let vid = edge.front().id();
+        seen.entry(vid).or_default().push(i);
+    }
+
+    // Count repeated vertices for diagnostics
+    let repeated: Vec<_> = seen.iter().filter(|(_, v)| v.len() >= 2).collect();
+
+    if repeated.is_empty() {
+        // Wire is not simple but has no repeated front vertices — this means
+        // the non-simplicity comes from position-based coincidence (different
+        // vertex IDs at the same position). We can't split by vertex ID.
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[split_wire] depth={}: {} edges, not simple, but no repeated vertex IDs (position-based coincidence?)",
+            depth,
+            edges.len()
+        );
+        return false;
+    }
+
+    // Try splitting at each repeated vertex
+    for positions in seen.values() {
+        if positions.len() < 2 {
+            continue;
+        }
+        // Try every pair of occurrences of this vertex
+        for pi in 0..positions.len() {
+            for pj in (pi + 1)..positions.len() {
+                let first_idx = positions[pi];
+                let i = positions[pj];
+
+                let inner_edges: Vec<_> = edges[first_idx..i].to_vec();
+                let outer_edges: Vec<_> = edges[i..]
+                    .iter()
+                    .chain(edges[..first_idx].iter())
+                    .cloned()
+                    .collect();
+
+                if inner_edges.is_empty() || outer_edges.is_empty() {
+                    continue;
+                }
+
+                let inner_wire: Wire<Point3, C> = inner_edges.into_iter().collect();
+                let outer_wire: Wire<Point3, C> = outer_edges.into_iter().collect();
+
+                if !inner_wire.is_closed() || !outer_wire.is_closed() {
+                    continue;
+                }
+
+                // Recursively split both sub-wires
+                let mut candidate: Vec<Wire<Point3, C>> = Vec::new();
+                if split_wire_recursive(&inner_wire, &mut candidate, depth + 1)
+                    && split_wire_recursive(&outer_wire, &mut candidate, depth + 1)
+                {
+                    output.extend(candidate);
+                    return true;
+                }
+                // This split point didn't work, try next
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[split_wire] depth={}: FAILED {} edges, {} repeated verts, closed={}",
+        depth,
+        edges.len(),
+        repeated.len(),
+        wire.is_closed()
+    );
+
+    false
+}

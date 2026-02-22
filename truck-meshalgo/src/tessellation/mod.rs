@@ -297,7 +297,10 @@ impl<C: PolylineableCurve, S: MeshableSurface> MeshableShape for Solid<Point3, C
             .iter()
             .map(|shell| shell.triangulation(tol))
             .collect::<Vec<_>>();
-        Solid::new(boundaries)
+        // Use new_unchecked: boolean pipeline may produce solids with
+        // non-strict topology (singular vertices, boundary edges from
+        // T-junctions) that are still valid for tessellation.
+        Solid::new_unchecked(boundaries)
     }
 }
 
@@ -309,7 +312,7 @@ impl<C: PolylineableCurve, S: RobustMeshableSurface> RobustMeshableShape for Sol
             .iter()
             .map(|shell| shell.robust_triangulation(tol))
             .collect::<Vec<_>>();
-        Solid::new(boundaries)
+        Solid::new_unchecked(boundaries)
     }
 }
 

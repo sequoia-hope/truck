@@ -113,8 +113,10 @@ where
                     Some((new_face, status))
                 }
                 Err(_e) => {
-                    // Try wire splitting: a non-simple wire may be recoverable
-                    // by splitting at the repeated vertex into two sub-wires.
+                    // Recovery strategies (tried in order):
+                    // 1. Recursive wire splitting for non-simple individual wires
+                    // 2. new_unchecked when all wires are individually valid but
+                    //    share vertices (T-junctions from boolean vertex unification)
                     let ori = face.orientation();
                     let mut split_wires: Vec<Wire<Point3, C>> = Vec::new();
                     let mut any_split = false;
@@ -123,49 +125,35 @@ where
                             split_wires.push(w.clone());
                             continue;
                         }
-                        let edges: Vec<_> = w.iter().cloned().collect();
-                        let mut seen = rustc_hash::FxHashMap::default();
-                        let mut done = false;
-                        for (i, edge) in edges.iter().enumerate() {
-                            let vid = edge.front().id();
-                            if let Some(&first_idx) = seen.get(&vid) {
-                                let inner: Vec<_> = edges[first_idx..i].to_vec();
-                                let outer: Vec<_> = edges[i..]
-                                    .iter()
-                                    .chain(edges[..first_idx].iter())
-                                    .cloned()
-                                    .collect();
-                                if !inner.is_empty() && !outer.is_empty() {
-                                    let iw: Wire<Point3, C> = inner.into_iter().collect();
-                                    let ow: Wire<Point3, C> = outer.into_iter().collect();
-                                    if iw.is_closed() && iw.is_simple()
-                                        && ow.is_closed() && ow.is_simple()
-                                    {
-                                        split_wires.push(ow);
-                                        split_wires.push(iw);
-                                        done = true;
-                                        any_split = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            seen.insert(vid, i);
-                        }
-                        if !done {
+                        let mut split_result: Vec<Wire<Point3, C>> = Vec::new();
+                        if super::split_wire_recursive(w, &mut split_result, 0) {
+                            split_wires.extend(split_result);
+                            any_split = true;
+                        } else {
                             split_wires.push(w.clone());
                         }
                     }
                     if any_split {
-                        if let Ok(mut new_face) = Face::try_new(split_wires, surface) {
+                        if let Ok(mut new_face) =
+                            Face::try_new(split_wires.clone(), surface.clone())
+                        {
                             if !ori {
                                 new_face.invert();
                             }
-                            #[cfg(debug_assertions)]
-                            eprintln!(
-                                "[boolean] divide_one_face: wire splitting recovered non-simple wire"
-                            );
                             return Some((new_face, status));
                         }
+                    }
+                    // Accept non-disjoint wires (T-junctions) via new_unchecked.
+                    // Each edge appears once per face; shared vertices create
+                    // singular points but don't affect edge counting.
+                    let check_wires = if any_split { split_wires } else { wires };
+                    let all_closed = check_wires.iter().all(|w| !w.is_empty() && w.is_closed());
+                    if !check_wires.is_empty() && all_closed {
+                        let mut new_face = Face::new_unchecked(check_wires, surface);
+                        if !ori {
+                            new_face.invert();
+                        }
+                        return Some((new_face, status));
                     }
                     #[cfg(debug_assertions)]
                     eprintln!(
