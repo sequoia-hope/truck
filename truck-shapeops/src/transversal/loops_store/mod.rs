@@ -441,8 +441,13 @@ where
 
 /// Check if a point is within tolerance of any boundary edge of a face.
 /// Used to filter degenerate intersection curves that lie along shared boundaries.
+///
+/// Uses a tight boundary tolerance (tol * 0.5) to avoid filtering real ICs
+/// that are near boundaries due to perturbation offsets. Coplanar shared-
+/// boundary ICs have midpoints at ~0 distance from the boundary, while
+/// perturbation-offset ICs have midpoints at ~tol distance.
 fn is_midpoint_on_face_boundary<C, S>(mid: Point3, face: &Face<Point3, C, S>, tol: f64) -> bool {
-    let boundary_tol = tol * 2.0;
+    let boundary_tol = tol * 0.5;
     for wire in face.absolute_boundaries().iter() {
         for edge in wire.iter() {
             let p = edge.front().point();
@@ -825,140 +830,143 @@ where
             let surface1 = geom_shell1[face_index1].surface();
             let polygon0 = poly_shell0[face_index0].surface()?;
             let polygon1 = poly_shell1[face_index1].surface()?;
-            intersection_curve::intersection_curves(
+            let ics = intersection_curve::intersection_curves(
                 surface0.clone(),
                 &polygon0,
                 surface1.clone(),
                 &polygon1,
-            )?
-            .into_iter()
-            .try_for_each(|(polyline, intersection_curve)| {
-                let mut intersection_curve = intersection_curve.into();
-                let status = ShapesOpStatus::from_is_curve(&intersection_curve)?;
-                let (status0, status1) = match (ori0, ori1) {
-                    (true, true) => (status, status.not()),
-                    (true, false) => (status.not(), status.not()),
-                    (false, true) => (status, status),
-                    (false, false) => (status.not(), status),
-                };
-                if polyline.front().near(&polyline.back()) {
-                    // Pre-validate: skip degenerate closed ICs where all points
-                    // collapse to essentially the same location.
-                    let is_degenerate = {
-                        let pts: &Vec<Point3> = &polyline.0;
-                        if pts.len() < 2 {
-                            true
-                        } else {
-                            let center = pts[0];
-                            pts.iter().all(|p| (*p - center).magnitude() < tol)
-                        }
+            )?;
+            ics.into_iter()
+                .try_for_each(|(polyline, intersection_curve)| {
+                    let mut intersection_curve = intersection_curve.into();
+                    let status = ShapesOpStatus::from_is_curve(&intersection_curve)?;
+                    let (status0, status1) = match (ori0, ori1) {
+                        (true, true) => (status, status.not()),
+                        (true, false) => (status.not(), status.not()),
+                        (false, true) => (status, status),
+                        (false, false) => (status.not(), status),
                     };
-                    if is_degenerate {
-                        #[cfg(debug_assertions)]
-                        eprintln!(
-                            "[boolean] Skipping degenerate closed IC: {} points within tol",
-                            polyline.0.len()
-                        );
+                    if polyline.front().near(&polyline.back()) {
+                        // Pre-validate: skip degenerate closed ICs where all points
+                        // collapse to essentially the same location.
+                        let is_degenerate = {
+                            let pts: &Vec<Point3> = &polyline.0;
+                            if pts.len() < 2 {
+                                true
+                            } else {
+                                let center = pts[0];
+                                pts.iter().all(|p| (*p - center).magnitude() < tol)
+                            }
+                        };
+                        if is_degenerate {
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[boolean] Skipping degenerate closed IC: {} points within tol",
+                                polyline.0.len()
+                            );
+                        } else {
+                            let geom_wire = create_independent_loop(intersection_curve);
+                            let poly_wire = create_independent_loop(polyline);
+                            poly_loops_store0[face_index0].add_independent_loop(BoundaryWire::new(
+                                poly_wire.clone(),
+                                status0,
+                            ));
+                            poly_loops_store1[face_index1]
+                                .add_independent_loop(BoundaryWire::new(poly_wire, status1));
+                            geom_loops_store0[face_index0].add_independent_loop(BoundaryWire::new(
+                                geom_wire.clone(),
+                                status0,
+                            ));
+                            geom_loops_store1[face_index1]
+                                .add_independent_loop(BoundaryWire::new(geom_wire, status1));
+                        }
                     } else {
-                        let geom_wire = create_independent_loop(intersection_curve);
-                        let poly_wire = create_independent_loop(polyline);
-                        poly_loops_store0[face_index0]
-                            .add_independent_loop(BoundaryWire::new(poly_wire.clone(), status0));
-                        poly_loops_store1[face_index1]
-                            .add_independent_loop(BoundaryWire::new(poly_wire, status1));
-                        geom_loops_store0[face_index0]
-                            .add_independent_loop(BoundaryWire::new(geom_wire.clone(), status0));
-                        geom_loops_store1[face_index1]
-                            .add_independent_loop(BoundaryWire::new(geom_wire, status1));
+                        // Pre-filter degenerate boundary-touching curves BEFORE any
+                        // vertex insertion. Coplanar-adjacent intersection curves may
+                        // lie along shared boundary edges, corrupting loop stores.
+                        let mid = polyline.front().midpoint(polyline.back());
+                        let on_boundary0 =
+                            is_midpoint_on_face_boundary(mid, &geom_shell0[face_index0], tol);
+                        let on_boundary1 =
+                            is_midpoint_on_face_boundary(mid, &geom_shell1[face_index1], tol);
+                        if on_boundary0 && on_boundary1 {
+                            return Some(());
+                        }
+                        // Wrap vertex insertion in a defensive closure: if vertex
+                        // projection fails (e.g., at coplanar face boundaries), skip
+                        // this curve rather than aborting the entire pipeline.
+                        let _ = (|| -> Option<()> {
+                            let pv0 = Vertex::new(polyline.front());
+                            let pv1 = Vertex::new(polyline.back());
+                            let gv0 = Vertex::new(polyline.front());
+                            let gv1 = Vertex::new(polyline.back());
+                            let mut pemap0 = HashMap::default();
+                            let mut pemap1 = HashMap::default();
+                            let mut gemap0 = HashMap::default();
+                            let mut gemap1 = HashMap::default();
+                            if let Some((wire_index, edge_index, kind)) =
+                                poly_loops_store0.add_polygon_vertex(face_index0, &pv0, &mut pemap0)
+                            {
+                                geom_loops_store0.add_geom_vertex(
+                                    (face_index0, wire_index, edge_index),
+                                    &gv0,
+                                    kind,
+                                    &surface1,
+                                    &mut gemap0,
+                                )?;
+                                let polyline = intersection_curve.leader_mut();
+                                *polyline.first_mut().unwrap() = gv0.point();
+                            }
+                            if let Some((wire_index, edge_index, kind)) =
+                                poly_loops_store0.add_polygon_vertex(face_index0, &pv1, &mut pemap1)
+                            {
+                                geom_loops_store0.add_geom_vertex(
+                                    (face_index0, wire_index, edge_index),
+                                    &gv1,
+                                    kind,
+                                    &surface1,
+                                    &mut gemap1,
+                                )?;
+                                let polyline = intersection_curve.leader_mut();
+                                *polyline.last_mut().unwrap() = gv1.point();
+                            }
+                            if let Some((wire_index, edge_index, kind)) =
+                                poly_loops_store1.add_polygon_vertex(face_index1, &pv0, &mut pemap0)
+                            {
+                                geom_loops_store1.add_geom_vertex(
+                                    (face_index1, wire_index, edge_index),
+                                    &gv0,
+                                    kind,
+                                    &surface0,
+                                    &mut gemap0,
+                                )?;
+                                let polyline = intersection_curve.leader_mut();
+                                *polyline.first_mut().unwrap() = gv0.point();
+                            }
+                            if let Some((wire_index, edge_index, kind)) =
+                                poly_loops_store1.add_polygon_vertex(face_index1, &pv1, &mut pemap1)
+                            {
+                                geom_loops_store1.add_geom_vertex(
+                                    (face_index1, wire_index, edge_index),
+                                    &gv1,
+                                    kind,
+                                    &surface0,
+                                    &mut gemap1,
+                                )?;
+                                let polyline = intersection_curve.leader_mut();
+                                *polyline.last_mut().unwrap() = gv1.point();
+                            }
+                            let pedge = Edge::new(&pv0, &pv1, polyline);
+                            let gedge = Edge::new(&gv0, &gv1, intersection_curve.into());
+                            poly_loops_store0[face_index0].add_edge(pedge.clone(), status0);
+                            geom_loops_store0[face_index0].add_edge(gedge.clone(), status0);
+                            poly_loops_store1[face_index1].add_edge(pedge, status1);
+                            geom_loops_store1[face_index1].add_edge(gedge, status1);
+                            Some(())
+                        })();
                     }
-                } else {
-                    // Pre-filter degenerate boundary-touching curves BEFORE any
-                    // vertex insertion. Coplanar-adjacent intersection curves may
-                    // lie along shared boundary edges, corrupting loop stores.
-                    let mid = polyline.front().midpoint(polyline.back());
-                    let on_boundary0 =
-                        is_midpoint_on_face_boundary(mid, &geom_shell0[face_index0], tol);
-                    let on_boundary1 =
-                        is_midpoint_on_face_boundary(mid, &geom_shell1[face_index1], tol);
-                    if on_boundary0 && on_boundary1 {
-                        return Some(());
-                    }
-                    // Wrap vertex insertion in a defensive closure: if vertex
-                    // projection fails (e.g., at coplanar face boundaries), skip
-                    // this curve rather than aborting the entire pipeline.
-                    let _open_curve_result = (|| -> Option<()> {
-                        let pv0 = Vertex::new(polyline.front());
-                        let pv1 = Vertex::new(polyline.back());
-                        let gv0 = Vertex::new(polyline.front());
-                        let gv1 = Vertex::new(polyline.back());
-                        let mut pemap0 = HashMap::default();
-                        let mut pemap1 = HashMap::default();
-                        let mut gemap0 = HashMap::default();
-                        let mut gemap1 = HashMap::default();
-                        let idx00 =
-                            poly_loops_store0.add_polygon_vertex(face_index0, &pv0, &mut pemap0);
-                        if let Some((wire_index, edge_index, kind)) = idx00 {
-                            geom_loops_store0.add_geom_vertex(
-                                (face_index0, wire_index, edge_index),
-                                &gv0,
-                                kind,
-                                &surface1,
-                                &mut gemap0,
-                            )?;
-                            let polyline = intersection_curve.leader_mut();
-                            *polyline.first_mut().unwrap() = gv0.point();
-                        }
-                        let idx01 =
-                            poly_loops_store0.add_polygon_vertex(face_index0, &pv1, &mut pemap1);
-                        if let Some((wire_index, edge_index, kind)) = idx01 {
-                            geom_loops_store0.add_geom_vertex(
-                                (face_index0, wire_index, edge_index),
-                                &gv1,
-                                kind,
-                                &surface1,
-                                &mut gemap1,
-                            )?;
-                            let polyline = intersection_curve.leader_mut();
-                            *polyline.last_mut().unwrap() = gv1.point();
-                        }
-                        let idx10 =
-                            poly_loops_store1.add_polygon_vertex(face_index1, &pv0, &mut pemap0);
-                        if let Some((wire_index, edge_index, kind)) = idx10 {
-                            geom_loops_store1.add_geom_vertex(
-                                (face_index1, wire_index, edge_index),
-                                &gv0,
-                                kind,
-                                &surface0,
-                                &mut gemap0,
-                            )?;
-                            let polyline = intersection_curve.leader_mut();
-                            *polyline.first_mut().unwrap() = gv0.point();
-                        }
-                        let idx11 =
-                            poly_loops_store1.add_polygon_vertex(face_index1, &pv1, &mut pemap1);
-                        if let Some((wire_index, edge_index, kind)) = idx11 {
-                            geom_loops_store1.add_geom_vertex(
-                                (face_index1, wire_index, edge_index),
-                                &gv1,
-                                kind,
-                                &surface0,
-                                &mut gemap1,
-                            )?;
-                            let polyline = intersection_curve.leader_mut();
-                            *polyline.last_mut().unwrap() = gv1.point();
-                        }
-                        let pedge = Edge::new(&pv0, &pv1, polyline);
-                        let gedge = Edge::new(&gv0, &gv1, intersection_curve.into());
-                        poly_loops_store0[face_index0].add_edge(pedge.clone(), status0);
-                        geom_loops_store0[face_index0].add_edge(gedge.clone(), status0);
-                        poly_loops_store1[face_index1].add_edge(pedge, status1);
-                        geom_loops_store1[face_index1].add_edge(gedge, status1);
-                        Some(())
-                    })();
-                    let _ = _open_curve_result;
-                }
-                Some(())
-            })
+                    Some(())
+                })
         })?;
 
     // Inject coplanar boundary loops for through-hole detection.

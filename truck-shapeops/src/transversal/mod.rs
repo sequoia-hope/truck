@@ -9,8 +9,9 @@ mod polyline_construction;
 pub(crate) mod robust_classify;
 pub use integrate::{
     and, and_result, and_result_with_tol, and_with_tol, difference, difference_result,
-    difference_result_with_tol, difference_with_tol, or, or_result, or_result_with_tol,
-    or_with_tol, BooleanStageError, BooleanTolerance, ShapeOpsCurve, ShapeOpsSurface,
+    difference_result_with_tol, difference_with_tol, heal_shell_vertices, or, or_result,
+    or_result_with_tol, or_with_tol, BooleanStageError, BooleanTolerance, ShapeOpsCurve,
+    ShapeOpsSurface,
 };
 
 use truck_geometry::prelude::*;
@@ -61,11 +62,31 @@ pub(crate) fn split_wire_recursive<C: Clone>(
         // the non-simplicity comes from position-based coincidence (different
         // vertex IDs at the same position). We can't split by vertex ID.
         #[cfg(debug_assertions)]
-        eprintln!(
-            "[split_wire] depth={}: {} edges, not simple, but no repeated vertex IDs (position-based coincidence?)",
-            depth,
-            edges.len()
-        );
+        {
+            eprintln!(
+                "[split_wire] depth={}: {} edges, not simple, but no repeated vertex IDs (position-based coincidence?)",
+                depth,
+                edges.len()
+            );
+            for (i, e) in edges.iter().enumerate() {
+                let a = e.absolute_clone();
+                let fp = a.front().point();
+                let bp = a.back().point();
+                eprintln!(
+                    "  e[{}]: fid={:?} bid={:?} f=({:.3},{:.3},{:.3}) b=({:.3},{:.3},{:.3}) ori={}",
+                    i,
+                    a.front().id(),
+                    a.back().id(),
+                    fp.x,
+                    fp.y,
+                    fp.z,
+                    bp.x,
+                    bp.y,
+                    bp.z,
+                    e.orientation(),
+                );
+            }
+        }
         return false;
     }
 
@@ -109,13 +130,33 @@ pub(crate) fn split_wire_recursive<C: Clone>(
     }
 
     #[cfg(debug_assertions)]
-    eprintln!(
-        "[split_wire] depth={}: FAILED {} edges, {} repeated verts, closed={}",
-        depth,
-        edges.len(),
-        repeated.len(),
-        wire.is_closed()
-    );
+    {
+        eprintln!(
+            "[split_wire] depth={}: FAILED {} edges, {} repeated verts, closed={}",
+            depth,
+            edges.len(),
+            repeated.len(),
+            wire.is_closed()
+        );
+        for (i, e) in edges.iter().enumerate() {
+            let a = e.absolute_clone();
+            let fp = a.front().point();
+            let bp = a.back().point();
+            eprintln!(
+                "  e[{}]: fid={:?} bid={:?} f=({:.3},{:.3},{:.3}) b=({:.3},{:.3},{:.3}) ori={}",
+                i,
+                a.front().id(),
+                a.back().id(),
+                fp.x,
+                fp.y,
+                fp.z,
+                bp.x,
+                bp.y,
+                bp.z,
+                e.orientation(),
+            );
+        }
+    }
 
     false
 }

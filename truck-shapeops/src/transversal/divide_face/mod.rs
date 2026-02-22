@@ -7,6 +7,139 @@ use std::ops::Deref;
 use truck_meshalgo::prelude::*;
 use truck_topology::*;
 
+/// Try to rebuild connected closed wires from a pool of edges.
+///
+/// When loops_store produces wires with connectivity issues (gaps, wrong
+/// orientations, or mixed-up edges), this function collects all edges
+/// and reconstructs proper closed wires by graph traversal. Each edge
+/// can be traversed in either direction. Matching uses vertex IDs first,
+/// then falls back to position proximity.
+#[allow(dead_code)]
+fn rebuild_connected_wires<C>(wires: &[Wire<Point3, C>], tol: f64) -> Option<Vec<Wire<Point3, C>>>
+where
+    C: Clone + BoundedCurve<Point = Point3>,
+{
+    // Collect all edges into a pool with both possible directions
+    type Vid = VertexID<Point3>;
+    let mut all_edges: Vec<(Edge<Point3, C>, bool)> = Vec::new(); // (abs_edge, used)
+    for wire in wires {
+        for edge in wire.iter() {
+            all_edges.push((edge.absolute_clone(), false));
+        }
+    }
+
+    if all_edges.is_empty() {
+        return None;
+    }
+
+    // Build adjacency: vertex_id -> list of (edge_index, is_forward, other_vertex_id)
+    let mut adjacency: HashMap<Vid, Vec<(usize, bool, Vid)>> = HashMap::default();
+    for (i, (edge, _)) in all_edges.iter().enumerate() {
+        let fid = edge.front().id();
+        let bid = edge.back().id();
+        adjacency.entry(fid).or_default().push((i, true, bid)); // forward: fid → bid
+        adjacency.entry(bid).or_default().push((i, false, fid)); // backward: bid → fid
+    }
+
+    let mut result_wires: Vec<Wire<Point3, C>> = Vec::new();
+    let n = all_edges.len();
+
+    // Try to build closed wires
+    while let Some(start_idx) = all_edges.iter().position(|(_, used)| !*used) {
+        all_edges[start_idx].1 = true;
+        let start_edge = &all_edges[start_idx].0;
+        let start_vid = start_edge.front().id();
+        let mut current_vid = start_edge.back().id();
+        let mut wire_edges: Vec<Edge<Point3, C>> = vec![start_edge.clone()];
+
+        // Follow the chain until we close the loop or get stuck
+        let mut stuck = false;
+        while current_vid != start_vid {
+            if wire_edges.len() > n {
+                stuck = true;
+                break;
+            }
+
+            // Find an unused edge starting at current_vid
+            let next = adjacency
+                .get(&current_vid)
+                .and_then(|adj| adj.iter().find(|(idx, _, _)| !all_edges[*idx].1))
+                .copied();
+
+            match next {
+                Some((idx, forward, next_vid)) => {
+                    all_edges[idx].1 = true;
+                    let edge = &all_edges[idx].0;
+                    if forward {
+                        wire_edges.push(edge.clone());
+                    } else {
+                        wire_edges.push(edge.inverse());
+                    }
+                    current_vid = next_vid;
+                }
+                None => {
+                    // Try position-based fallback: find an unused edge with
+                    // a vertex near current position
+                    let current_pos = {
+                        // Find the point for current_vid
+                        let last_edge = wire_edges.last().unwrap();
+                        last_edge.back().point()
+                    };
+                    let found = all_edges
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (_, used))| !*used)
+                        .find_map(|(idx, (edge, _))| {
+                            let fp = edge.front().point();
+                            let bp = edge.back().point();
+                            if (fp - current_pos).magnitude() < tol {
+                                Some((idx, true, edge.back().id()))
+                            } else if (bp - current_pos).magnitude() < tol {
+                                Some((idx, false, edge.front().id()))
+                            } else {
+                                None
+                            }
+                        });
+                    match found {
+                        Some((idx, forward, next_vid)) => {
+                            all_edges[idx].1 = true;
+                            let edge = &all_edges[idx].0;
+                            if forward {
+                                wire_edges.push(edge.clone());
+                            } else {
+                                wire_edges.push(edge.inverse());
+                            }
+                            current_vid = next_vid;
+                        }
+                        None => {
+                            stuck = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if stuck {
+            // Couldn't build a closed wire — bail out
+            return None;
+        }
+
+        let wire: Wire<Point3, C> = wire_edges.into_iter().collect();
+        if wire.is_closed() {
+            result_wires.push(wire);
+        } else {
+            return None;
+        }
+    }
+
+    if result_wires.is_empty() {
+        return None;
+    }
+
+    Some(result_wires)
+}
+
 fn create_parameter_boundary<P, C, S>(
     face: &Face<P, C, S>,
     wire: &Wire<P, C>,
@@ -63,8 +196,12 @@ where
     loops.iter().try_for_each(|wire| {
         let poly = create_parameter_boundary(face, wire, &mut map, tol)?;
         let area = poly.area();
-        // Skip degenerate loops with negligible area (coplanar artifacts)
-        if area.abs() < tol {
+        // Skip degenerate loops with negligible parametric area. Use tol^2
+        // as the threshold to avoid skipping real IC-derived face fragments
+        // whose parametric area is small due to surface parameterization
+        // compression (e.g., a 0.5×0.5 world-space corner maps to area
+        // 0.028 in parametric space on a 3×3 face).
+        if area.abs() < tol * tol {
             return Some(());
         }
         match area > 0.0 {
@@ -112,11 +249,11 @@ where
                     }
                     Some((new_face, status))
                 }
-                Err(_e) => {
-                    // Recovery strategies (tried in order):
-                    // 1. Recursive wire splitting for non-simple individual wires
-                    // 2. new_unchecked when all wires are individually valid but
-                    //    share vertices (T-junctions from boolean vertex unification)
+                Err(_e_outer) => {
+                    // Try recursive wire splitting for non-simple wires.
+                    // Do NOT use Face::new_unchecked here — non-simple faces
+                    // from divide_one_face cause edge over-sharing (3+ refs)
+                    // that breaks the Closed shell invariant in weld_coincident_edges.
                     let ori = face.orientation();
                     let mut split_wires: Vec<Wire<Point3, C>> = Vec::new();
                     let mut any_split = false;
@@ -143,23 +280,35 @@ where
                             return Some((new_face, status));
                         }
                     }
-                    // Accept non-disjoint wires (T-junctions) via new_unchecked.
-                    // Each edge appears once per face; shared vertices create
-                    // singular points but don't affect edge counting.
-                    let check_wires = if any_split { split_wires } else { wires };
-                    let all_closed = check_wires.iter().all(|w| !w.is_empty() && w.is_closed());
-                    if !check_wires.is_empty() && all_closed {
-                        let mut new_face = Face::new_unchecked(check_wires, surface);
-                        if !ori {
-                            new_face.invert();
-                        }
-                        return Some((new_face, status));
-                    }
                     #[cfg(debug_assertions)]
-                    eprintln!(
-                        "[boolean] Face::try_new failed in divide_one_face: {:?}",
-                        _e
-                    );
+                    {
+                        let check_wires = if any_split { &split_wires } else { &wires };
+                        eprintln!(
+                            "[boolean] Face::try_new failed in divide_one_face: {:?}",
+                            _e_outer
+                        );
+                        for (wi, w) in check_wires.iter().enumerate() {
+                            let edges: Vec<_> = w.iter().collect();
+                            eprintln!(
+                                "  wire[{}]: {} edges, closed={}, simple={}",
+                                wi,
+                                edges.len(),
+                                w.is_closed(),
+                                w.is_simple(),
+                            );
+                            for (ei, e) in edges.iter().enumerate() {
+                                let a = e.absolute_clone();
+                                let fp = a.front().point();
+                                let bp = a.back().point();
+                                eprintln!(
+                                    "    edge[{}]: fid={:?} bid={:?} fp=({:.4},{:.4},{:.4}) bp=({:.4},{:.4},{:.4}) ori={}",
+                                    ei, a.front().id(), a.back().id(),
+                                    fp.x, fp.y, fp.z, bp.x, bp.y, bp.z,
+                                    e.orientation(),
+                                );
+                            }
+                        }
+                    }
                     None
                 }
             }
@@ -249,6 +398,12 @@ where
                 } else {
                     match divide_one_face(face, loops, tol) {
                         Some(vec) => {
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[divide_face] face {} produced {} fragments",
+                                idx,
+                                vec.len(),
+                            );
                             vec.into_iter().for_each(|(face, status)| {
                                 if is_coplanar {
                                     coplanar_fragment_ids.push(face.id());

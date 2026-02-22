@@ -30,6 +30,20 @@ impl<T> PartialEq for ID<T> {
 
 impl<T> Eq for ID<T> {}
 
+impl<T> Ord for ID<T> {
+    #[inline(always)]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl<T> PartialOrd for ID<T> {
+    #[inline(always)]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl<T> Debug for ID<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.write_fmt(format_args!("0x{:x}", self.0))
