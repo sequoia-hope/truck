@@ -2592,40 +2592,45 @@ pub fn difference_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 }
 
 /// Difference operation with per-stage tolerance control.
+///
+/// For multi-shell solid0 (A), each shell is processed independently against
+/// solid1 (B): `(A0 ∪ A1) \ B = (A0 \ B) ∪ (A1 \ B)`. This prevents
+/// disjoint shells from being lost when they don't intersect each other.
 pub fn difference_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid0: &Solid<Point3, C, S>,
     solid1: &Solid<Point3, C, S>,
     tols: &BooleanTolerance,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
-    let mut iter0 = solid0.boundaries().iter();
-    let mut iter1 = solid1.boundaries().iter();
-    let shell0 = iter0.next().unwrap();
-    let shell1 = iter1.next().unwrap();
-    let ClassifiedShellBuckets { or0, and1, .. } =
-        classify_one_pair_of_shells_result_with_tol(shell0, shell1, tols)?;
-    // Difference = or0 (A faces outside B) + inverted and1 (B faces inside A, flipped)
-    let mut diff_faces: Vec<Face<Point3, C, S>> = or0.into_iter().collect();
-    for face in and1.into_iter() {
-        diff_faces.push(face.inverse());
-    }
-    let mut diff_shell: Shell<Point3, C, S> = diff_faces.into_iter().collect();
-    // Handle additional boundary shells (multi-shell solids)
-    for shell in iter0 {
-        let classified = classify_one_pair_of_shells_result_with_tol(&diff_shell, shell, tols)?;
-        let mut faces: Vec<Face<Point3, C, S>> = classified.or0.into_iter().collect();
-        for face in classified.and1.into_iter() {
-            faces.push(face.inverse());
+    let shells0 = solid0.boundaries();
+    let shells1 = solid1.boundaries();
+    let mut all_diff_faces: Vec<Face<Point3, C, S>> = Vec::new();
+
+    // Process each shell of solid0 independently against solid1.
+    // (A0 ∪ A1 ∪ ...) \ (B0 ∪ B1 ∪ ...) = ∪_i (Ai \ B0 \ B1 \ ...)
+    for shell0 in shells0.iter() {
+        let mut shell1_iter = shells1.iter();
+        let first_shell1 = shell1_iter.next().unwrap();
+        let ClassifiedShellBuckets { or0, and1, .. } =
+            classify_one_pair_of_shells_result_with_tol(shell0, first_shell1, tols)?;
+        // Difference = or0 (A faces outside B) + inverted and1 (B faces inside A, flipped)
+        let mut diff_faces: Vec<Face<Point3, C, S>> = or0.into_iter().collect();
+        for face in and1.into_iter() {
+            diff_faces.push(face.inverse());
         }
-        diff_shell = faces.into_iter().collect();
-    }
-    for shell in iter1 {
-        let classified = classify_one_pair_of_shells_result_with_tol(&diff_shell, shell, tols)?;
-        let mut faces: Vec<Face<Point3, C, S>> = classified.or0.into_iter().collect();
-        for face in classified.and1.into_iter() {
-            faces.push(face.inverse());
+        // Iterative subtraction against additional B shells: (Ai \ B0) \ B1 \ ...
+        for additional_b in shell1_iter {
+            let diff_shell: Shell<Point3, C, S> = diff_faces.into_iter().collect();
+            let classified =
+                classify_one_pair_of_shells_result_with_tol(&diff_shell, additional_b, tols)?;
+            diff_faces = classified.or0.into_iter().collect();
+            for face in classified.and1.into_iter() {
+                diff_faces.push(face.inverse());
+            }
         }
-        diff_shell = faces.into_iter().collect();
+        all_diff_faces.extend(diff_faces);
     }
+
+    let mut diff_shell: Shell<Point3, C, S> = all_diff_faces.into_iter().collect();
     finalize_boolean_shell(&mut diff_shell, tols)
 }
 
