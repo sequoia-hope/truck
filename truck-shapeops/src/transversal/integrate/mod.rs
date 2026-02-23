@@ -1416,6 +1416,7 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 
 /// Information about an edge that appears in != 2 faces (open or over-shared).
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct OpenEdgeInfo {
     /// Front vertex position.
     pub front: Point3,
@@ -2366,7 +2367,7 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 
     // If the shell isn't closed, try wider weld tolerances to close gaps.
     let wider_tols = [tols.tau_model * 2.0, tols.tau_model * 5.0];
-    for (i, &wider) in wider_tols.iter().enumerate() {
+    for (_i, &wider) in wider_tols.iter().enumerate() {
         weld_coincident_edges(shell, tols.tau_model, Some(wider));
 
         #[cfg(debug_assertions)]
@@ -2374,7 +2375,7 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
             let open = diagnose_open_edges(shell);
             eprintln!(
                 "[finalize] after weld #{}: {} faces, {} open edges",
-                i + 2,
+                _i + 2,
                 shell.len(),
                 open.len(),
             );

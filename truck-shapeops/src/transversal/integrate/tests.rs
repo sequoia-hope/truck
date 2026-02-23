@@ -853,3 +853,131 @@ fn mutual_containment_coplanar() {
         shell.len()
     );
 }
+
+/// Three abutting boxes along Z axis: chained union.
+///
+/// Box A: [0,10] x [0,10] x [0,10]
+/// Box B: [0,10] x [0,10] x [10,20]  (abuts A at z=10)
+/// Box C: [0,10] x [0,10] x [20,30]  (abuts B at z=20)
+///
+/// or(or(A, B), C) should produce a valid 10x10x30 box.
+/// HP-1 reports this chain fails at the 3rd step.
+#[test]
+fn three_abutting_boxes_chained_union() {
+    let box_a: Solid = {
+        let v = builder::vertex(Point3::origin());
+        let e = builder::tsweep(&v, Vector3::unit_x() * 10.0);
+        let f = builder::tsweep(&e, Vector3::unit_y() * 10.0);
+        builder::tsweep(&f, Vector3::unit_z() * 10.0)
+    };
+
+    let box_b: Solid = {
+        let v = builder::vertex(Point3::new(0.0, 0.0, 10.0));
+        let e = builder::tsweep(&v, Vector3::unit_x() * 10.0);
+        let f = builder::tsweep(&e, Vector3::unit_y() * 10.0);
+        builder::tsweep(&f, Vector3::unit_z() * 10.0)
+    };
+
+    let box_c: Solid = {
+        let v = builder::vertex(Point3::new(0.0, 0.0, 20.0));
+        let e = builder::tsweep(&v, Vector3::unit_x() * 10.0);
+        let f = builder::tsweep(&e, Vector3::unit_y() * 10.0);
+        builder::tsweep(&f, Vector3::unit_z() * 10.0)
+    };
+
+    // Step 1: or(A, B) — 2 abutting boxes
+    let step1 = crate::or_result(&box_a, &box_b, 0.05);
+    assert!(step1.is_ok(), "or(A, B) should succeed: {:?}", step1.err());
+    let ab = step1.unwrap();
+
+    eprintln!(
+        "[3-abutting] or(A,B): {} boundaries, shell0 has {} faces",
+        ab.boundaries().len(),
+        ab.boundaries()[0].len(),
+    );
+
+    // Step 2: or(AB, C) — chain the 3rd box
+    let step2 = crate::or_result(&ab, &box_c, 0.05);
+    assert!(
+        step2.is_ok(),
+        "or(AB, C) should succeed for 3 abutting boxes: {:?}",
+        step2.err()
+    );
+    let abc = step2.unwrap();
+
+    let shell = &abc.boundaries()[0];
+    use truck_topology::shell::ShellCondition;
+    eprintln!(
+        "[3-abutting] or(AB,C): {} boundaries, shell0 has {} faces, condition={:?}",
+        abc.boundaries().len(),
+        shell.len(),
+        shell.shell_condition(),
+    );
+
+    assert_eq!(
+        shell.shell_condition(),
+        ShellCondition::Closed,
+        "3-abutting union must be a closed manifold"
+    );
+    assert!(
+        shell.len() >= 6,
+        "3 abutting boxes union should have at least 6 faces (got {})",
+        shell.len()
+    );
+}
+
+/// Four abutting 20x20x10 boxes along X axis (HP-1 geometry).
+///
+/// Matches the geometry from the several-extrudes.waffle test case.
+/// All boxes use same 20x20 cross-section, depth 10, along X.
+#[test]
+fn four_abutting_boxes_x_axis_hp1() {
+    let make_box = |x_start: f64| -> Solid {
+        let v = builder::vertex(Point3::new(x_start, -10.0, -10.0));
+        let e = builder::tsweep(&v, Vector3::unit_y() * 20.0);
+        let f = builder::tsweep(&e, Vector3::unit_z() * 20.0);
+        builder::tsweep(&f, Vector3::unit_x() * 10.0)
+    };
+
+    let box1 = make_box(0.0);
+    let box2 = make_box(10.0);
+    let box3 = make_box(20.0);
+    let box4 = make_box(30.0);
+
+    // Chain unions
+    let r1 = crate::or_result(&box1, &box2, 0.05);
+    assert!(r1.is_ok(), "or(1,2) failed: {:?}", r1.err());
+    let s12 = r1.unwrap();
+    eprintln!(
+        "[HP1] or(1,2): {} faces, {} boundaries",
+        s12.boundaries()[0].len(),
+        s12.boundaries().len(),
+    );
+
+    let r2 = crate::or_result(&s12, &box3, 0.05);
+    assert!(r2.is_ok(), "or(12,3) failed: {:?}", r2.err());
+    let s123 = r2.unwrap();
+    eprintln!(
+        "[HP1] or(12,3): {} faces, {} boundaries",
+        s123.boundaries()[0].len(),
+        s123.boundaries().len(),
+    );
+
+    let r3 = crate::or_result(&s123, &box4, 0.05);
+    assert!(r3.is_ok(), "or(123,4) failed: {:?}", r3.err());
+    let s1234 = r3.unwrap();
+
+    let shell = &s1234.boundaries()[0];
+    use truck_topology::shell::ShellCondition;
+    eprintln!(
+        "[HP1] or(123,4): {} faces, condition={:?}",
+        shell.len(),
+        shell.shell_condition(),
+    );
+
+    assert_eq!(
+        shell.shell_condition(),
+        ShellCondition::Closed,
+        "4-box chain union must be closed"
+    );
+}

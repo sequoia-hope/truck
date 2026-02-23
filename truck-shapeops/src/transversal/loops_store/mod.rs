@@ -240,7 +240,7 @@ impl<P: Copy, C: Clone> Loops<P, C> {
     }
 
     #[inline(always)]
-    fn add_independent_loop(&mut self, r#loop: BoundaryWire<P, C>) {
+    pub(crate) fn add_independent_loop(&mut self, r#loop: BoundaryWire<P, C>) {
         self.push(r#loop.inverse());
         self.push(r#loop);
     }
