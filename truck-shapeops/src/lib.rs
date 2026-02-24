@@ -19,8 +19,12 @@ mod transversal;
 pub use transversal::{
     and, and_result, and_result_with_tol, and_with_tol, difference, difference_result,
     difference_result_with_tol, difference_with_tol, heal_shell_vertices, or, or_result,
-    or_result_with_tol, or_with_tol, BooleanStageError, BooleanTolerance, ShapeOpsCurve,
-    ShapeOpsSurface,
+    or_result_with_tol, or_with_tol, BooleanDiagnostics, BooleanStageError, BooleanTolerance,
+    ShapeOpsCurve, ShapeOpsSurface,
 };
+/// Diagnostic sub-types for boolean operations.
+pub mod diagnostics {
+    pub use crate::transversal::diagnostics::*;
+}
 mod alternative;
 mod fillet;

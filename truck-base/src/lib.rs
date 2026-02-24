@@ -25,8 +25,9 @@ pub mod ders;
 pub mod entry_map;
 /// Deterministic hash functions
 pub mod hash;
-/// ID structure with `Copy`, `Hash` and `Eq` using raw pointers
+/// ID structure with `Copy`, `Hash` and `Eq` using raw pointers, plus deterministic IDs
 pub mod id;
+pub use id::{DetContext, DetId};
 pub mod newton;
 /// Setting Tolerance
 pub mod tolerance;

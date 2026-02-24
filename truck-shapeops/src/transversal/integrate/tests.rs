@@ -981,3 +981,143 @@ fn four_abutting_boxes_x_axis_hp1() {
         "4-box chain union must be closed"
     );
 }
+
+#[test]
+fn test_tolerance_fields_from_model() {
+    let bt = super::BooleanTolerance::from_model_tol(0.01);
+    assert_eq!(bt.tau_model, 0.01);
+    assert_eq!(bt.tau_mesh, 0.01);
+    assert!((bt.tau_weld - 0.004).abs() < 1e-15);
+    assert!((bt.tau_boundary - 0.005).abs() < 1e-15);
+    assert!((bt.tau_edge_cluster - 0.05).abs() < 1e-15);
+    assert!((bt.tau_area - 0.0001).abs() < 1e-15);
+}
+
+#[test]
+fn test_tolerance_uniform_backward_compat() {
+    let bt = super::BooleanTolerance::uniform(0.01);
+    // uniform mode: all base fields = tol
+    assert_eq!(bt.tau_model, 0.01);
+    assert_eq!(bt.tau_boundary, 0.01);
+    assert_eq!(bt.tau_edge_cluster, 0.01);
+    assert!((bt.tau_area - 0.0001).abs() < 1e-15);
+}
+
+#[test]
+fn test_diagnostics_default() {
+    let diag = crate::BooleanDiagnostics::default();
+    assert_eq!(diag.tolerance.tau_model, 0.0);
+    assert!(diag.warnings.is_empty());
+    assert_eq!(diag.classification.faces_coplanar, 0);
+    assert_eq!(diag.topology.vertices_welded, 0);
+}
+
+// ---------------------------------------------------------------------------
+// DetId tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_with_det_context_scoped() {
+    use truck_base::id::DetContext;
+    // Outside any context, assign_vertex_det_ids still works (fallback).
+    let v = builder::vertex(Point3::origin());
+    let e = builder::tsweep(&v, Vector3::unit_x());
+    let f = builder::tsweep(&e, Vector3::unit_y());
+    let cube: Solid = builder::tsweep(&f, Vector3::unit_z());
+    let shell = &cube.boundaries()[0];
+
+    let det_map = super::assign_vertex_det_ids(shell);
+    assert!(!det_map.is_empty(), "Should assign IDs to all vertices");
+
+    // Inside a det context, IDs are sequential from 0.
+    super::with_det_context(|| {
+        let det_map2 = super::assign_vertex_det_ids(shell);
+        assert_eq!(det_map2.len(), det_map.len());
+        // All IDs should be sequential starting from 0
+        let mut ids: Vec<u64> = det_map2.values().map(|d| d.raw()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), det_map2.len(), "All IDs should be unique");
+        assert_eq!(ids[0], 0, "First DetId should be 0");
+    });
+}
+
+#[test]
+fn test_det_context_deterministic_vertex_ordering() {
+    // Run assign_vertex_det_ids twice on the same shell and verify
+    // the same (Vid → DetId) mapping is produced.
+    let v = builder::vertex(Point3::origin());
+    let e = builder::tsweep(&v, Vector3::unit_x());
+    let f = builder::tsweep(&e, Vector3::unit_y());
+    let cube: Solid = builder::tsweep(&f, Vector3::unit_z());
+    let shell = &cube.boundaries()[0];
+
+    let map1 = super::with_det_context(|| super::assign_vertex_det_ids(shell));
+    let map2 = super::with_det_context(|| super::assign_vertex_det_ids(shell));
+
+    // Same Vid keys should get same DetId values
+    for (vid, det1) in &map1 {
+        let det2 = map2.get(vid).expect("Same vertices should be present");
+        assert_eq!(det1, det2, "Same Vid should get same DetId across contexts");
+    }
+}
+
+#[test]
+fn test_boolean_with_det_context_box_union() {
+    // Verify that boolean operations run successfully with DetId context.
+    let v = builder::vertex(Point3::origin());
+    let e = builder::tsweep(&v, Vector3::unit_x());
+    let f = builder::tsweep(&e, Vector3::unit_y());
+    let cube: Solid = builder::tsweep(&f, Vector3::unit_z());
+
+    let v2 = builder::vertex(Point3::new(0.25, 0.25, 1.0));
+    let e2 = builder::tsweep(&v2, Vector3::unit_x() * 0.5);
+    let f2 = builder::tsweep(&e2, Vector3::unit_y() * 0.5);
+    let boss: Solid = builder::tsweep(&f2, Vector3::unit_z() * 0.5);
+
+    // OR (coplanar) and AND should succeed with DetId context
+    let or_result = crate::or(&cube, &boss, 0.05);
+    assert!(or_result.is_some(), "OR with DetId context should succeed");
+
+    let and_result = crate::and(&cube, &boss, 0.05);
+    assert!(
+        and_result.is_some(),
+        "AND with DetId context should succeed"
+    );
+
+    // Difference with fully-enclosed tool (non-degenerate)
+    let v3 = builder::vertex(Point3::new(0.25, 0.25, 0.25));
+    let e3 = builder::tsweep(&v3, Vector3::unit_x() * 0.5);
+    let f3 = builder::tsweep(&e3, Vector3::unit_y() * 0.5);
+    let inner: Solid = builder::tsweep(&f3, Vector3::unit_z() * 0.5);
+
+    let diff_result = crate::difference(&cube, &inner, 0.05);
+    assert!(
+        diff_result.is_some(),
+        "Difference with DetId context should succeed"
+    );
+}
+
+#[test]
+fn test_boolean_deterministic_50x() {
+    // Run the same boolean 50 times and verify identical face counts.
+    for _ in 0..50 {
+        let v = builder::vertex(Point3::origin());
+        let e = builder::tsweep(&v, Vector3::unit_x());
+        let f = builder::tsweep(&e, Vector3::unit_y());
+        let cube: Solid = builder::tsweep(&f, Vector3::unit_z());
+
+        let v2 = builder::vertex(Point3::new(0.25, 0.25, 1.0));
+        let e2 = builder::tsweep(&v2, Vector3::unit_x() * 0.5);
+        let f2 = builder::tsweep(&e2, Vector3::unit_y() * 0.5);
+        let boss: Solid = builder::tsweep(&f2, Vector3::unit_z() * 0.5);
+
+        let result = crate::or(&cube, &boss, 0.05).expect("OR should succeed");
+        let face_count = result.boundaries()[0].len();
+        // Coplanar box-on-box union produces 11 faces
+        assert_eq!(
+            face_count, 11,
+            "Each run should produce the same face count"
+        );
+    }
+}

@@ -2,6 +2,9 @@
 
 use super::faces_classification::FacesClassification;
 use super::loops_store::*;
+// Order-insensitive: HashMap is used for polyline caching (EdgeID -> PolylineCurve)
+// and adjacency lookup in rebuild_connected_wires (dead code). Face division iterates
+// over shells (Vec) in index order.
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Deref;
 use truck_meshalgo::prelude::*;
@@ -186,6 +189,7 @@ fn divide_one_face<C, S>(
     face: &Face<Point3, C, S>,
     loops: &Loops<Point3, C>,
     tol: f64,
+    tau_area: f64,
 ) -> Option<Vec<FaceWithShapesOpStatus<C, S>>>
 where
     C: BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
@@ -196,12 +200,12 @@ where
     loops.iter().try_for_each(|wire| {
         let poly = create_parameter_boundary(face, wire, &mut map, tol)?;
         let area = poly.area();
-        // Skip degenerate loops with negligible parametric area. Use tol^2
-        // as the threshold to avoid skipping real IC-derived face fragments
-        // whose parametric area is small due to surface parameterization
-        // compression (e.g., a 0.5×0.5 world-space corner maps to area
-        // 0.028 in parametric space on a 3×3 face).
-        if area.abs() < tol * tol {
+        // Skip degenerate loops with negligible parametric area. Uses
+        // `tau_area` (typically `tau_model^2`) to avoid skipping real IC-derived
+        // face fragments whose parametric area is small due to surface
+        // parameterization compression (e.g., a 0.5×0.5 world-space corner
+        // maps to area 0.028 in parametric space on a 3×3 face).
+        if area.abs() < tau_area {
             return Some(());
         }
         match area > 0.0 {
@@ -326,6 +330,7 @@ pub fn divide_faces_with_coplanar<C, S>(
     loops_store: &LoopsStore<Point3, C>,
     tol: f64,
     coplanar_faces: &rustc_hash::FxHashSet<usize>,
+    tau_area: f64,
 ) -> Option<(FacesClassification<Point3, C, S>, Vec<FaceID<S>>)>
 where
     C: BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
@@ -396,7 +401,7 @@ where
                     }
                     res.push(face.clone(), ShapesOpStatus::Unknown);
                 } else {
-                    match divide_one_face(face, loops, tol) {
+                    match divide_one_face(face, loops, tol, tau_area) {
                         Some(vec) => {
                             #[cfg(debug_assertions)]
                             eprintln!(

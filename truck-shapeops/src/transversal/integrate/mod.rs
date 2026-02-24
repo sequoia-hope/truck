@@ -1,9 +1,81 @@
 use crate::alternative::Alternative;
 
 use super::*;
+use std::cell::RefCell;
+use truck_base::id::{DetContext, DetId};
 use truck_geometry::prelude::*;
 use truck_meshalgo::prelude::*;
 use truck_topology::*;
+
+// ---------------------------------------------------------------------------
+// Deterministic ID context (thread-local, scoped to each boolean operation)
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static DET_CONTEXT: RefCell<Option<DetContext>> = const { RefCell::new(None) };
+}
+
+/// Run a closure with a fresh deterministic ID context.
+///
+/// All calls to `next_det_id()` within `f` produce sequential IDs starting
+/// from 0. Contexts do not nest — calling `with_det_context` while one is
+/// already active replaces it.
+fn with_det_context<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    DET_CONTEXT.with(|ctx| {
+        *ctx.borrow_mut() = Some(DetContext::new());
+    });
+    let result = f();
+    DET_CONTEXT.with(|ctx| {
+        *ctx.borrow_mut() = None;
+    });
+    result
+}
+
+/// Assign deterministic IDs to all unique vertices in a shell, ordered by
+/// spatial position (lexicographic x, y, z). Returns a map from pointer-based
+/// `VertexID` to `DetId`.
+///
+/// Falls back to sequential pointer-ID ordering if not in a `with_det_context`
+/// scope (so existing non-det-context callers still work).
+fn assign_vertex_det_ids<C, S>(
+    shell: &Shell<Point3, C, S>,
+) -> rustc_hash::FxHashMap<VertexID<Point3>, DetId> {
+    type Vid = VertexID<Point3>;
+    let mut unique_verts: Vec<(Vid, Point3)> = Vec::new();
+    let mut seen: rustc_hash::FxHashSet<Vid> = rustc_hash::FxHashSet::default();
+    for face in shell.iter() {
+        for wire in face.absolute_boundaries().iter() {
+            for v in wire.vertex_iter() {
+                if seen.insert(v.id()) {
+                    unique_verts.push((v.id(), v.point()));
+                }
+            }
+        }
+    }
+    // Sort by spatial position for deterministic ordering.
+    unique_verts.sort_by(|a, b| {
+        let pa = (a.1.x, a.1.y, a.1.z);
+        let pb = (b.1.x, b.1.y, b.1.z);
+        pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // Assign sequential DetIds (either from thread-local context or standalone).
+    let has_ctx = DET_CONTEXT.with(|ctx| ctx.borrow().is_some());
+    unique_verts
+        .iter()
+        .enumerate()
+        .map(|(i, (vid, _))| {
+            let det = if has_ctx {
+                DET_CONTEXT.with(|ctx| ctx.borrow().as_ref().unwrap().next_id())
+            } else {
+                DetId::from_raw(i as u64)
+            };
+            (*vid, det)
+        })
+        .collect()
+}
 
 /// Per-stage tolerance configuration for boolean operations.
 ///
@@ -25,6 +97,12 @@ pub struct BooleanTolerance {
     pub tau_weld: f64,
     /// Coplanar face detection threshold (normal parallelism + plane distance).
     pub tau_coplanar: f64,
+    /// IC-on-boundary filter tolerance (was inline `tol * 0.5`).
+    pub tau_boundary: f64,
+    /// Phase 1 midpoint clustering tolerance in `weld_coincident_edges` (was inline `tol * 5.0`).
+    pub tau_edge_cluster: f64,
+    /// Minimum parametric face area threshold in `divide_one_face` (was inline `tol * tol`).
+    pub tau_area: f64,
 }
 
 impl BooleanTolerance {
@@ -35,6 +113,9 @@ impl BooleanTolerance {
             tau_mesh: tol,
             tau_weld: tol,
             tau_coplanar: tol,
+            tau_boundary: tol,
+            tau_edge_cluster: tol,
+            tau_area: tol * tol,
         }
     }
 
@@ -55,6 +136,9 @@ impl BooleanTolerance {
             tau_mesh: tau_model,
             tau_weld: 0.4 * tau_model,
             tau_coplanar: tau_model,
+            tau_boundary: 0.5 * tau_model,
+            tau_edge_cluster: 5.0 * tau_model,
+            tau_area: tau_model * tau_model,
         }
     }
 }
@@ -208,9 +292,13 @@ pub(crate) fn irrational_ray_dirs() -> [Vector3; 4] {
 ///
 /// Uses scale-adaptive perturbation and irrational ray directions with majority
 /// voting to avoid false classifications from grid-aligned triangulation.
+///
+/// When a BVH is provided, uses R-tree acceleration to skip triangles whose
+/// bounding boxes don't intersect the ray. Falls back to linear scan otherwise.
 fn ray_cast_classify<C, S>(
     face: &Face<Point3, C, S>,
     poly_shell: &Shell<Point3, PolylineCurve<Point3>, Option<PolygonMesh>>,
+    bvh: Option<&rstar::RTree<bvh::BvhTriangle>>,
 ) -> Option<isize> {
     let verts: Vec<_> = face.boundaries()[0]
         .vertex_iter()
@@ -228,12 +316,21 @@ fn ray_cast_classify<C, S>(
 
     let dirs = irrational_ray_dirs();
 
+    // Choose ray-cast function: BVH-accelerated or linear fallback.
+    let cast_ray = |pt: Point3, d: Vector3| -> Option<isize> {
+        if let Some(bvh) = bvh {
+            bvh::try_ray_cast_bvh(pt, d, bvh)
+        } else {
+            try_ray_cast(pt, d, poly_shell)
+        }
+    };
+
     // Majority vote: cast all 4 irrational rays, take majority (need >=2 agreeing).
     let majority_vote = |pt: Point3| -> Option<isize> {
         let mut inside = 0u32;
         let mut outside = 0u32;
         for &d in &dirs {
-            if let Some(c) = try_ray_cast(pt, d, poly_shell) {
+            if let Some(c) = cast_ray(pt, d) {
                 // Use parity (odd/even) of the absolute crossing count, not the
                 // sign. The parity is always correct: odd crossings = inside,
                 // even crossings = outside.
@@ -295,7 +392,7 @@ fn ray_cast_classify<C, S>(
     // Last resort: accept any single non-None result from any direction.
     let centroid_perturbed = centroid + perturb;
     for &d in &dirs {
-        if let Some(c) = try_ray_cast(centroid_perturbed, d, poly_shell) {
+        if let Some(c) = cast_ray(centroid_perturbed, d) {
             return Some(if c.unsigned_abs() % 2 == 1 { 1 } else { 0 });
         }
     }
@@ -368,8 +465,10 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
     shell0: &Shell<Point3, C, S>,
     shell1: &Shell<Point3, C, S>,
     tols: &BooleanTolerance,
+    diag: Option<&mut BooleanDiagnostics>,
 ) -> std::result::Result<ClassifiedShellBuckets<Point3, C, S>, BooleanStageError> {
     nonpositive_tolerance!(tols.tau_model);
+    let _total_start = std::time::Instant::now();
     #[cfg(debug_assertions)]
     eprintln!(
         "[classify] input: shell0={} faces, shell1={} faces",
@@ -378,6 +477,9 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
     );
     let poly_shell0 = shell0.triangulation(tols.tau_mesh);
     let poly_shell1 = shell1.triangulation(tols.tau_mesh);
+    // Build BVH (R-tree) once per shell for O(log n) ray-cast acceleration.
+    let bvh0 = bvh::build_triangle_bvh(&poly_shell0);
+    let bvh1 = bvh::build_triangle_bvh(&poly_shell1);
     let altshell0: AltCurveShell<C, S> =
         shell0.mapped(|x| *x, |c| Alternative::FirstType(c.clone()), Clone::clone);
     let altshell1: AltCurveShell<C, S> =
@@ -395,8 +497,10 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
         &poly_shell1,
         tols.tau_model,
         Some(tols.tau_coplanar),
+        tols.tau_boundary,
     )
     .ok_or(BooleanStageError::LoopsStoreCreation)?;
+    let _loops_store_elapsed = _total_start.elapsed();
     #[cfg(debug_assertions)]
     {
         for (fi, loops) in loops_store1.iter().enumerate() {
@@ -437,6 +541,7 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
         &loops_store0,
         tols.tau_model,
         &coplanar_faces0,
+        tols.tau_area,
     )
     .ok_or(BooleanStageError::FaceDivision)?;
     cls0.integrate_by_component();
@@ -445,9 +550,11 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
         &loops_store1,
         tols.tau_model,
         &coplanar_faces1,
+        tols.tau_area,
     )
     .ok_or(BooleanStageError::FaceDivision)?;
     cls1.integrate_by_component();
+    let _divide_elapsed = _total_start.elapsed();
     // Reset overlapping coplanar fragments to Unknown for re-classification.
     cls0.reset_overlapping_coplanar(&coplanar_fids0, shell1, true, tols.tau_coplanar);
     cls1.reset_overlapping_coplanar(&coplanar_fids1, shell0, false, tols.tau_coplanar);
@@ -472,7 +579,7 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
                 }
                 return Some(());
             }
-            let count = ray_cast_classify(&face, &poly_shell1)?;
+            let count = ray_cast_classify(&face, &poly_shell1, Some(&bvh1))?;
             if count == 1 {
                 and0.push(face);
             } else {
@@ -508,7 +615,7 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
                 }
                 return Some(());
             }
-            let count = ray_cast_classify(&face, &poly_shell0)?;
+            let count = ray_cast_classify(&face, &poly_shell0, Some(&bvh0))?;
             if count == 1 {
                 and1.push(face);
             } else {
@@ -529,7 +636,8 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
         and0.len() + and1.len(),
         or0.len() + or1.len(),
     );
-    Ok(ClassifiedShellBuckets {
+    let _classify_elapsed = _total_start.elapsed();
+    let result = ClassifiedShellBuckets {
         and0: altshell_to_shell(&and0, tols.tau_model).ok_or(BooleanStageError::ShellAssembly(
             "altshell_to_shell(and0)".into(),
         ))?,
@@ -542,7 +650,30 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
         or1: altshell_to_shell(&or1, tols.tau_model).ok_or(BooleanStageError::ShellAssembly(
             "altshell_to_shell(or1)".into(),
         ))?,
-    })
+    };
+    let _altshell_elapsed = _total_start.elapsed();
+
+    // Populate diagnostics if requested.
+    if let Some(diag) = diag {
+        use super::diagnostics::*;
+        diag.tolerance = ToleranceReport {
+            tau_model: tols.tau_model,
+            tau_mesh: tols.tau_mesh,
+            tau_weld: tols.tau_weld,
+            tau_coplanar: tols.tau_coplanar,
+            tau_boundary: tols.tau_boundary,
+            tau_edge_cluster: tols.tau_edge_cluster,
+            tau_area: tols.tau_area,
+        };
+        diag.classification.faces_coplanar = coplanar_faces0.len() + coplanar_faces1.len();
+        diag.timing.loops_store = _loops_store_elapsed;
+        diag.timing.divide_faces = _divide_elapsed - _loops_store_elapsed;
+        diag.timing.classification = _classify_elapsed - _divide_elapsed;
+        diag.timing.altshell = _altshell_elapsed - _classify_elapsed;
+        diag.timing.total = _altshell_elapsed;
+    }
+
+    Ok(result)
 }
 
 fn process_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
@@ -555,7 +686,7 @@ fn process_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSu
         mut or0,
         mut and1,
         mut or1,
-    } = classify_one_pair_of_shells_result_with_tol(shell0, shell1, tols)?;
+    } = classify_one_pair_of_shells_result_with_tol(shell0, shell1, tols, None)?;
     and0.append(&mut and1);
     or0.append(&mut or1);
     Ok([and0, or0])
@@ -1017,6 +1148,7 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell: &mut Shell<Point3, C, S>,
     tol: f64,
     weld_tol: Option<f64>,
+    edge_cluster_tol: f64,
 ) {
     use rustc_hash::{FxHashMap, FxHashSet};
     type Vid = VertexID<Point3>;
@@ -1168,14 +1300,18 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // feature gets its own canonical edge, preventing within-face conflicts and
     // ensuring each edge pair is correctly shared between exactly 2 faces.
     //
-    // Uses BTreeMap for deterministic iteration order — FxHashMap iteration
-    // depends on pointer-based hash values which vary between runs, causing
-    // different canonical edge selections and downstream shell closure failures.
-    type VPairKey = (Vid, Vid);
+    // Uses BTreeMap<(DetId, DetId), _> for deterministic iteration order.
+    // DetIds are assigned to vertices by spatial position ordering (see
+    // assign_vertex_det_ids), so the BTreeMap key order is the same across
+    // runs regardless of pointer addresses.
+
+    // Assign deterministic IDs to post-Phase-0 vertices for ordering.
+    let vid_to_det = assign_vertex_det_ids(shell);
+    type DetPairKey = (DetId, DetId);
 
     // Collect edges grouped by vertex pair, with curve midpoints
     type EdgeMid<C2> = (Edge<Point3, C2>, Point3);
-    let mut pair_groups: std::collections::BTreeMap<VPairKey, Vec<EdgeMid<C>>> =
+    let mut pair_groups: std::collections::BTreeMap<DetPairKey, Vec<EdgeMid<C>>> =
         std::collections::BTreeMap::new();
 
     for face in shell.iter() {
@@ -1185,23 +1321,32 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                 let fid = abs.front().id();
                 let bid = abs.back().id();
 
+                // Map pointer-derived IDs to deterministic IDs.
+                // The vid_to_det map covers all vertices in the shell, so
+                // the fallback should never trigger (but avoids a panic).
+                let det_fid = vid_to_det
+                    .get(&fid)
+                    .copied()
+                    .unwrap_or(DetId::from_raw(u64::MAX));
+                let det_bid = vid_to_det
+                    .get(&bid)
+                    .copied()
+                    .unwrap_or(DetId::from_raw(u64::MAX - 1));
+
                 // Compute curve midpoint for geometric matching
                 let curve = abs.curve();
                 let (t0, t1) = curve.range_tuple();
                 let midpoint = curve.subs((t0 + t1) * 0.5);
 
-                // Normalize key: smaller ID first for deterministic ordering
-                let key = if pair_groups.contains_key(&(fid, bid)) {
-                    (fid, bid)
-                } else if pair_groups.contains_key(&(bid, fid)) {
-                    (bid, fid)
+                // Normalize key: smaller DetId first for deterministic ordering
+                let key = if pair_groups.contains_key(&(det_fid, det_bid)) {
+                    (det_fid, det_bid)
+                } else if pair_groups.contains_key(&(det_bid, det_fid)) {
+                    (det_bid, det_fid)
+                } else if det_fid <= det_bid {
+                    (det_fid, det_bid)
                 } else {
-                    // Use deterministic ordering: smaller ID first
-                    if fid <= bid {
-                        (fid, bid)
-                    } else {
-                        (bid, fid)
-                    }
+                    (det_bid, det_fid)
                 };
 
                 pair_groups.entry(key).or_default().push((abs, midpoint));
@@ -1209,8 +1354,9 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         }
     }
 
-    // For each vertex pair, cluster by midpoint proximity and assign canonicals
-    let mid_tol = tol * 5.0;
+    // For each vertex pair, cluster by midpoint proximity and assign canonicals.
+    // Uses `edge_cluster_tol` (typically `BooleanTolerance::tau_edge_cluster`, i.e. 5.0 * tau_model).
+    let mid_tol = edge_cluster_tol;
     let mut edge_to_canonical: std::collections::BTreeMap<EdgeID<C>, Edge<Point3, C>> =
         std::collections::BTreeMap::new();
 
@@ -2347,7 +2493,7 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
     use truck_topology::shell::ShellCondition;
 
-    weld_coincident_edges(shell, tols.tau_model, None);
+    weld_coincident_edges(shell, tols.tau_model, None, tols.tau_edge_cluster);
 
     #[cfg(debug_assertions)]
     {
@@ -2368,7 +2514,7 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // If the shell isn't closed, try wider weld tolerances to close gaps.
     let wider_tols = [tols.tau_model * 2.0, tols.tau_model * 5.0];
     for (_i, &wider) in wider_tols.iter().enumerate() {
-        weld_coincident_edges(shell, tols.tau_model, Some(wider));
+        weld_coincident_edges(shell, tols.tau_model, Some(wider), tols.tau_edge_cluster);
 
         #[cfg(debug_assertions)]
         {
@@ -2442,13 +2588,18 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // original unsplit edge. Split these original edges at interior vertices
     // from the shell, then re-weld to canonicalize the fragments.
     if split_open_edges_at_interior_vertices(shell, tols.tau_model) {
-        weld_coincident_edges(shell, tols.tau_model, None);
+        weld_coincident_edges(shell, tols.tau_model, None, tols.tau_edge_cluster);
         let boundaries = shell.connected_components();
         if let Ok(solid) = Solid::try_new(boundaries) {
             return Ok(solid);
         }
         // Try wider tolerance
-        weld_coincident_edges(shell, tols.tau_model, Some(tols.tau_model * 5.0));
+        weld_coincident_edges(
+            shell,
+            tols.tau_model,
+            Some(tols.tau_model * 5.0),
+            tols.tau_edge_cluster,
+        );
         let boundaries = shell.connected_components();
         if let Ok(solid) = Solid::try_new(boundaries) {
             return Ok(solid);
@@ -2493,25 +2644,30 @@ pub fn and_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 }
 
 /// AND operation with per-stage tolerance control.
+///
+/// Wraps the entire operation in a deterministic ID context so that
+/// internal `BTreeMap` orderings are run-independent.
 pub fn and_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid0: &Solid<Point3, C, S>,
     solid1: &Solid<Point3, C, S>,
     tols: &BooleanTolerance,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
-    let mut iter0 = solid0.boundaries().iter();
-    let mut iter1 = solid1.boundaries().iter();
-    let shell0 = iter0.next().unwrap();
-    let shell1 = iter1.next().unwrap();
-    let [mut and_shell, _] = process_one_pair_of_shells_result_with_tol(shell0, shell1, tols)?;
-    for shell in iter0 {
-        let [res, _] = process_one_pair_of_shells_result_with_tol(&and_shell, shell, tols)?;
-        and_shell = res;
-    }
-    for shell in iter1 {
-        let [res, _] = process_one_pair_of_shells_result_with_tol(&and_shell, shell, tols)?;
-        and_shell = res;
-    }
-    finalize_boolean_shell(&mut and_shell, tols)
+    with_det_context(|| {
+        let mut iter0 = solid0.boundaries().iter();
+        let mut iter1 = solid1.boundaries().iter();
+        let shell0 = iter0.next().unwrap();
+        let shell1 = iter1.next().unwrap();
+        let [mut and_shell, _] = process_one_pair_of_shells_result_with_tol(shell0, shell1, tols)?;
+        for shell in iter0 {
+            let [res, _] = process_one_pair_of_shells_result_with_tol(&and_shell, shell, tols)?;
+            and_shell = res;
+        }
+        for shell in iter1 {
+            let [res, _] = process_one_pair_of_shells_result_with_tol(&and_shell, shell, tols)?;
+            and_shell = res;
+        }
+        finalize_boolean_shell(&mut and_shell, tols)
+    })
 }
 
 /// AND operation between two solids.
@@ -2542,25 +2698,29 @@ pub fn or_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 }
 
 /// OR operation with per-stage tolerance control.
+///
+/// Wraps the entire operation in a deterministic ID context.
 pub fn or_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid0: &Solid<Point3, C, S>,
     solid1: &Solid<Point3, C, S>,
     tols: &BooleanTolerance,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
-    let mut iter0 = solid0.boundaries().iter();
-    let mut iter1 = solid1.boundaries().iter();
-    let shell0 = iter0.next().unwrap();
-    let shell1 = iter1.next().unwrap();
-    let [_, mut or_shell] = process_one_pair_of_shells_result_with_tol(shell0, shell1, tols)?;
-    for shell in iter0 {
-        let [_, res] = process_one_pair_of_shells_result_with_tol(&or_shell, shell, tols)?;
-        or_shell = res;
-    }
-    for shell in iter1 {
-        let [_, res] = process_one_pair_of_shells_result_with_tol(&or_shell, shell, tols)?;
-        or_shell = res;
-    }
-    finalize_boolean_shell(&mut or_shell, tols)
+    with_det_context(|| {
+        let mut iter0 = solid0.boundaries().iter();
+        let mut iter1 = solid1.boundaries().iter();
+        let shell0 = iter0.next().unwrap();
+        let shell1 = iter1.next().unwrap();
+        let [_, mut or_shell] = process_one_pair_of_shells_result_with_tol(shell0, shell1, tols)?;
+        for shell in iter0 {
+            let [_, res] = process_one_pair_of_shells_result_with_tol(&or_shell, shell, tols)?;
+            or_shell = res;
+        }
+        for shell in iter1 {
+            let [_, res] = process_one_pair_of_shells_result_with_tol(&or_shell, shell, tols)?;
+            or_shell = res;
+        }
+        finalize_boolean_shell(&mut or_shell, tols)
+    })
 }
 
 /// OR operation between two solids.
@@ -2593,6 +2753,8 @@ pub fn difference_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 
 /// Difference operation with per-stage tolerance control.
 ///
+/// Wraps the entire operation in a deterministic ID context.
+///
 /// For multi-shell solid0 (A), each shell is processed independently against
 /// solid1 (B): `(A0 ∪ A1) \ B = (A0 \ B) ∪ (A1 \ B)`. This prevents
 /// disjoint shells from being lost when they don't intersect each other.
@@ -2601,37 +2763,39 @@ pub fn difference_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid1: &Solid<Point3, C, S>,
     tols: &BooleanTolerance,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
-    let shells0 = solid0.boundaries();
-    let shells1 = solid1.boundaries();
-    let mut all_diff_faces: Vec<Face<Point3, C, S>> = Vec::new();
+    with_det_context(|| {
+        let shells0 = solid0.boundaries();
+        let shells1 = solid1.boundaries();
+        let mut all_diff_faces: Vec<Face<Point3, C, S>> = Vec::new();
 
-    // Process each shell of solid0 independently against solid1.
-    // (A0 ∪ A1 ∪ ...) \ (B0 ∪ B1 ∪ ...) = ∪_i (Ai \ B0 \ B1 \ ...)
-    for shell0 in shells0.iter() {
-        let mut shell1_iter = shells1.iter();
-        let first_shell1 = shell1_iter.next().unwrap();
-        let ClassifiedShellBuckets { or0, and1, .. } =
-            classify_one_pair_of_shells_result_with_tol(shell0, first_shell1, tols)?;
-        // Difference = or0 (A faces outside B) + inverted and1 (B faces inside A, flipped)
-        let mut diff_faces: Vec<Face<Point3, C, S>> = or0.into_iter().collect();
-        for face in and1.into_iter() {
-            diff_faces.push(face.inverse());
-        }
-        // Iterative subtraction against additional B shells: (Ai \ B0) \ B1 \ ...
-        for additional_b in shell1_iter {
-            let diff_shell: Shell<Point3, C, S> = diff_faces.into_iter().collect();
-            let classified =
-                classify_one_pair_of_shells_result_with_tol(&diff_shell, additional_b, tols)?;
-            diff_faces = classified.or0.into_iter().collect();
-            for face in classified.and1.into_iter() {
+        for shell0 in shells0.iter() {
+            let mut shell1_iter = shells1.iter();
+            let first_shell1 = shell1_iter.next().unwrap();
+            let ClassifiedShellBuckets { or0, and1, .. } =
+                classify_one_pair_of_shells_result_with_tol(shell0, first_shell1, tols, None)?;
+            let mut diff_faces: Vec<Face<Point3, C, S>> = or0.into_iter().collect();
+            for face in and1.into_iter() {
                 diff_faces.push(face.inverse());
             }
+            for additional_b in shell1_iter {
+                let diff_shell: Shell<Point3, C, S> = diff_faces.into_iter().collect();
+                let classified = classify_one_pair_of_shells_result_with_tol(
+                    &diff_shell,
+                    additional_b,
+                    tols,
+                    None,
+                )?;
+                diff_faces = classified.or0.into_iter().collect();
+                for face in classified.and1.into_iter() {
+                    diff_faces.push(face.inverse());
+                }
+            }
+            all_diff_faces.extend(diff_faces);
         }
-        all_diff_faces.extend(diff_faces);
-    }
 
-    let mut diff_shell: Shell<Point3, C, S> = all_diff_faces.into_iter().collect();
-    finalize_boolean_shell(&mut diff_shell, tols)
+        let mut diff_shell: Shell<Point3, C, S> = all_diff_faces.into_iter().collect();
+        finalize_boolean_shell(&mut diff_shell, tols)
+    })
 }
 
 /// Difference operation: A \ B.

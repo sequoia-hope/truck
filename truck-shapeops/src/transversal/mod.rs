@@ -1,7 +1,9 @@
+pub(crate) mod bvh;
 pub(crate) mod coplanar;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod coplanar_overlay;
 mod coplanar_splitting;
+pub mod diagnostics;
 mod divide_face;
 mod faces_classification;
 mod integrate;
@@ -9,6 +11,7 @@ mod intersection_curve;
 mod loops_store;
 mod polyline_construction;
 pub(crate) mod robust_classify;
+pub use diagnostics::BooleanDiagnostics;
 pub use integrate::{
     and, and_result, and_result_with_tol, and_with_tol, difference, difference_result,
     difference_result_with_tol, difference_with_tol, heal_shell_vertices, or, or_result,

@@ -136,6 +136,7 @@ fn independent_intersection() {
         &poly_shell1,
         TOL,
         None,
+        TOL * 0.5,
     )
     .unwrap();
 
@@ -377,6 +378,7 @@ fn rotated_intersection() {
         &poly_shell1,
         TOL,
         None,
+        TOL * 0.5,
     )
     .unwrap();
 
@@ -634,6 +636,7 @@ fn crossing_edges() {
         &poly_shell1,
         TOL,
         None,
+        TOL * 0.5,
     )
     .unwrap();
 

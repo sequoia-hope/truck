@@ -112,13 +112,22 @@ fn independent_intersection() {
         geom_loops_store0: loops_store0,
         geom_loops_store1: loops_store1,
         ..
-    } = loops_store::create_loops_stores(&shell0, &poly_shell0, &shell1, &poly_shell1, TOL, None)
-        .unwrap();
+    } = loops_store::create_loops_stores(
+        &shell0,
+        &poly_shell0,
+        &shell1,
+        &poly_shell1,
+        TOL,
+        None,
+        TOL * 0.5,
+    )
+    .unwrap();
     let (mut cls0, _) = divide_face::divide_faces_with_coplanar(
         &shell0,
         &loops_store0,
         TOL,
         &rustc_hash::FxHashSet::default(),
+        TOL * TOL,
     )
     .unwrap();
     cls0.integrate_by_component();
@@ -127,6 +136,7 @@ fn independent_intersection() {
         &loops_store1,
         TOL,
         &rustc_hash::FxHashSet::default(),
+        TOL * TOL,
     )
     .unwrap();
     cls1.integrate_by_component();

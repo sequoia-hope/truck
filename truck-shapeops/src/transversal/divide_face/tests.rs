@@ -60,7 +60,7 @@ fn divide_plane_test() {
     ]
     .into_iter()
     .collect();
-    let res = divide_one_face(&face, &loops, 0.01).unwrap();
+    let res = divide_one_face(&face, &loops, 0.01, 0.01 * 0.01).unwrap();
     assert_eq!(res.len(), 2);
     let (mut or, mut and) = (true, true);
     for (face, status) in res {
@@ -198,12 +198,22 @@ fn independent_intersection() {
         geom_loops_store0: loops_store0,
         geom_loops_store1: loops_store1,
         ..
-    } = create_loops_stores(&shell0, &poly_shell0, &shell1, &poly_shell1, TOL, None).unwrap();
+    } = create_loops_stores(
+        &shell0,
+        &poly_shell0,
+        &shell1,
+        &poly_shell1,
+        TOL,
+        None,
+        TOL * 0.5,
+    )
+    .unwrap();
     let [and0, or0, unknown0] = divide_faces_with_coplanar(
         &shell0,
         &loops_store0,
         TOL,
         &rustc_hash::FxHashSet::default(),
+        TOL * TOL,
     )
     .unwrap()
     .0
@@ -213,6 +223,7 @@ fn independent_intersection() {
         &loops_store1,
         TOL,
         &rustc_hash::FxHashSet::default(),
+        TOL * TOL,
     )
     .unwrap()
     .0

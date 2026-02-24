@@ -1,6 +1,8 @@
 #![allow(clippy::many_single_char_names)]
 
 use super::*;
+// Order-insensitive: HashMap is used for face-indexed lookups and local caches.
+// Loop construction iterates over shells (Vec) in index order, not HashMaps.
 use rustc_hash::FxHashMap as HashMap;
 use truck_base::cgmath64::*;
 use truck_geometry::prelude::*;
@@ -442,12 +444,15 @@ where
 /// Check if a point is within tolerance of any boundary edge of a face.
 /// Used to filter degenerate intersection curves that lie along shared boundaries.
 ///
-/// Uses a tight boundary tolerance (tol * 0.5) to avoid filtering real ICs
-/// that are near boundaries due to perturbation offsets. Coplanar shared-
-/// boundary ICs have midpoints at ~0 distance from the boundary, while
-/// perturbation-offset ICs have midpoints at ~tol distance.
-fn is_midpoint_on_face_boundary<C, S>(mid: Point3, face: &Face<Point3, C, S>, tol: f64) -> bool {
-    let boundary_tol = tol * 0.5;
+/// Uses `boundary_tol` (typically `BooleanTolerance::tau_boundary`, i.e. 0.5 * tau_model)
+/// to avoid filtering real ICs that are near boundaries due to perturbation offsets.
+/// Coplanar shared-boundary ICs have midpoints at ~0 distance from the boundary,
+/// while perturbation-offset ICs have midpoints at ~tol distance.
+fn is_midpoint_on_face_boundary<C, S>(
+    mid: Point3,
+    face: &Face<Point3, C, S>,
+    boundary_tol: f64,
+) -> bool {
     for wire in face.absolute_boundaries().iter() {
         for edge in wire.iter() {
             let p = edge.front().point();
@@ -671,6 +676,7 @@ pub fn create_loops_stores<C, S>(
     poly_shell1: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
     tol: f64,
     coplanar_tol: Option<f64>,
+    boundary_tol: f64,
 ) -> Option<LoopsStoreQuadruple<C>>
 where
     C: SearchNearestParameter<D1, Point = Point3>
@@ -885,10 +891,16 @@ where
                         // vertex insertion. Coplanar-adjacent intersection curves may
                         // lie along shared boundary edges, corrupting loop stores.
                         let mid = polyline.front().midpoint(polyline.back());
-                        let on_boundary0 =
-                            is_midpoint_on_face_boundary(mid, &geom_shell0[face_index0], tol);
-                        let on_boundary1 =
-                            is_midpoint_on_face_boundary(mid, &geom_shell1[face_index1], tol);
+                        let on_boundary0 = is_midpoint_on_face_boundary(
+                            mid,
+                            &geom_shell0[face_index0],
+                            boundary_tol,
+                        );
+                        let on_boundary1 = is_midpoint_on_face_boundary(
+                            mid,
+                            &geom_shell1[face_index1],
+                            boundary_tol,
+                        );
                         if on_boundary0 && on_boundary1 {
                             return Some(());
                         }

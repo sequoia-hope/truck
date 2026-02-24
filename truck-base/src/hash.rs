@@ -331,19 +331,35 @@ impl<S: Float + FromPrimitive> HashGen<S> for [S; 4] {
 }
 
 impl<S: Float + FromPrimitive> HashGen<S> for [S; 1] {
-    fn hash1(gen: Self) -> S { S::hash1(gen[0]) }
-    fn hash2(gen: Self) -> [S; 2] { S::hash2(gen[0]) }
-    fn hash3(gen: Self) -> [S; 3] { S::hash3(gen[0]) }
-    fn hash4(gen: Self) -> [S; 4] { S::hash4(gen[0]) }
+    fn hash1(gen: Self) -> S {
+        S::hash1(gen[0])
+    }
+    fn hash2(gen: Self) -> [S; 2] {
+        S::hash2(gen[0])
+    }
+    fn hash3(gen: Self) -> [S; 3] {
+        S::hash3(gen[0])
+    }
+    fn hash4(gen: Self) -> [S; 4] {
+        S::hash4(gen[0])
+    }
 }
 
 macro_rules! derive_hashgen {
     ($from: ty, $into: ty) => {
         impl<S: Float + FromPrimitive> HashGen<S> for $from {
-            fn hash1(gen: Self) -> S { <$into>::hash1(gen.into()) }
-            fn hash2(gen: Self) -> [S; 2] { <$into>::hash2(gen.into()) }
-            fn hash3(gen: Self) -> [S; 3] { <$into>::hash3(gen.into()) }
-            fn hash4(gen: Self) -> [S; 4] { <$into>::hash4(gen.into()) }
+            fn hash1(gen: Self) -> S {
+                <$into>::hash1(gen.into())
+            }
+            fn hash2(gen: Self) -> [S; 2] {
+                <$into>::hash2(gen.into())
+            }
+            fn hash3(gen: Self) -> [S; 3] {
+                <$into>::hash3(gen.into())
+            }
+            fn hash4(gen: Self) -> [S; 4] {
+                <$into>::hash4(gen.into())
+            }
         }
     };
 }

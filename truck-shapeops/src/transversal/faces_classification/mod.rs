@@ -1,6 +1,8 @@
 use super::coplanar;
 use super::integrate::ShapeOpsSurface;
 use super::loops_store::ShapesOpStatus;
+// Order-insensitive: FxHashMap<FaceID, Status> is used as a lookup table only.
+// Iteration over faces uses self.shell (a Vec, deterministic order), not the map.
 use rustc_hash::FxHashMap as HashMap;
 use truck_base::cgmath64::*;
 use truck_topology::*;

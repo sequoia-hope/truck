@@ -114,7 +114,9 @@ fn contour_centroid(contour: &[[f64; 2]]) -> [f64; 2] {
         return [0.0, 0.0];
     }
     let n = contour.len() as f64;
-    let (sx, sy) = contour.iter().fold((0.0, 0.0), |(sx, sy), p| (sx + p[0], sy + p[1]));
+    let (sx, sy) = contour
+        .iter()
+        .fold((0.0, 0.0), |(sx, sy), p| (sx + p[0], sy + p[1]));
     [sx / n, sy / n]
 }
 
@@ -197,9 +199,12 @@ pub fn compute_coplanar_overlay<C, S: ShapeOpsSurface>(
         shape1.overlay(&shape0, OverlayRule::Difference, FillRule::EvenOdd);
 
     // Check if there's any actual overlap
-    let has_overlap = intersection_shapes
-        .iter()
-        .any(|shape| shape.first().map(|c| signed_area_2d(c).abs() > min_area).unwrap_or(false));
+    let has_overlap = intersection_shapes.iter().any(|shape| {
+        shape
+            .first()
+            .map(|c| signed_area_2d(c).abs() > min_area)
+            .unwrap_or(false)
+    });
 
     if !has_overlap {
         // No overlap — faces are coplanar but disjoint
@@ -334,8 +339,7 @@ pub fn inject_overlay_fragments<C>(
 
         // Inject as independent loop (adds both the wire and its inverse)
         if face_idx < loops_store.len() {
-            loops_store[face_idx]
-                .add_independent_loop(BoundaryWire::new(wire, fragment.status));
+            loops_store[face_idx].add_independent_loop(BoundaryWire::new(wire, fragment.status));
         }
 
         // Also inject holes as independent loops (inverted status)
@@ -391,8 +395,16 @@ mod tests {
         // CCW square should have positive area
         let sq = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
         let area = signed_area_2d(&sq);
-        assert!(area > 0.0, "CCW square area should be positive, got {}", area);
-        assert!((area - 1.0).abs() < 1e-10, "Area should be 1.0, got {}", area);
+        assert!(
+            area > 0.0,
+            "CCW square area should be positive, got {}",
+            area
+        );
+        assert!(
+            (area - 1.0).abs() < 1e-10,
+            "Area should be 1.0, got {}",
+            area
+        );
     }
 
     #[test]
@@ -400,7 +412,11 @@ mod tests {
         // CW square should have negative area
         let sq = vec![[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
         let area = signed_area_2d(&sq);
-        assert!(area < 0.0, "CW square area should be negative, got {}", area);
+        assert!(
+            area < 0.0,
+            "CW square area should be negative, got {}",
+            area
+        );
     }
 
     #[test]
@@ -516,7 +532,11 @@ mod tests {
         // Union of abutting squares should be one rectangle
         let union: Vec<Vec<Vec<[f64; 2]>>> =
             shape0.overlay(&shape1, OverlayRule::Union, FillRule::EvenOdd);
-        assert_eq!(union.len(), 1, "Union of abutting squares should be 1 shape");
+        assert_eq!(
+            union.len(),
+            1,
+            "Union of abutting squares should be 1 shape"
+        );
         let union_area = signed_area_2d(&union[0][0]).abs();
         assert!(
             (union_area - 2.0).abs() < 0.1,

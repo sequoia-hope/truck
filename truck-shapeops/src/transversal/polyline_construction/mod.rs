@@ -1,3 +1,6 @@
+// Order-sensitive: graph walk starts at FxHashMap entry (arbitrary order),
+// but polyline direction is canonicalized post-construction (Sprint 26) so
+// final output is deterministic regardless of graph traversal order.
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
 use truck_base::{cgmath64::*, tolerance::*};
