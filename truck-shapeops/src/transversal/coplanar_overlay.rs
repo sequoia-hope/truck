@@ -17,9 +17,12 @@ use i_overlay::float::single::SingleFloatOverlay;
 use truck_base::cgmath64::*;
 use truck_topology::*;
 
-use super::coplanar::{make_tangent_basis, point_in_polygon, project_to_2d};
+#[allow(unused_imports)]
+use super::coplanar::point_in_polygon;
+use super::coplanar::{make_tangent_basis, project_to_2d};
 use super::coplanar_splitting::face_boundary_info;
 use super::integrate::ShapeOpsSurface;
+#[allow(unused_imports)]
 use super::loops_store::ShapesOpStatus;
 
 /// (outer_contour, hole_contours) from projecting a face to 2D
@@ -27,6 +30,7 @@ type FaceContours2D = (Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>);
 
 /// A 2D polygon fragment from overlay, classified with its relation to the other solid.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct OverlayFragment {
     /// Outer boundary contour in 2D (counterclockwise)
     pub outer: Vec<[f64; 2]>,
@@ -38,6 +42,7 @@ pub struct OverlayFragment {
 
 /// Result of a coplanar overlay between two face boundaries.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CoplanarOverlayResult {
     /// Fragments belonging to face0 (for injection into face0's loops)
     pub fragments0: Vec<OverlayFragment>,
@@ -49,6 +54,7 @@ pub struct CoplanarOverlayResult {
 
 /// The shared 2D coordinate system for a coplanar face pair.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CoplanarCoordSystem {
     pub origin: Point3,
     pub u_axis: Vector3,
@@ -58,6 +64,7 @@ pub struct CoplanarCoordSystem {
 
 impl CoplanarCoordSystem {
     /// Lift a 2D point back to 3D.
+    #[allow(dead_code)]
     pub fn to_3d(&self, pt: [f64; 2]) -> Point3 {
         self.origin + self.u_axis * pt[0] + self.v_axis * pt[1]
     }
@@ -109,6 +116,7 @@ fn build_overlay_shape(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Vec<Vec<[
 }
 
 /// Compute the centroid of a 2D polygon contour.
+#[allow(dead_code)]
 fn contour_centroid(contour: &[[f64; 2]]) -> [f64; 2] {
     if contour.is_empty() {
         return [0.0, 0.0];
@@ -144,6 +152,7 @@ fn signed_area_2d(contour: &[[f64; 2]]) -> f64 {
 ///
 /// The `same_sense` parameter indicates whether the face normals point in the
 /// same direction (true) or opposite directions (false/anti-sense).
+#[allow(dead_code)]
 pub fn compute_coplanar_overlay<C, S: ShapeOpsSurface>(
     face0: &Face<Point3, C, S>,
     face1: &Face<Point3, C, S>,
@@ -317,6 +326,7 @@ pub fn compute_coplanar_overlay<C, S: ShapeOpsSurface>(
 /// Each fragment contour becomes a closed wire in the loops_store with the
 /// appropriate ShapesOpStatus. The caller then uses divide_face to split
 /// the original face along these boundaries.
+#[allow(dead_code)]
 pub fn inject_overlay_fragments<C>(
     fragments: &[OverlayFragment],
     coord: &CoplanarCoordSystem,
@@ -327,6 +337,7 @@ pub fn inject_overlay_fragments<C>(
     C: Clone + From<truck_geometry::prelude::BSplineCurve<Point3>>,
 {
     use super::loops_store::BoundaryWire;
+    #[allow(unused_imports)]
     use truck_geometry::prelude::BSplineCurve;
 
     for fragment in fragments {
@@ -357,6 +368,7 @@ pub fn inject_overlay_fragments<C>(
 }
 
 /// Convert a 2D contour into a 3D closed wire using line edges.
+#[allow(dead_code)]
 fn contour_to_wire<C: From<truck_geometry::prelude::BSplineCurve<Point3>>>(
     contour: &[[f64; 2]],
     coord: &CoplanarCoordSystem,
@@ -385,6 +397,151 @@ fn contour_to_wire<C: From<truck_geometry::prelude::BSplineCurve<Point3>>>(
 
     edges.into_iter().collect()
 }
+
+/// Classify a face fragment that may be coplanar with faces in the other shell
+/// using 2D polygon overlay (iOverlay).
+///
+/// Unlike `classify_coplanar_fragment` which tests a single interior point,
+/// this projects the entire face boundary and all coplanar faces from the other
+/// shell into 2D, merges the other-shell faces via union, then computes the
+/// intersection area. This is robust to boundary-proximity issues that cause
+/// single-point classification to fail.
+///
+/// Returns `Some(action)` if the face is coplanar with faces in the other shell
+/// and the overlay produces a definitive classification. Returns `None` if:
+/// - The face is not coplanar with any other-shell face
+/// - The overlay cannot produce a result (degenerate geometry)
+pub(crate) fn classify_coplanar_via_overlay<C1, C2, S: ShapeOpsSurface>(
+    face: &Face<Point3, C1, S>,
+    other_shell: &Shell<Point3, C2, S>,
+    is_shell0: bool,
+    tol: f64,
+) -> Option<CoplanarAction> {
+    use super::coplanar::{check_coplanar, face_sample_info};
+
+    let info = face_sample_info(face)?;
+
+    // Collect all coplanar faces from the other shell, split by sense
+    let mut same_sense_faces: Vec<usize> = Vec::new();
+    let mut anti_sense_faces: Vec<usize> = Vec::new();
+
+    for (idx, other_face) in other_shell.iter().enumerate() {
+        let other_info = match face_sample_info(other_face) {
+            Some(i) => i,
+            None => continue,
+        };
+        match check_coplanar(&info, &other_info, tol) {
+            Some(true) => same_sense_faces.push(idx),
+            Some(false) => anti_sense_faces.push(idx),
+            None => continue,
+        }
+    }
+
+    if same_sense_faces.is_empty() && anti_sense_faces.is_empty() {
+        return None; // Not coplanar with anything — fall to ray-cast
+    }
+
+    // Build 2D coordinate system from the face's plane
+    let (u_axis, v_axis) = make_tangent_basis(info.normal);
+    let coord = CoplanarCoordSystem {
+        origin: info.point,
+        u_axis,
+        v_axis,
+        normal: info.normal,
+    };
+
+    // Project the unknown face to 2D
+    let (face_outer, face_holes) = face_to_2d_contours(face, &coord)?;
+    let face_area = signed_area_2d(&face_outer).abs();
+    let min_area = tol * tol;
+    if face_area < min_area {
+        return None;
+    }
+    let face_shape = build_overlay_shape(&face_outer, &face_holes);
+
+    // Check anti-sense faces first (Remove takes priority)
+    if !anti_sense_faces.is_empty() {
+        let merged = merge_other_faces(other_shell, &anti_sense_faces, &coord, min_area);
+        if let Some(merged_shape) = merged {
+            let intersection: Vec<Vec<Vec<[f64; 2]>>> =
+                face_shape.overlay(&merged_shape, OverlayRule::Intersect, FillRule::EvenOdd);
+            let int_area: f64 = intersection
+                .iter()
+                .flat_map(|s| s.first())
+                .map(|c| signed_area_2d(c).abs())
+                .sum();
+            if int_area > min_area {
+                return Some(CoplanarAction::Remove);
+            }
+        }
+    }
+
+    // Check same-sense faces
+    if !same_sense_faces.is_empty() {
+        let merged = merge_other_faces(other_shell, &same_sense_faces, &coord, min_area);
+        if let Some(merged_shape) = merged {
+            let intersection: Vec<Vec<Vec<[f64; 2]>>> =
+                face_shape.overlay(&merged_shape, OverlayRule::Intersect, FillRule::EvenOdd);
+            let int_area: f64 = intersection
+                .iter()
+                .flat_map(|s| s.first())
+                .map(|c| signed_area_2d(c).abs())
+                .sum();
+            if int_area > min_area {
+                // Face overlaps with same-sense coplanar faces in other shell → inside
+                return Some(if is_shell0 {
+                    CoplanarAction::And
+                } else {
+                    CoplanarAction::Or
+                });
+            }
+        }
+        // Same-sense coplanar but no overlap → outside the other solid
+        return Some(CoplanarAction::Or);
+    }
+
+    None
+}
+
+/// Merge multiple coplanar faces from a shell into a single 2D union polygon.
+///
+/// Projects each face to 2D, then unions them progressively using iOverlay.
+fn merge_other_faces<C, S: ShapeOpsSurface>(
+    shell: &Shell<Point3, C, S>,
+    face_indices: &[usize],
+    coord: &CoplanarCoordSystem,
+    min_area: f64,
+) -> Option<Vec<Vec<[f64; 2]>>> {
+    let shell_faces: Vec<_> = shell.iter().collect();
+    let mut merged: Option<Vec<Vec<[f64; 2]>>> = None;
+
+    for &idx in face_indices {
+        if idx >= shell_faces.len() {
+            continue;
+        }
+        let face = &shell_faces[idx];
+        let (outer, holes) = face_to_2d_contours(face, coord)?;
+        if signed_area_2d(&outer).abs() < min_area {
+            continue;
+        }
+        let shape = build_overlay_shape(&outer, &holes);
+
+        merged = Some(match merged {
+            None => shape,
+            Some(existing) => {
+                let union: Vec<Vec<Vec<[f64; 2]>>> =
+                    existing.overlay(&shape, OverlayRule::Union, FillRule::EvenOdd);
+                // Flatten: union returns Vec<shape> where each shape is Vec<contour>
+                // We merge them into a single shape list
+                union.into_iter().flatten().collect()
+            }
+        });
+    }
+
+    merged
+}
+
+use super::coplanar::CoplanarAction;
 
 #[cfg(test)]
 mod tests {
@@ -620,6 +777,156 @@ mod tests {
             (total_area - 5.0).abs() < 0.5,
             "Intersection with hole should be ~5, got {}",
             total_area
+        );
+    }
+
+    /// Test overlay classification logic: small square fully inside large square → And
+    #[test]
+    fn test_classify_overlay_contained_fragment() {
+        // Face: small 3x3 square at (1,1)-(4,4)
+        // Other shell face: large 10x10 square
+        // The face is fully inside → intersection area = face area → And
+        let face_outer = vec![[1.0, 1.0], [4.0, 1.0], [4.0, 4.0], [1.0, 4.0]];
+        let other_outer = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+
+        let face_shape = vec![face_outer.clone()];
+        let other_shape = vec![other_outer];
+
+        let intersection: Vec<Vec<Vec<[f64; 2]>>> =
+            face_shape.overlay(&other_shape, OverlayRule::Intersect, FillRule::EvenOdd);
+        let int_area: f64 = intersection
+            .iter()
+            .flat_map(|s| s.first())
+            .map(|c| signed_area_2d(c).abs())
+            .sum();
+
+        let face_area = signed_area_2d(&face_outer).abs();
+        let min_area = 0.05 * 0.05; // tol² for tol=0.05
+
+        // Intersection area should equal face area (face is fully contained)
+        assert!(
+            int_area > min_area,
+            "Contained fragment should have intersection area > min_area"
+        );
+        assert!(
+            (int_area - face_area).abs() < 0.1,
+            "Intersection should equal face area (~9), got {}",
+            int_area
+        );
+    }
+
+    /// Test overlay classification logic: disjoint same-plane squares → Or
+    #[test]
+    fn test_classify_overlay_disjoint_fragment() {
+        // Face: square at (0,0)-(1,1)
+        // Other: square at (5,5)-(6,6)
+        // No overlap → intersection area = 0 → Or (same-sense, no overlap)
+        let face_outer = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let other_outer = vec![[5.0, 5.0], [6.0, 5.0], [6.0, 6.0], [5.0, 6.0]];
+
+        let face_shape = vec![face_outer];
+        let other_shape = vec![other_outer];
+
+        let intersection: Vec<Vec<Vec<[f64; 2]>>> =
+            face_shape.overlay(&other_shape, OverlayRule::Intersect, FillRule::EvenOdd);
+        let int_area: f64 = intersection
+            .iter()
+            .flat_map(|s| s.first())
+            .map(|c| signed_area_2d(c).abs())
+            .sum();
+
+        let min_area = 0.05 * 0.05;
+        assert!(
+            int_area < min_area,
+            "Disjoint fragments should have near-zero intersection, got {}",
+            int_area
+        );
+    }
+
+    /// Test overlay classification: face vs merged multi-face union → And
+    #[test]
+    fn test_classify_overlay_multi_face_merge() {
+        // Face: 4x4 square at (1,0)-(5,4)
+        // Other shell has 3 faces: [0,3]x[0,2], [2,5]x[0,2], [0,5]x[2,4]
+        // Their union covers [0,5]x[0,4] (fully contains the face)
+        let face_outer = vec![[1.0, 0.0], [5.0, 0.0], [5.0, 4.0], [1.0, 4.0]];
+
+        let other0 = vec![[0.0, 0.0], [3.0, 0.0], [3.0, 2.0], [0.0, 2.0]];
+        let other1 = vec![[2.0, 0.0], [5.0, 0.0], [5.0, 2.0], [2.0, 2.0]];
+        let other2 = vec![[0.0, 2.0], [5.0, 2.0], [5.0, 4.0], [0.0, 4.0]];
+
+        // Merge the 3 other faces via progressive union
+        let shape_a = vec![other0];
+        let shape_b = vec![other1];
+        let union_ab: Vec<Vec<Vec<[f64; 2]>>> =
+            shape_a.overlay(&shape_b, OverlayRule::Union, FillRule::EvenOdd);
+        let merged_ab: Vec<Vec<[f64; 2]>> = union_ab.into_iter().flatten().collect();
+
+        let shape_c = vec![other2];
+        let union_abc: Vec<Vec<Vec<[f64; 2]>>> =
+            merged_ab.overlay(&shape_c, OverlayRule::Union, FillRule::EvenOdd);
+        let merged: Vec<Vec<[f64; 2]>> = union_abc.into_iter().flatten().collect();
+
+        // Verify merged area is 20 (5x4)
+        let merged_area: f64 = merged.iter().map(|c| signed_area_2d(c).abs()).sum();
+        assert!(
+            merged_area > 15.0,
+            "Merged area should be ~20, got {}",
+            merged_area
+        );
+
+        // Now compute intersection of face vs merged
+        let face_shape = vec![face_outer.clone()];
+        let intersection: Vec<Vec<Vec<[f64; 2]>>> =
+            face_shape.overlay(&merged, OverlayRule::Intersect, FillRule::EvenOdd);
+        let int_area: f64 = intersection
+            .iter()
+            .flat_map(|s| s.first())
+            .map(|c| signed_area_2d(c).abs())
+            .sum();
+
+        let face_area = signed_area_2d(&face_outer).abs();
+        let min_area = 0.05 * 0.05;
+        assert!(
+            int_area > min_area,
+            "Multi-face merged overlap should be > min_area"
+        );
+        assert!(
+            (int_area - face_area).abs() < 1.0,
+            "Intersection should be close to face area (~16), got {}",
+            int_area
+        );
+    }
+
+    /// Test overlay classification: partial overlap produces correct intersection area
+    #[test]
+    fn test_classify_overlay_partial_overlap() {
+        // Face: [0,4]x[0,4] (area 16)
+        // Other: [2,6]x[0,4] (area 16)
+        // Overlap: [2,4]x[0,4] (area 8)
+        let face_outer = vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]];
+        let other_outer = vec![[2.0, 0.0], [6.0, 0.0], [6.0, 4.0], [2.0, 4.0]];
+
+        let face_shape = vec![face_outer];
+        let other_shape = vec![other_outer];
+
+        let intersection: Vec<Vec<Vec<[f64; 2]>>> =
+            face_shape.overlay(&other_shape, OverlayRule::Intersect, FillRule::EvenOdd);
+        let int_area: f64 = intersection
+            .iter()
+            .flat_map(|s| s.first())
+            .map(|c| signed_area_2d(c).abs())
+            .sum();
+
+        let min_area = 0.05 * 0.05;
+        assert!(
+            int_area > min_area,
+            "Partial overlap should have intersection > min_area"
+        );
+        assert!(
+            (int_area - 8.0).abs() < 0.5,
+            "Partial overlap area should be ~8, got {}",
+            int_area
         );
     }
 }

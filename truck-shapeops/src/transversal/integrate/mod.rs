@@ -569,9 +569,18 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
     unknown0
         .into_iter()
         .try_for_each(|face| {
-            if let Some(action) =
+            // Try overlay-based classification first (handles complex multi-fragment coplanar topology)
+            let coplanar_action = coplanar_overlay::classify_coplanar_via_overlay(
+                &face,
+                shell1,
+                true,
+                tols.tau_coplanar,
+            )
+            .or_else(|| {
+                // Fallback: single-point classification for edge cases overlay misses
                 coplanar::classify_coplanar_fragment(&face, shell1, true, tols.tau_coplanar)
-            {
+            });
+            if let Some(action) = coplanar_action {
                 match action {
                     coplanar::CoplanarAction::Remove => {}
                     coplanar::CoplanarAction::And => and0.push(face),
@@ -605,9 +614,18 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
     unknown1
         .into_iter()
         .try_for_each(|face| {
-            if let Some(action) =
+            // Try overlay-based classification first (handles complex multi-fragment coplanar topology)
+            let coplanar_action = coplanar_overlay::classify_coplanar_via_overlay(
+                &face,
+                shell0,
+                false,
+                tols.tau_coplanar,
+            )
+            .or_else(|| {
+                // Fallback: single-point classification for edge cases overlay misses
                 coplanar::classify_coplanar_fragment(&face, shell0, false, tols.tau_coplanar)
-            {
+            });
+            if let Some(action) = coplanar_action {
                 match action {
                     coplanar::CoplanarAction::Remove => {}
                     coplanar::CoplanarAction::And => and1.push(face),

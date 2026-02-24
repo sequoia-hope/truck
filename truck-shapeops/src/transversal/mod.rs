@@ -1,6 +1,5 @@
 pub(crate) mod bvh;
 pub(crate) mod coplanar;
-#[allow(dead_code, unused_imports)]
 pub(crate) mod coplanar_overlay;
 mod coplanar_splitting;
 pub mod diagnostics;

@@ -1229,3 +1229,105 @@ fn wire_simplicity_after_union() {
         non_simple,
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Coplanar overlay classification integration tests
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Tests overlay-based coplanar classification: 10×10×10 box with 1 boss at
+/// z=10, then a cut whose base is coplanar with the z=10 face. The cut tool's
+/// z=10 base face must be classified via overlay (not single-point) to get
+/// correct And/Or buckets.
+#[test]
+fn boss_then_coplanar_cut() {
+    // Base: 10×10×10 box
+    let v = builder::vertex(Point3::origin());
+    let e = builder::tsweep(&v, Vector3::unit_x() * 10.0);
+    let f = builder::tsweep(&e, Vector3::unit_y() * 10.0);
+    let base: Solid = builder::tsweep(&f, Vector3::unit_z() * 10.0);
+
+    // Boss: 3×3×3 at (1,1,10) — creates a hole in the z=10 face
+    let v1 = builder::vertex(Point3::new(1.0, 1.0, 10.0));
+    let e1 = builder::tsweep(&v1, Vector3::unit_x() * 3.0);
+    let f1 = builder::tsweep(&e1, Vector3::unit_y() * 3.0);
+    let boss: Solid = builder::tsweep(&f1, Vector3::unit_z() * 3.0);
+
+    let with_boss = crate::or(&base, &boss, 0.05);
+    assert!(with_boss.is_some(), "Boss union should succeed");
+    let solid1 = with_boss.unwrap();
+
+    // Cut: 3×3 tool at (6,6) through the entire z-range
+    // Its z=10 base face is coplanar with the modified z=10 face (which has a hole)
+    let v2 = builder::vertex(Point3::new(6.0, 6.0, -2.0));
+    let e2 = builder::tsweep(&v2, Vector3::unit_x() * 3.0);
+    let f2 = builder::tsweep(&e2, Vector3::unit_y() * 3.0);
+    let mut tool: Solid = builder::tsweep(&f2, Vector3::unit_z() * 16.0);
+    tool.not();
+
+    let result = crate::and(&solid1, &tool, 0.05);
+    assert!(
+        result.is_some(),
+        "Cut on body with boss should succeed (overlay-based coplanar classification)"
+    );
+
+    let solid = result.unwrap();
+    let shell = &solid.boundaries()[0];
+    assert!(
+        shell.len() > 6,
+        "Cut result should have more than 6 faces (got {})",
+        shell.len()
+    );
+}
+
+/// Two non-adjacent bosses at z=10, then a cut through the coplanar region.
+/// Tests overlay classification with multiple coplanar face fragments from
+/// the other shell that need to be merged.
+#[test]
+fn two_bosses_then_coplanar_cut() {
+    // Base: 10×10×10 box
+    let v = builder::vertex(Point3::origin());
+    let e = builder::tsweep(&v, Vector3::unit_x() * 10.0);
+    let f = builder::tsweep(&e, Vector3::unit_y() * 10.0);
+    let base: Solid = builder::tsweep(&f, Vector3::unit_z() * 10.0);
+
+    // Boss 1: 2×2×2 at (0.5,0.5,10)
+    let v1 = builder::vertex(Point3::new(0.5, 0.5, 10.0));
+    let e1 = builder::tsweep(&v1, Vector3::unit_x() * 2.0);
+    let f1 = builder::tsweep(&e1, Vector3::unit_y() * 2.0);
+    let boss1: Solid = builder::tsweep(&f1, Vector3::unit_z() * 2.0);
+
+    let with_boss1 = crate::or(&base, &boss1, 0.05);
+    assert!(with_boss1.is_some(), "Boss 1 union should succeed");
+    let solid1 = with_boss1.unwrap();
+
+    // Boss 2: 2×2×2 at (7,7,10) — far from boss 1
+    let v2 = builder::vertex(Point3::new(7.0, 7.0, 10.0));
+    let e2 = builder::tsweep(&v2, Vector3::unit_x() * 2.0);
+    let f2 = builder::tsweep(&e2, Vector3::unit_y() * 2.0);
+    let boss2: Solid = builder::tsweep(&f2, Vector3::unit_z() * 2.0);
+
+    let with_boss2 = crate::or(&solid1, &boss2, 0.05);
+    assert!(with_boss2.is_some(), "Boss 2 union should succeed");
+    let solid2 = with_boss2.unwrap();
+
+    // Cut: 2×2 tool at (4,4) through the entire z-range
+    let v3 = builder::vertex(Point3::new(4.0, 4.0, -2.0));
+    let e3 = builder::tsweep(&v3, Vector3::unit_x() * 2.0);
+    let f3 = builder::tsweep(&e3, Vector3::unit_y() * 2.0);
+    let mut tool: Solid = builder::tsweep(&f3, Vector3::unit_z() * 16.0);
+    tool.not();
+
+    let result = crate::and(&solid2, &tool, 0.05);
+    assert!(
+        result.is_some(),
+        "Cut after 2 bosses should succeed (overlay-based coplanar classification)"
+    );
+
+    let solid = result.unwrap();
+    let shell = &solid.boundaries()[0];
+    assert!(
+        shell.len() > 6,
+        "Cut result should have more than 6 faces (got {})",
+        shell.len()
+    );
+}

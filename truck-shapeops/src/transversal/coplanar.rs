@@ -162,9 +162,9 @@ fn face_interior_point<C, S>(face: &Face<Point3, C, S>) -> Option<Point3> {
 }
 
 /// Sample information from a face: a boundary point and the effective normal.
-struct FaceSampleInfo {
-    point: Point3,
-    normal: Vector3,
+pub(crate) struct FaceSampleInfo {
+    pub(crate) point: Point3,
+    pub(crate) normal: Vector3,
 }
 
 /// Extract a sample point from the face boundary and compute the effective normal.
@@ -173,7 +173,9 @@ struct FaceSampleInfo {
 /// more robust than using only the first vertex, because some vertices (e.g. on
 /// non-XY faces) may land in degenerate positions where the surface
 /// parameterisation cannot converge.
-fn face_sample_info<C, S: ShapeOpsSurface>(face: &Face<Point3, C, S>) -> Option<FaceSampleInfo> {
+pub(crate) fn face_sample_info<C, S: ShapeOpsSurface>(
+    face: &Face<Point3, C, S>,
+) -> Option<FaceSampleInfo> {
     let boundaries = face.boundaries();
     let wire = boundaries.first()?;
     let surface = face.surface();
@@ -208,7 +210,11 @@ fn face_sample_info<C, S: ShapeOpsSurface>(face: &Face<Point3, C, S>) -> Option<
 /// The previous `|dot| <= 1.0 - tol` formula was mathematically incorrect for
 /// separated tolerances: with `tol = 0.25` (from 5× model), it would accept
 /// faces at up to ~75° as "parallel", producing false coplanar detections.
-fn check_coplanar(info0: &FaceSampleInfo, info1: &FaceSampleInfo, tol: f64) -> Option<bool> {
+pub(crate) fn check_coplanar(
+    info0: &FaceSampleInfo,
+    info1: &FaceSampleInfo,
+    tol: f64,
+) -> Option<bool> {
     let dot = info0.normal.dot(info1.normal);
     // Normals must be (anti-)parallel: angle between them < tol radians.
     // Using the small-angle approximation: 1 - cos(θ) ≈ θ²/2, so
