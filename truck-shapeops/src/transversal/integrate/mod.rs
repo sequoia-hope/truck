@@ -1148,7 +1148,6 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell: &mut Shell<Point3, C, S>,
     tol: f64,
     weld_tol: Option<f64>,
-    edge_cluster_tol: f64,
 ) {
     use rustc_hash::{FxHashMap, FxHashSet};
     type Vid = VertexID<Point3>;
@@ -1292,13 +1291,17 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         }
     }
 
-    // Phase 1: Build canonical edge map using curve midpoint clustering.
+    // Phase 1: Edge canonicalization via multi-point curve matching.
     //
-    // Two edges between the same vertex pair may represent different geometric
-    // features (e.g., outer boundary + hole of a T-junction face). By clustering
-    // edges with matching (vertex_pair, curve_midpoint), each distinct geometric
-    // feature gets its own canonical edge, preventing within-face conflicts and
-    // ensuring each edge pair is correctly shared between exactly 2 faces.
+    // Two edges with the same vertex pair are canonical partners if their
+    // curves agree at 3 sample points (t=0.25, 0.5, 0.75 within parameter
+    // range) within 3 * tau_model (accounts for independent BSpline
+    // approximation error). Edges from the same face are never merged
+    // (they represent distinct geometric features like inner vs outer boundary).
+    //
+    // This replaces the previous single-midpoint clustering approach that
+    // used tau_edge_cluster = 5.0 * tau_model, which was too loose for some
+    // configurations and could incorrectly merge distinct edges.
     //
     // Uses BTreeMap<(DetId, DetId), _> for deterministic iteration order.
     // DetIds are assigned to vertices by spatial position ordering (see
@@ -1309,12 +1312,18 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     let vid_to_det = assign_vertex_det_ids(shell);
     type DetPairKey = (DetId, DetId);
 
-    // Collect edges grouped by vertex pair, with curve midpoints
-    type EdgeMid<C2> = (Edge<Point3, C2>, Point3);
-    let mut pair_groups: std::collections::BTreeMap<DetPairKey, Vec<EdgeMid<C>>> =
-        std::collections::BTreeMap::new();
+    // Edge candidate: edge with face ownership and 3-point curve samples.
+    struct EdgeCandidate<C2> {
+        edge: Edge<Point3, C2>,
+        face_idx: usize,
+        samples: [[f64; 3]; 3],
+    }
 
-    for face in shell.iter() {
+    // Build edge candidate list with face ownership
+    let mut candidates: Vec<EdgeCandidate<C>> = Vec::new();
+    let mut candidate_det_pair: Vec<DetPairKey> = Vec::new();
+
+    for (face_idx, face) in shell.iter().enumerate() {
         for wire in face.absolute_boundaries().iter() {
             for edge in wire.iter() {
                 let abs = edge.absolute_clone();
@@ -1322,8 +1331,6 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                 let bid = abs.back().id();
 
                 // Map pointer-derived IDs to deterministic IDs.
-                // The vid_to_det map covers all vertices in the shell, so
-                // the fallback should never trigger (but avoids a panic).
                 let det_fid = vid_to_det
                     .get(&fid)
                     .copied()
@@ -1333,71 +1340,96 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                     .copied()
                     .unwrap_or(DetId::from_raw(u64::MAX - 1));
 
-                // Compute curve midpoint for geometric matching
-                let curve = abs.curve();
-                let (t0, t1) = curve.range_tuple();
-                let midpoint = curve.subs((t0 + t1) * 0.5);
-
-                // Normalize key: smaller DetId first for deterministic ordering
-                let key = if pair_groups.contains_key(&(det_fid, det_bid)) {
-                    (det_fid, det_bid)
-                } else if pair_groups.contains_key(&(det_bid, det_fid)) {
-                    (det_bid, det_fid)
-                } else if det_fid <= det_bid {
+                let det_pair = if det_fid <= det_bid {
                     (det_fid, det_bid)
                 } else {
                     (det_bid, det_fid)
                 };
 
-                pair_groups.entry(key).or_default().push((abs, midpoint));
+                // Sample curve at 3 points within parameter range
+                let curve = abs.curve();
+                let (t0, t1) = curve.range_tuple();
+                let dt = t1 - t0;
+                let samples = [
+                    {
+                        let p = curve.subs(t0 + dt * 0.25);
+                        [p.x, p.y, p.z]
+                    },
+                    {
+                        let p = curve.subs(t0 + dt * 0.5);
+                        [p.x, p.y, p.z]
+                    },
+                    {
+                        let p = curve.subs(t0 + dt * 0.75);
+                        [p.x, p.y, p.z]
+                    },
+                ];
+
+                candidate_det_pair.push(det_pair);
+                candidates.push(EdgeCandidate {
+                    edge: abs,
+                    face_idx,
+                    samples,
+                });
             }
         }
     }
 
-    // For each vertex pair, cluster by midpoint proximity and assign canonicals.
-    // Uses `edge_cluster_tol` (typically `BooleanTolerance::tau_edge_cluster`, i.e. 5.0 * tau_model).
-    let mid_tol = edge_cluster_tol;
+    // Group candidate indices by vertex pair
+    let mut pair_groups: std::collections::BTreeMap<DetPairKey, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, pair) in candidate_det_pair.iter().enumerate() {
+        pair_groups.entry(*pair).or_default().push(i);
+    }
+
+    // Within each group, find canonical pairs via multi-point matching.
+    // Edges from DIFFERENT faces whose curves agree at 3 sample points
+    // within tau_model are canonical partners.
     let mut edge_to_canonical: std::collections::BTreeMap<EdgeID<C>, Edge<Point3, C>> =
         std::collections::BTreeMap::new();
 
-    for edges in pair_groups.values() {
-        if edges.len() <= 1 {
+    for indices in pair_groups.values() {
+        if indices.len() <= 1 {
             continue;
         }
 
-        // Cluster by midpoint proximity
-        let mut clusters: Vec<Vec<usize>> = Vec::new();
-        let mut assigned = vec![false; edges.len()];
-
-        for i in 0..edges.len() {
-            if assigned[i] {
+        let mut matched = vec![false; indices.len()];
+        for i in 0..indices.len() {
+            if matched[i] {
                 continue;
             }
-            assigned[i] = true;
-            let mut cluster = vec![i];
-            let ref_mid = edges[i].1;
+            let ci = &candidates[indices[i]];
 
-            for j in (i + 1)..edges.len() {
-                if assigned[j] {
+            for j in (i + 1)..indices.len() {
+                if matched[j] {
                     continue;
                 }
-                if (edges[j].1 - ref_mid).magnitude() < mid_tol {
-                    cluster.push(j);
-                    assigned[j] = true;
-                }
-            }
-            clusters.push(cluster);
-        }
+                let cj = &candidates[indices[j]];
 
-        // Assign canonical within each cluster
-        for cluster in clusters {
-            if cluster.len() <= 1 {
-                continue;
-            }
-            let canon = &edges[cluster[0]].0;
-            for &idx in &cluster {
-                if edges[idx].0.id() != canon.id() {
-                    edge_to_canonical.insert(edges[idx].0.id(), canon.clone());
+                // Skip edges from the same face — they represent distinct
+                // geometric features (e.g., inner vs outer boundary).
+                if ci.face_idx == cj.face_idx {
+                    continue;
+                }
+
+                // Check 3-point curve agreement within 3 * tau_model.
+                // Factor of 3 accounts for two independent BSpline
+                // approximations of the same intersection curve, each
+                // within tau_model of the true curve (worst case 2*tau_model
+                // apart, plus margin). Still much tighter than the old
+                // single-midpoint clustering at 5 * tau_model.
+                let match_tol = tol * 3.0;
+                let agree = (0..3).all(|k| {
+                    let dx = ci.samples[k][0] - cj.samples[k][0];
+                    let dy = ci.samples[k][1] - cj.samples[k][1];
+                    let dz = ci.samples[k][2] - cj.samples[k][2];
+                    (dx * dx + dy * dy + dz * dz).sqrt() < match_tol
+                });
+
+                if agree && ci.edge.id() != cj.edge.id() {
+                    // ci is canonical, cj maps to ci
+                    edge_to_canonical.insert(cj.edge.id(), ci.edge.clone());
+                    matched[j] = true;
                 }
             }
         }
@@ -1614,6 +1646,60 @@ pub fn diagnose_open_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                     midpoint,
                     face_count: count,
                 });
+            }
+        }
+    }
+    result
+}
+
+/// Euler characteristic validation for a shell: V - E + F = 2 (genus-0).
+///
+/// Returns `Ok(())` if the Euler formula holds, or `Err` with the
+/// computed values `(V, E, F, chi)` if it doesn't.
+/// This is a topological invariant for closed genus-0 surfaces (simple solids).
+/// For solids with through-holes (genus > 0), chi = 2 - 2g.
+pub fn validate_euler_characteristic<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell: &Shell<Point3, C, S>,
+) -> std::result::Result<(), (usize, usize, usize, i64)> {
+    use std::collections::BTreeSet;
+    type Vid = VertexID<Point3>;
+
+    let mut vertices: BTreeSet<Vid> = BTreeSet::new();
+    let mut edges: BTreeSet<EdgeID<C>> = BTreeSet::new();
+    let f = shell.len();
+
+    for face in shell.iter() {
+        for wire in face.absolute_boundaries().iter() {
+            for edge in wire.iter() {
+                edges.insert(edge.id());
+                vertices.insert(edge.front().id());
+                vertices.insert(edge.back().id());
+            }
+        }
+    }
+
+    let v = vertices.len();
+    let e = edges.len();
+    let chi = v as i64 - e as i64 + f as i64;
+
+    if chi == 2 {
+        Ok(())
+    } else {
+        Err((v, e, f, chi))
+    }
+}
+
+/// Check that all wires in a shell are simple (no repeated vertices).
+///
+/// Returns a list of `(face_index, wire_index)` for non-simple wires.
+pub fn find_non_simple_wires<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell: &Shell<Point3, C, S>,
+) -> Vec<(usize, usize)> {
+    let mut result = Vec::new();
+    for (fi, face) in shell.iter().enumerate() {
+        for (wi, wire) in face.absolute_boundaries().iter().enumerate() {
+            if !wire.is_simple() {
+                result.push((fi, wi));
             }
         }
     }
@@ -2493,7 +2579,7 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
     use truck_topology::shell::ShellCondition;
 
-    weld_coincident_edges(shell, tols.tau_model, None, tols.tau_edge_cluster);
+    weld_coincident_edges(shell, tols.tau_model, None);
 
     #[cfg(debug_assertions)]
     {
@@ -2514,7 +2600,7 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // If the shell isn't closed, try wider weld tolerances to close gaps.
     let wider_tols = [tols.tau_model * 2.0, tols.tau_model * 5.0];
     for (_i, &wider) in wider_tols.iter().enumerate() {
-        weld_coincident_edges(shell, tols.tau_model, Some(wider), tols.tau_edge_cluster);
+        weld_coincident_edges(shell, tols.tau_model, Some(wider));
 
         #[cfg(debug_assertions)]
         {
@@ -2588,18 +2674,13 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // original unsplit edge. Split these original edges at interior vertices
     // from the shell, then re-weld to canonicalize the fragments.
     if split_open_edges_at_interior_vertices(shell, tols.tau_model) {
-        weld_coincident_edges(shell, tols.tau_model, None, tols.tau_edge_cluster);
+        weld_coincident_edges(shell, tols.tau_model, None);
         let boundaries = shell.connected_components();
         if let Ok(solid) = Solid::try_new(boundaries) {
             return Ok(solid);
         }
         // Try wider tolerance
-        weld_coincident_edges(
-            shell,
-            tols.tau_model,
-            Some(tols.tau_model * 5.0),
-            tols.tau_edge_cluster,
-        );
+        weld_coincident_edges(shell, tols.tau_model, Some(tols.tau_model * 5.0));
         let boundaries = shell.connected_components();
         if let Ok(solid) = Solid::try_new(boundaries) {
             return Ok(solid);
@@ -2611,6 +2692,28 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
             eprintln!(
                 "[finalize] after split propagation + weld: {} open edges",
                 open.len(),
+            );
+        }
+    }
+
+    // Post-weld Euler validation (debug diagnostic)
+    #[cfg(debug_assertions)]
+    {
+        match validate_euler_characteristic(shell) {
+            Ok(()) => {}
+            Err((v, e, f, chi)) => {
+                eprintln!(
+                    "[finalize] Euler check: V={} E={} F={} chi={} (expected 2)",
+                    v, e, f, chi,
+                );
+            }
+        }
+        let non_simple = find_non_simple_wires(shell);
+        if !non_simple.is_empty() {
+            eprintln!(
+                "[finalize] {} non-simple wires: {:?}",
+                non_simple.len(),
+                non_simple,
             );
         }
     }

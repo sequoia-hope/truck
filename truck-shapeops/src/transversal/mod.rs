@@ -13,10 +13,11 @@ mod polyline_construction;
 pub(crate) mod robust_classify;
 pub use diagnostics::BooleanDiagnostics;
 pub use integrate::{
-    and, and_result, and_result_with_tol, and_with_tol, difference, difference_result,
-    difference_result_with_tol, difference_with_tol, heal_shell_vertices, or, or_result,
-    or_result_with_tol, or_with_tol, BooleanStageError, BooleanTolerance, ShapeOpsCurve,
-    ShapeOpsSurface,
+    and, and_result, and_result_with_tol, and_with_tol, diagnose_open_edges, difference,
+    difference_result, difference_result_with_tol, difference_with_tol, find_non_simple_wires,
+    heal_shell_vertices, or, or_result, or_result_with_tol, or_with_tol,
+    validate_euler_characteristic, BooleanStageError, BooleanTolerance, OpenEdgeInfo,
+    ShapeOpsCurve, ShapeOpsSurface,
 };
 
 use truck_geometry::prelude::*;

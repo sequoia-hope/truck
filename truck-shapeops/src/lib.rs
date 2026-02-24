@@ -17,10 +17,11 @@ mod healing;
 pub use healing::{RobustSplitClosedEdgesAndFaces, SplitClosedEdgesAndFaces};
 mod transversal;
 pub use transversal::{
-    and, and_result, and_result_with_tol, and_with_tol, difference, difference_result,
-    difference_result_with_tol, difference_with_tol, heal_shell_vertices, or, or_result,
-    or_result_with_tol, or_with_tol, BooleanDiagnostics, BooleanStageError, BooleanTolerance,
-    ShapeOpsCurve, ShapeOpsSurface,
+    and, and_result, and_result_with_tol, and_with_tol, diagnose_open_edges, difference,
+    difference_result, difference_result_with_tol, difference_with_tol, find_non_simple_wires,
+    heal_shell_vertices, or, or_result, or_result_with_tol, or_with_tol,
+    validate_euler_characteristic, BooleanDiagnostics, BooleanStageError, BooleanTolerance,
+    OpenEdgeInfo, ShapeOpsCurve, ShapeOpsSurface,
 };
 /// Diagnostic sub-types for boolean operations.
 pub mod diagnostics {

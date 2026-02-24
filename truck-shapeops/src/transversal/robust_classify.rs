@@ -78,7 +78,7 @@ fn sos_orient2d_tiebreak(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> i32 {
         swaps += 1;
     }
     let _ = idx; // suppress unused warning
-    if swaps % 2 == 0 {
+    if swaps.is_multiple_of(2) {
         1
     } else {
         -1
