@@ -276,8 +276,7 @@ fn biangle_wire_detection() {
     );
 
     // 3-edge triangle: not biangle (wrong length)
-    let triangle: Wire<_, _> =
-        vec![line(&v0, &v1), line(&v1, &v2), line(&v2, &v0)].into();
+    let triangle: Wire<_, _> = vec![line(&v0, &v1), line(&v1, &v2), line(&v2, &v0)].into();
     assert!(!is_biangle_wire(&triangle), "3-edge wire is not biangle");
 
     // Single edge: not biangle (wrong length)
@@ -323,7 +322,10 @@ fn divide_face_with_biangle_wire_produces_fragments() {
     // Biangle: same IC edge forward + backward (simulates add_edge None,None case)
     let ic_edge = line(&v[4], &v[5]);
     let biangle_wire: Wire<_, _> = vec![ic_edge.inverse(), ic_edge].into();
-    assert!(is_biangle_wire(&biangle_wire), "test setup: must be biangle");
+    assert!(
+        is_biangle_wire(&biangle_wire),
+        "test setup: must be biangle"
+    );
 
     let face = Face::new(
         vec![left_wire.clone()],
@@ -362,10 +364,10 @@ fn divide_face_with_biangle_wire_produces_fragments() {
 fn split_wire_recursive_figure_eight() {
     // Wire: v0→v1→v2→v0→v3→v4→v0 (v0 appears at positions 0 and 3)
     let v = Vertex::news([
-        Point3::new(0.0, 0.0, 0.0),  // v0: repeated vertex
-        Point3::new(2.0, 1.0, 0.0),  // v1
-        Point3::new(1.0, 2.0, 0.0),  // v2
-        Point3::new(-2.0, 1.0, 0.0), // v3
+        Point3::new(0.0, 0.0, 0.0),   // v0: repeated vertex
+        Point3::new(2.0, 1.0, 0.0),   // v1
+        Point3::new(1.0, 2.0, 0.0),   // v2
+        Point3::new(-2.0, 1.0, 0.0),  // v3
         Point3::new(-1.0, -2.0, 0.0), // v4
     ]);
     let wire: Wire<_, _> = vec![
@@ -378,16 +380,27 @@ fn split_wire_recursive_figure_eight() {
     ]
     .into();
     assert!(wire.is_closed(), "test setup: wire must be closed");
-    assert!(!wire.is_simple(), "test setup: wire must be non-simple (v0 repeated)");
+    assert!(
+        !wire.is_simple(),
+        "test setup: wire must be non-simple (v0 repeated)"
+    );
 
     let mut output = Vec::new();
     let success = super::super::split_wire_recursive(&wire, &mut output, 0);
     assert!(success, "split_wire_recursive should succeed on figure-8");
-    assert_eq!(output.len(), 2, "figure-8 should split into exactly 2 sub-wires");
+    assert_eq!(
+        output.len(),
+        2,
+        "figure-8 should split into exactly 2 sub-wires"
+    );
     for (i, w) in output.iter().enumerate() {
         assert!(w.is_simple(), "sub-wire {} must be simple", i);
         assert!(w.is_closed(), "sub-wire {} must be closed", i);
-        assert!(w.len() >= 3, "sub-wire {} must have ≥3 edges (not degenerate)", i);
+        assert!(
+            w.len() >= 3,
+            "sub-wire {} must have ≥3 edges (not degenerate)",
+            i
+        );
     }
 }
 
@@ -398,13 +411,13 @@ fn split_wire_recursive_triple_visit() {
     // Wire: v0→v1→v2→v0→v3→v4→v0→v5→v6→v0
     // v0 appears as front vertex at positions 0, 3, and 6
     let v = Vertex::news([
-        Point3::new(0.0, 0.0, 0.0),  // v0: visited 3 times
-        Point3::new(3.0, 0.0, 0.0),  // v1
-        Point3::new(2.0, 3.0, 0.0),  // v2
-        Point3::new(-3.0, 0.0, 0.0), // v3
-        Point3::new(-2.0, 3.0, 0.0), // v4
+        Point3::new(0.0, 0.0, 0.0),   // v0: visited 3 times
+        Point3::new(3.0, 0.0, 0.0),   // v1
+        Point3::new(2.0, 3.0, 0.0),   // v2
+        Point3::new(-3.0, 0.0, 0.0),  // v3
+        Point3::new(-2.0, 3.0, 0.0),  // v4
         Point3::new(-1.0, -3.0, 0.0), // v5
-        Point3::new(1.0, -3.0, 0.0), // v6
+        Point3::new(1.0, -3.0, 0.0),  // v6
     ]);
     let wire: Wire<_, _> = vec![
         line(&v[0], &v[1]),
@@ -432,11 +445,7 @@ fn split_wire_recursive_triple_visit() {
     for (i, w) in output.iter().enumerate() {
         assert!(w.is_simple(), "sub-wire {} must be simple", i);
         assert!(w.is_closed(), "sub-wire {} must be closed", i);
-        assert!(
-            !is_biangle_wire(w),
-            "sub-wire {} must not be biangle",
-            i
-        );
+        assert!(!is_biangle_wire(w), "sub-wire {} must not be biangle", i);
     }
 }
 
@@ -504,7 +513,10 @@ fn zero_fragment_face_preserved_in_classification() {
         TOL * TOL,
     );
 
-    assert!(result.is_some(), "divide_faces_with_coplanar must not abort");
+    assert!(
+        result.is_some(),
+        "divide_faces_with_coplanar must not abort"
+    );
     let (cls, _) = result.unwrap();
     let [and, or, unknown] = cls.and_or_unknown();
     let total = and.len() + or.len() + unknown.len();

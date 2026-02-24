@@ -805,10 +805,7 @@ fn crossing_edges() {
 // Sprint A: Biangle wire creation in add_edge
 // ============================================================================
 
-fn line_bspline(
-    v0: &Vertex<Point3>,
-    v1: &Vertex<Point3>,
-) -> Edge<Point3, BSplineCurve<Point3>> {
+fn line_bspline(v0: &Vertex<Point3>, v1: &Vertex<Point3>) -> Edge<Point3, BSplineCurve<Point3>> {
     let curve = BSplineCurve::new(KnotVec::bezier_knot(1), vec![v0.point(), v1.point()]);
     Edge::new(v0, v1, curve)
 }

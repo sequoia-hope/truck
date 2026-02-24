@@ -143,6 +143,153 @@ where
     Some(result_wires)
 }
 
+/// Merge wires that share vertex IDs into composite figure-8 wires, then split
+/// into simple vertex-disjoint wires. Used as a last-resort recovery when
+/// Face::try_new fails due to `disjoint_wires` being false.
+///
+/// Algorithm: splice wires at shared vertices to form figure-8 chains,
+/// then use `split_wire_recursive` to decompose back into simple wires.
+fn merge_splice_wires<C: Clone>(wires: &[Wire<Point3, C>]) -> Vec<Wire<Point3, C>> {
+    use rustc_hash::FxHashMap;
+    type Vid = VertexID<Point3>;
+
+    if wires.len() < 2 {
+        return wires.to_vec();
+    }
+
+    // Build vertex→wire_indices map to find sharing.
+    let mut vid_to_wires: FxHashMap<Vid, Vec<usize>> = FxHashMap::default();
+    for (wi, w) in wires.iter().enumerate() {
+        for v in w.vertex_iter() {
+            vid_to_wires.entry(v.id()).or_default().push(wi);
+        }
+    }
+
+    // Union-find to group wires into connected components via shared vertices.
+    let n = wires.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent[rb] = ra;
+        }
+    }
+
+    for wire_list in vid_to_wires.values() {
+        let mut unique: Vec<usize> = wire_list.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() >= 2 {
+            for &wi in &unique[1..] {
+                union(&mut parent, unique[0], wi);
+            }
+        }
+    }
+
+    // Group wires by component.
+    let mut components: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        components.entry(root).or_default().push(i);
+    }
+
+    let mut result: Vec<Wire<Point3, C>> = Vec::new();
+
+    for comp in components.values() {
+        if comp.len() == 1 {
+            // Single wire — pass through unchanged.
+            result.push(wires[comp[0]].clone());
+            continue;
+        }
+
+        // Splice component wires at shared vertices into a composite figure-8.
+        // Start with the first wire's edges, then splice each subsequent wire
+        // by rotating both to start at a shared vertex.
+        let mut composite: Vec<Edge<Point3, C>> = wires[comp[0]].iter().cloned().collect();
+
+        let mut splice_ok = true;
+        for &wi in &comp[1..] {
+            let wire_edges: Vec<Edge<Point3, C>> = wires[wi].iter().cloned().collect();
+
+            // Find vertex IDs in the composite.
+            let comp_vids: std::collections::HashSet<Vid> =
+                composite.iter().map(|e| e.front().id()).collect();
+
+            // Find a shared vertex in the new wire.
+            let splice_pos = wire_edges
+                .iter()
+                .position(|e| comp_vids.contains(&e.front().id()));
+
+            if let Some(pos) = splice_pos {
+                let shared_vid = wire_edges[pos].front().id();
+                let comp_pos = composite.iter().position(|e| e.front().id() == shared_vid);
+
+                if let Some(cp) = comp_pos {
+                    // Splice: rotate composite to start at shared vertex,
+                    // then append wire rotated to start at same vertex.
+                    let mut spliced = Vec::with_capacity(composite.len() + wire_edges.len());
+                    spliced.extend_from_slice(&composite[cp..]);
+                    spliced.extend_from_slice(&composite[..cp]);
+                    spliced.extend_from_slice(&wire_edges[pos..]);
+                    spliced.extend_from_slice(&wire_edges[..pos]);
+                    composite = spliced;
+                } else {
+                    splice_ok = false;
+                    break;
+                }
+            } else {
+                splice_ok = false;
+                break;
+            }
+        }
+
+        if !splice_ok {
+            // Couldn't splice — return originals for this component.
+            for &wi in comp {
+                result.push(wires[wi].clone());
+            }
+            continue;
+        }
+
+        let composite_wire: Wire<Point3, C> = composite.into_iter().collect();
+
+        if !composite_wire.is_closed() {
+            // Composite not closed — return originals.
+            for &wi in comp {
+                result.push(wires[wi].clone());
+            }
+            continue;
+        }
+
+        // Split the composite at repeated vertices.
+        let mut split_result: Vec<Wire<Point3, C>> = Vec::new();
+        if super::split_wire_recursive(&composite_wire, &mut split_result, 0) {
+            for w in split_result {
+                if w.len() >= 3 && w.is_closed() && !is_biangle_wire(&w) {
+                    result.push(w);
+                }
+            }
+        } else {
+            // Split failed — return originals.
+            for &wi in comp {
+                result.push(wires[wi].clone());
+            }
+        }
+    }
+
+    result
+}
+
 fn create_parameter_boundary<P, C, S>(
     face: &Face<P, C, S>,
     wire: &Wire<P, C>,
@@ -442,6 +589,52 @@ where
                             if let Ok(mut new_face) =
                                 Face::try_new(split_wires, surface.clone())
                             {
+                                if !ori {
+                                    new_face.invert();
+                                }
+                                return Some((new_face, status));
+                            }
+                        }
+                    }
+                    // Last resort: merge wires sharing vertex IDs into a
+                    // composite figure-8, then re-split into simple disjoint
+                    // wires. This handles cases where IC vertex insertion maps
+                    // different IC endpoints to the same boundary vertex.
+                    // Only apply when sharing is pairwise — skip when any
+                    // vertex appears in 3+ different wires (indicates
+                    // legitimate hole topology, not IC artifacts).
+                    if !Wire::disjoint_wires(&wires)
+                        && wires.iter().all(|w| w.is_simple() && w.is_closed())
+                        && wires.len() >= 2
+                        && !{
+                            let mut vid_wire_count =
+                                std::collections::HashMap::<
+                                    VertexID<Point3>,
+                                    std::collections::HashSet<usize>,
+                                >::new();
+                            for (wi, w) in wires.iter().enumerate() {
+                                for v in w.vertex_iter() {
+                                    vid_wire_count
+                                        .entry(v.id())
+                                        .or_default()
+                                        .insert(wi);
+                                }
+                            }
+                            vid_wire_count.values().any(|s| s.len() >= 3)
+                        }
+                    {
+                        let merged = merge_splice_wires(&wires);
+                        if !merged.is_empty() && Wire::disjoint_wires(&merged) {
+                            if let Ok(mut new_face) =
+                                Face::try_new(merged, surface.clone())
+                            {
+                                #[cfg(debug_assertions)]
+                                eprintln!(
+                                    "[boolean] merge+splice recovered face \
+                                     ({} wires → {} wires)",
+                                    wires.len(),
+                                    new_face.absolute_boundaries().len(),
+                                );
                                 if !ori {
                                     new_face.invert();
                                 }
