@@ -247,3 +247,275 @@ fn independent_intersection() {
     let and_shell: Shell<_, _, _> = vec![and0[0].clone(), and1[0].clone()].into();
     assert_eq!(and_shell.shell_condition(), ShellCondition::Closed);
 }
+
+// ============================================================================
+// Sprint A: Biangle wire detection tests
+// ============================================================================
+
+/// Verify is_biangle_wire correctly identifies degenerate biangle wires
+/// (same edge forward + backward) and rejects normal wires.
+#[test]
+fn biangle_wire_detection() {
+    let v0 = Vertex::new(Point3::new(0.0, 0.0, 0.0));
+    let v1 = Vertex::new(Point3::new(4.0, 0.0, 0.0));
+    let edge = line(&v0, &v1);
+
+    // Biangle: same edge forward and backward (shared Arc, same EdgeID)
+    let biangle: Wire<_, _> = vec![edge.inverse(), edge.clone()].into();
+    assert!(
+        is_biangle_wire(&biangle),
+        "wire with same edge in both orientations must be detected as biangle"
+    );
+
+    // Normal 2-edge wire with DIFFERENT edges (different Arcs)
+    let v2 = Vertex::new(Point3::new(2.0, 2.0, 0.0));
+    let normal: Wire<_, _> = vec![line(&v0, &v2), line(&v2, &v0)].into();
+    assert!(
+        !is_biangle_wire(&normal),
+        "wire with two different edges is not biangle"
+    );
+
+    // 3-edge triangle: not biangle (wrong length)
+    let triangle: Wire<_, _> =
+        vec![line(&v0, &v1), line(&v1, &v2), line(&v2, &v0)].into();
+    assert!(!is_biangle_wire(&triangle), "3-edge wire is not biangle");
+
+    // Single edge: not biangle (wrong length)
+    let single: Wire<_, _> = vec![line(&v0, &v1)].into();
+    assert!(!is_biangle_wire(&single), "single-edge wire is not biangle");
+}
+
+/// Verify that divide_one_face filters biangle wires and still produces
+/// valid face fragments. This is a regression test for Sprint A: without
+/// biangle filtering, the biangle + IC wires could cause Face::try_new
+/// to fail with NotDisjointWires/NotSimpleWire on complex shells.
+#[test]
+fn divide_face_with_biangle_wire_produces_fragments() {
+    // Square face on z=0 plane with IC vertices on the boundary
+    let v = Vertex::news([
+        Point3::new(0.0, 0.0, 0.0), // v0
+        Point3::new(4.0, 0.0, 0.0), // v1
+        Point3::new(4.0, 4.0, 0.0), // v2
+        Point3::new(0.0, 4.0, 0.0), // v3
+        Point3::new(2.0, 0.0, 0.0), // v4: IC vertex on bottom edge
+        Point3::new(2.0, 4.0, 0.0), // v5: IC vertex on top edge
+    ]);
+
+    // After IC vertex insertion, the boundary is split at v4 and v5.
+    // add_edge creates two closed IC wires + possibly a biangle.
+    // Simulate the post-add_edge state:
+    // Left half: v4→v5→v3→v0→v4 (And)
+    let left_wire: Wire<_, _> = vec![
+        line(&v[4], &v[5]),
+        line(&v[5], &v[3]),
+        line(&v[3], &v[0]),
+        line(&v[0], &v[4]),
+    ]
+    .into();
+    // Right half: v5→v4→v1→v2→v5 (Or)
+    let right_wire: Wire<_, _> = vec![
+        line(&v[5], &v[4]),
+        line(&v[4], &v[1]),
+        line(&v[1], &v[2]),
+        line(&v[2], &v[5]),
+    ]
+    .into();
+    // Biangle: same IC edge forward + backward (simulates add_edge None,None case)
+    let ic_edge = line(&v[4], &v[5]);
+    let biangle_wire: Wire<_, _> = vec![ic_edge.inverse(), ic_edge].into();
+    assert!(is_biangle_wire(&biangle_wire), "test setup: must be biangle");
+
+    let face = Face::new(
+        vec![left_wire.clone()],
+        Plane::new(
+            Point3::origin(),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        ),
+    );
+
+    // Loops with left half (And), right half (Or), and biangle (Unknown)
+    let loops: Loops<_, _> = vec![
+        BoundaryWire::new(left_wire, ShapesOpStatus::And),
+        BoundaryWire::new(right_wire, ShapesOpStatus::Or),
+        BoundaryWire::new(biangle_wire, ShapesOpStatus::Unknown),
+    ]
+    .into_iter()
+    .collect();
+
+    let res = divide_one_face(&face, &loops, TOL, TOL * TOL);
+    assert!(res.is_some(), "divide_one_face should not return None");
+    let fragments = res.unwrap();
+    assert!(
+        !fragments.is_empty(),
+        "biangle wire must be filtered — face should produce fragments, got 0"
+    );
+}
+
+// ============================================================================
+// Sprint B: Non-simple wire splitting tests
+// ============================================================================
+
+/// Verify split_wire_recursive handles a figure-8 wire (vertex visited twice)
+/// by splitting into two simple closed sub-wires.
+#[test]
+fn split_wire_recursive_figure_eight() {
+    // Wire: v0→v1→v2→v0→v3→v4→v0 (v0 appears at positions 0 and 3)
+    let v = Vertex::news([
+        Point3::new(0.0, 0.0, 0.0),  // v0: repeated vertex
+        Point3::new(2.0, 1.0, 0.0),  // v1
+        Point3::new(1.0, 2.0, 0.0),  // v2
+        Point3::new(-2.0, 1.0, 0.0), // v3
+        Point3::new(-1.0, -2.0, 0.0), // v4
+    ]);
+    let wire: Wire<_, _> = vec![
+        line(&v[0], &v[1]),
+        line(&v[1], &v[2]),
+        line(&v[2], &v[0]),
+        line(&v[0], &v[3]),
+        line(&v[3], &v[4]),
+        line(&v[4], &v[0]),
+    ]
+    .into();
+    assert!(wire.is_closed(), "test setup: wire must be closed");
+    assert!(!wire.is_simple(), "test setup: wire must be non-simple (v0 repeated)");
+
+    let mut output = Vec::new();
+    let success = super::super::split_wire_recursive(&wire, &mut output, 0);
+    assert!(success, "split_wire_recursive should succeed on figure-8");
+    assert_eq!(output.len(), 2, "figure-8 should split into exactly 2 sub-wires");
+    for (i, w) in output.iter().enumerate() {
+        assert!(w.is_simple(), "sub-wire {} must be simple", i);
+        assert!(w.is_closed(), "sub-wire {} must be closed", i);
+        assert!(w.len() >= 3, "sub-wire {} must have ≥3 edges (not degenerate)", i);
+    }
+}
+
+/// Verify split_wire_recursive handles a triple-visit vertex
+/// (vertex appears 3 times in a 9-edge wire, similar to k8 diagnostic).
+#[test]
+fn split_wire_recursive_triple_visit() {
+    // Wire: v0→v1→v2→v0→v3→v4→v0→v5→v6→v0
+    // v0 appears as front vertex at positions 0, 3, and 6
+    let v = Vertex::news([
+        Point3::new(0.0, 0.0, 0.0),  // v0: visited 3 times
+        Point3::new(3.0, 0.0, 0.0),  // v1
+        Point3::new(2.0, 3.0, 0.0),  // v2
+        Point3::new(-3.0, 0.0, 0.0), // v3
+        Point3::new(-2.0, 3.0, 0.0), // v4
+        Point3::new(-1.0, -3.0, 0.0), // v5
+        Point3::new(1.0, -3.0, 0.0), // v6
+    ]);
+    let wire: Wire<_, _> = vec![
+        line(&v[0], &v[1]),
+        line(&v[1], &v[2]),
+        line(&v[2], &v[0]),
+        line(&v[0], &v[3]),
+        line(&v[3], &v[4]),
+        line(&v[4], &v[0]),
+        line(&v[0], &v[5]),
+        line(&v[5], &v[6]),
+        line(&v[6], &v[0]),
+    ]
+    .into();
+    assert!(wire.is_closed());
+    assert!(!wire.is_simple());
+
+    let mut output = Vec::new();
+    let success = super::super::split_wire_recursive(&wire, &mut output, 0);
+    assert!(success, "should split triple-visit wire");
+    assert!(
+        output.len() >= 2,
+        "should produce ≥2 sub-wires from triple-visit, got {}",
+        output.len()
+    );
+    for (i, w) in output.iter().enumerate() {
+        assert!(w.is_simple(), "sub-wire {} must be simple", i);
+        assert!(w.is_closed(), "sub-wire {} must be closed", i);
+        assert!(
+            !is_biangle_wire(w),
+            "sub-wire {} must not be biangle",
+            i
+        );
+    }
+}
+
+// ============================================================================
+// Sprint D: Zero-fragment face preservation test
+// ============================================================================
+
+/// When divide_one_face produces 0 fragments (area cancellation),
+/// divide_faces_with_coplanar must preserve the original face as Unknown,
+/// not silently drop it. This is the root cause of the "14 unknown faces"
+/// cascade in the k8 diagnostic.
+#[test]
+fn zero_fragment_face_preserved_in_classification() {
+    // Build a 10×10 square face on z=0 plane
+    let v = Vertex::news([
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(10.0, 0.0, 0.0),
+        Point3::new(10.0, 10.0, 0.0),
+        Point3::new(0.0, 10.0, 0.0),
+    ]);
+    let outer_wire: Wire<_, _> = vec![
+        line(&v[0], &v[1]),
+        line(&v[1], &v[2]),
+        line(&v[2], &v[3]),
+        line(&v[3], &v[0]),
+    ]
+    .into();
+    let surface = Plane::new(
+        Point3::origin(),
+        Point3::new(1.0, 0.0, 0.0),
+        Point3::new(0.0, 1.0, 0.0),
+    );
+    let face = Face::new(vec![outer_wire.clone()], surface);
+    let shell: Shell<_, _, _> = vec![face].into();
+
+    // Create a nearly-matching clockwise inner wire that cancels the outer area.
+    // Inner: (ε,ε) → (ε,10-ε) → (10-ε,10-ε) → (10-ε,ε) → (ε,ε) [clockwise]
+    // Area ≈ -(10-2ε)² ≈ -99.996 when ε=0.001
+    // |outer_area + inner_area| = |100 - 99.996| = 0.004 < TOL (0.05) → cleared
+    let eps = 0.001;
+    let vi = Vertex::news([
+        Point3::new(eps, eps, 0.0),
+        Point3::new(10.0 - eps, eps, 0.0),
+        Point3::new(10.0 - eps, 10.0 - eps, 0.0),
+        Point3::new(eps, 10.0 - eps, 0.0),
+    ]);
+    let inner_wire: Wire<_, _> = vec![
+        line(&vi[0], &vi[3]), // (ε,ε) → (ε,10-ε): up
+        line(&vi[3], &vi[2]), // (ε,10-ε) → (10-ε,10-ε): right
+        line(&vi[2], &vi[1]), // (10-ε,10-ε) → (10-ε,ε): down
+        line(&vi[1], &vi[0]), // (10-ε,ε) → (ε,ε): left
+    ]
+    .into();
+
+    // Build LoopsStore from the shell, then inject the inner wire with And status
+    // to force divide_one_face to be called (not the all-Unknown shortcut).
+    let mut loops_store: LoopsStore<_, _> = shell.face_iter().collect();
+    loops_store[0].push(BoundaryWire::new(inner_wire, ShapesOpStatus::And));
+
+    let result = divide_faces_with_coplanar(
+        &shell,
+        &loops_store,
+        TOL,
+        &rustc_hash::FxHashSet::default(),
+        TOL * TOL,
+    );
+
+    assert!(result.is_some(), "divide_faces_with_coplanar must not abort");
+    let (cls, _) = result.unwrap();
+    let [and, or, unknown] = cls.and_or_unknown();
+    let total = and.len() + or.len() + unknown.len();
+    assert_eq!(
+        total, 1,
+        "zero-fragment face must be preserved (not lost), got {} faces",
+        total
+    );
+    assert_eq!(
+        unknown.len(),
+        1,
+        "preserved face should be classified as Unknown for downstream ray-cast"
+    );
+}

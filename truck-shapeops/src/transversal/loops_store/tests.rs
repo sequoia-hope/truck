@@ -800,3 +800,136 @@ fn crossing_edges() {
         geom_loops_store0.display(wire_id_format)
     );
 }
+
+// ============================================================================
+// Sprint A: Biangle wire creation in add_edge
+// ============================================================================
+
+fn line_bspline(
+    v0: &Vertex<Point3>,
+    v1: &Vertex<Point3>,
+) -> Edge<Point3, BSplineCurve<Point3>> {
+    let curve = BSplineCurve::new(KnotVec::bezier_knot(1), vec![v0.point(), v1.point()]);
+    Edge::new(v0, v1, curve)
+}
+
+/// When add_edge finds no existing wire endpoint match (the (None, None) case),
+/// it creates a 2-edge wire [edge.inverse(), edge] — a degenerate biangle.
+/// This test documents the biangle creation behavior.
+#[test]
+fn add_edge_no_match_creates_biangle() {
+    let v0 = Vertex::new(Point3::new(1.0, 0.0, 0.0));
+    let v1 = Vertex::new(Point3::new(3.0, 0.0, 0.0));
+    let edge = line_bspline(&v0, &v1);
+
+    // Empty Loops — no existing wires for the edge endpoints to match
+    let mut loops: Loops<Point3, BSplineCurve<Point3>> = Loops(Vec::new());
+    loops.add_edge(edge, ShapesOpStatus::And);
+
+    assert_eq!(loops.len(), 1, "add_edge should create one wire");
+    assert_eq!(loops[0].len(), 2, "wire should have exactly 2 edges");
+    assert!(
+        is_biangle_wire(&loops[0]),
+        "add_edge (None, None) creates a biangle wire"
+    );
+}
+
+/// When add_edge matches one endpoint, the result should NOT be a biangle.
+#[test]
+fn add_edge_one_match_not_biangle() {
+    let v0 = Vertex::new(Point3::new(0.0, 0.0, 0.0));
+    let v1 = Vertex::new(Point3::new(2.0, 0.0, 0.0));
+    let v2 = Vertex::new(Point3::new(4.0, 0.0, 0.0));
+
+    // Start with a biangle wire from first edge (None, None case)
+    let mut loops: Loops<Point3, BSplineCurve<Point3>> = Loops(Vec::new());
+    loops.add_edge(line_bspline(&v0, &v1), ShapesOpStatus::And);
+    assert_eq!(loops.len(), 1);
+
+    // Add second edge that shares vertex v1 — should match and merge
+    loops.add_edge(line_bspline(&v1, &v2), ShapesOpStatus::Or);
+
+    // After merging, no wire should be a biangle
+    for (i, bw) in loops.iter().enumerate() {
+        assert!(
+            !is_biangle_wire(bw),
+            "wire {} should not be biangle after matching merge",
+            i
+        );
+    }
+}
+
+// ============================================================================
+// Sprint C: AABB overlap utility tests
+// ============================================================================
+
+/// Two AABBs far apart should not overlap.
+#[test]
+fn aabbs_overlap_disjoint() {
+    let a = ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = ([5.0, 5.0, 5.0], [6.0, 6.0, 6.0]);
+    assert!(
+        !aabbs_overlap(&a, &b, 0.01),
+        "disjoint AABBs must not overlap"
+    );
+}
+
+/// Two AABBs with a small gap should overlap only with sufficient margin.
+#[test]
+fn aabbs_overlap_gap_within_margin() {
+    let a = ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = ([1.05, 0.0, 0.0], [2.0, 1.0, 1.0]);
+    assert!(
+        !aabbs_overlap(&a, &b, 0.0),
+        "gap=0.05 should not overlap with margin=0"
+    );
+    assert!(
+        !aabbs_overlap(&a, &b, 0.02),
+        "gap=0.05 should not overlap with margin=0.02 (total=0.04)"
+    );
+    assert!(
+        aabbs_overlap(&a, &b, 0.03),
+        "gap=0.05 should overlap with margin=0.03 (total=0.06)"
+    );
+}
+
+/// Two overlapping AABBs should always report overlap.
+#[test]
+fn aabbs_overlap_intersecting() {
+    let a = ([0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+    let b = ([1.0, 1.0, 1.0], [3.0, 3.0, 3.0]);
+    assert!(
+        aabbs_overlap(&a, &b, 0.0),
+        "overlapping AABBs must always overlap"
+    );
+}
+
+/// AABBs that are exactly touching should not overlap with zero margin
+/// but should overlap with any positive margin.
+#[test]
+fn aabbs_overlap_touching() {
+    let a = ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = ([1.0, 0.0, 0.0], [2.0, 1.0, 1.0]);
+    // Exactly touching: a.max[0]=1.0, b.min[0]=1.0
+    // aabbs_overlap checks a.min[d] - margin > b.max[d] + margin
+    // 0.0 - 0.0 > 2.0 + 0.0 → false (ok)
+    // 1.0 - 0.0 > 1.0 + 0.0 → false (not strictly greater)
+    // So touching AABBs DO overlap with margin=0.
+    assert!(
+        aabbs_overlap(&a, &b, 0.0),
+        "touching AABBs overlap (not strictly separated)"
+    );
+}
+
+/// AABB overlap is symmetric.
+#[test]
+fn aabbs_overlap_symmetric() {
+    let a = ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = ([2.0, 0.0, 0.0], [3.0, 1.0, 1.0]);
+    let margin = 0.6;
+    assert_eq!(
+        aabbs_overlap(&a, &b, margin),
+        aabbs_overlap(&b, &a, margin),
+        "AABB overlap must be symmetric"
+    );
+}

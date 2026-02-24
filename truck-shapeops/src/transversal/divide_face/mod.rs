@@ -245,7 +245,37 @@ where
             let wires: Vec<Wire<Point3, C>> = pre_face
                 .into_iter()
                 .map(|chunk| chunk.wire.deref().clone())
+                .filter(|w| !is_biangle_wire(w))
                 .collect();
+            if wires.is_empty() {
+                return None;
+            }
+            // Proactively split non-simple wires before Face::try_new.
+            // This handles the k8 case where IC vertex insertion creates
+            // 10-edge wires visiting the same vertex 3 times.
+            let wires: Vec<Wire<Point3, C>> = {
+                let mut split_wires = Vec::new();
+                for w in wires {
+                    if w.is_simple() {
+                        split_wires.push(w);
+                    } else {
+                        let mut sub = Vec::new();
+                        if super::split_wire_recursive(&w, &mut sub, 0) {
+                            for sw in sub {
+                                if sw.is_closed() && !is_biangle_wire(&sw) {
+                                    split_wires.push(sw);
+                                }
+                            }
+                        } else {
+                            split_wires.push(w);
+                        }
+                    }
+                }
+                split_wires
+            };
+            if wires.is_empty() {
+                return None;
+            }
             match Face::try_new(wires.clone(), surface.clone()) {
                 Ok(mut new_face) => {
                     if !face.orientation() {
@@ -254,44 +284,47 @@ where
                     Some((new_face, status))
                 }
                 Err(_e_outer) => {
-                    // Try recursive wire splitting for non-simple wires.
-                    // Do NOT use Face::new_unchecked here — non-simple faces
-                    // from divide_one_face cause edge over-sharing (3+ refs)
-                    // that breaks the Closed shell invariant in weld_coincident_edges.
-                    let ori = face.orientation();
-                    let mut split_wires: Vec<Wire<Point3, C>> = Vec::new();
-                    let mut any_split = false;
-                    for w in &wires {
-                        if w.is_simple() {
-                            split_wires.push(w.clone());
-                            continue;
-                        }
-                        let mut split_result: Vec<Wire<Point3, C>> = Vec::new();
-                        if super::split_wire_recursive(w, &mut split_result, 0) {
-                            split_wires.extend(split_result);
-                            any_split = true;
-                        } else {
-                            split_wires.push(w.clone());
-                        }
-                    }
-                    if any_split {
-                        if let Ok(mut new_face) =
-                            Face::try_new(split_wires.clone(), surface.clone())
-                        {
-                            if !ori {
-                                new_face.invert();
-                            }
-                            return Some((new_face, status));
-                        }
-                    }
+                    // Diagnose the failure: individual wire simplicity vs.
+                    // inter-wire vertex sharing (disjoint_wires check).
                     #[cfg(debug_assertions)]
                     {
-                        let check_wires = if any_split { &split_wires } else { &wires };
+                        let all_simple = wires.iter().all(|w| w.is_simple());
+                        let all_closed = wires.iter().all(|w| w.is_closed());
+                        let disjoint = Wire::disjoint_wires(&wires);
                         eprintln!(
-                            "[boolean] Face::try_new failed in divide_one_face: {:?}",
-                            _e_outer
+                            "[boolean] Face::try_new failed: {:?} \
+                             (wires={}, all_simple={}, all_closed={}, disjoint={})",
+                            _e_outer,
+                            wires.len(),
+                            all_simple,
+                            all_closed,
+                            disjoint,
                         );
-                        for (wi, w) in check_wires.iter().enumerate() {
+                        if !disjoint {
+                            // Identify which vertex IDs are shared between wires
+                            let mut seen = std::collections::HashMap::<VertexID<Point3>, Vec<usize>>::new();
+                            for (wi, w) in wires.iter().enumerate() {
+                                for v in w.vertex_iter() {
+                                    seen.entry(v.id()).or_default().push(wi);
+                                }
+                            }
+                            for (vid, wire_indices) in &seen {
+                                if wire_indices.len() > 1 {
+                                    let deduped: Vec<usize> = {
+                                        let mut d = wire_indices.clone();
+                                        d.dedup();
+                                        d
+                                    };
+                                    if deduped.len() > 1 {
+                                        eprintln!(
+                                            "  shared vertex {:?} in wires {:?}",
+                                            vid, deduped,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        for (wi, w) in wires.iter().enumerate() {
                             let edges: Vec<_> = w.iter().collect();
                             eprintln!(
                                 "  wire[{}]: {} edges, closed={}, simple={}",
@@ -305,11 +338,114 @@ where
                                 let fp = a.front().point();
                                 let bp = a.back().point();
                                 eprintln!(
-                                    "    edge[{}]: fid={:?} bid={:?} fp=({:.4},{:.4},{:.4}) bp=({:.4},{:.4},{:.4}) ori={}",
+                                    "    edge[{}]: fid={:?} bid={:?} fp=({:.6},{:.6},{:.6}) bp=({:.6},{:.6},{:.6}) ori={}",
                                     ei, a.front().id(), a.back().id(),
                                     fp.x, fp.y, fp.z, bp.x, bp.y, bp.z,
                                     e.orientation(),
                                 );
+                            }
+                        }
+                    }
+                    let ori = face.orientation();
+                    // Fix inter-wire shared vertices (disjoint_wires=false).
+                    // When IC vertex insertion maps different IC endpoints to
+                    // the same boundary vertex, multiple wires share vertex
+                    // IDs. Remove wires whose vertex set is a proper subset
+                    // of another wire — these are degenerate artifacts from
+                    // IC splitting at existing boundary vertices.
+                    if !Wire::disjoint_wires(&wires)
+                        && wires.iter().all(|w| w.is_simple() && w.is_closed())
+                    {
+                        let vertex_sets: Vec<
+                            std::collections::HashSet<VertexID<Point3>>,
+                        > = wires
+                            .iter()
+                            .map(|w| w.vertex_iter().map(|v| v.id()).collect())
+                            .collect();
+                        // Only apply embedded-wire removal for simple
+                        // pairwise sharing. Skip when any vertex appears
+                        // in 3+ wires (complex multi-way sharing indicates
+                        // legitimate hole topology, not degenerate artifacts).
+                        let has_multiway = {
+                            let mut vid_count =
+                                std::collections::HashMap::<
+                                    VertexID<Point3>,
+                                    usize,
+                                >::new();
+                            for w in &wires {
+                                for v in w.vertex_iter() {
+                                    *vid_count.entry(v.id()).or_default() +=
+                                        1;
+                                }
+                            }
+                            vid_count.values().any(|&c| c >= 3)
+                        };
+                        if !has_multiway {
+                            let mut fixed_wires: Vec<Wire<Point3, C>> =
+                                Vec::new();
+                            for (i, w) in wires.iter().enumerate() {
+                                let is_embedded = vertex_sets
+                                    .iter()
+                                    .enumerate()
+                                    .any(|(j, vj)| {
+                                        i != j
+                                            && vertex_sets[i].len()
+                                                < vj.len()
+                                            && vertex_sets[i].is_subset(vj)
+                                    });
+                                if !is_embedded {
+                                    fixed_wires.push(w.clone());
+                                }
+                            }
+                            if !fixed_wires.is_empty()
+                                && fixed_wires.len() < wires.len()
+                            {
+                                #[cfg(debug_assertions)]
+                                eprintln!(
+                                    "[boolean] Removed {} fully-embedded \
+                                     wires, retrying Face::try_new",
+                                    wires.len() - fixed_wires.len(),
+                                );
+                                if let Ok(mut new_face) = Face::try_new(
+                                    fixed_wires,
+                                    surface.clone(),
+                                ) {
+                                    if !ori {
+                                        new_face.invert();
+                                    }
+                                    return Some((new_face, status));
+                                }
+                            }
+                            // Remaining pairwise sharing without
+                            // embedded wires: fall through to Sprint D
+                            // preservation (face kept as Unknown).
+                        }
+                    }
+                    if Wire::disjoint_wires(&wires) {
+                        // Individual wires are non-simple — try splitting
+                        let mut split_wires: Vec<Wire<Point3, C>> = Vec::new();
+                        let mut any_split = false;
+                        for w in &wires {
+                            if w.is_simple() {
+                                split_wires.push(w.clone());
+                                continue;
+                            }
+                            let mut split_result: Vec<Wire<Point3, C>> = Vec::new();
+                            if super::split_wire_recursive(w, &mut split_result, 0) {
+                                split_wires.extend(split_result);
+                                any_split = true;
+                            } else {
+                                split_wires.push(w.clone());
+                            }
+                        }
+                        if any_split {
+                            if let Ok(mut new_face) =
+                                Face::try_new(split_wires, surface.clone())
+                            {
+                                if !ori {
+                                    new_face.invert();
+                                }
+                                return Some((new_face, status));
                             }
                         }
                     }
@@ -402,6 +538,21 @@ where
                     res.push(face.clone(), ShapesOpStatus::Unknown);
                 } else {
                     match divide_one_face(face, loops, tol, tau_area) {
+                        Some(vec) if vec.is_empty() => {
+                            // Zero fragments — preserve original face as Unknown
+                            // so downstream classification (overlay → coplanar →
+                            // ray-cast) can determine its status.
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[divide_face] face {} produced 0 fragments \
+                                 — preserving as Unknown",
+                                idx,
+                            );
+                            if is_coplanar {
+                                coplanar_fragment_ids.push(face.id());
+                            }
+                            res.push(face.clone(), ShapesOpStatus::Unknown);
+                        }
                         Some(vec) => {
                             #[cfg(debug_assertions)]
                             eprintln!(
@@ -416,7 +567,20 @@ where
                                 res.push(face, status);
                             });
                         }
-                        None => return None,
+                        None => {
+                            // Face division failed — preserve the original face
+                            // as Unknown rather than aborting the entire boolean.
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[divide_face] face {} division failed \
+                                 — preserving as Unknown",
+                                idx,
+                            );
+                            if is_coplanar {
+                                coplanar_fragment_ids.push(face.id());
+                            }
+                            res.push(face.clone(), ShapesOpStatus::Unknown);
+                        }
                     }
                 }
             }

@@ -158,6 +158,19 @@ impl<'a, P, C> IntoIterator for &'a LoopsStore<P, C> {
     }
 }
 
+/// Returns true if a wire is a degenerate "biangle" — exactly 2 edges
+/// referencing the same underlying Edge (same EdgeID / same Arc<curve>)
+/// in opposite orientations. These arise in add_edge's (None, None) branch
+/// when an IC endpoint doesn't connect to any existing wire, producing
+/// `vec![edge0.inverse(), edge0]`.
+pub(crate) fn is_biangle_wire<P, C>(wire: &Wire<P, C>) -> bool {
+    if wire.len() != 2 {
+        return false;
+    }
+    let edges: Vec<_> = wire.iter().collect();
+    edges[0].id() == edges[1].id()
+}
+
 #[derive(Clone, Debug, Copy, PartialEq)]
 enum ParameterKind {
     Front,
@@ -669,6 +682,42 @@ pub struct LoopsStoreQuadruple<C> {
     pub coplanar_faces1: rustc_hash::FxHashSet<usize>,
 }
 
+/// Compute axis-aligned bounding box from polygon mesh positions.
+/// Returns (min, max) corners, or None if no mesh is available.
+fn compute_face_aabb(
+    poly_face: &Face<Point3, PolylineCurve, Option<PolygonMesh>>,
+) -> Option<([f64; 3], [f64; 3])> {
+    let mesh = poly_face.surface()?;
+    let positions = mesh.positions();
+    if positions.is_empty() {
+        return None;
+    }
+    let mut min = [f64::MAX; 3];
+    let mut max = [f64::MIN; 3];
+    for p in positions.iter() {
+        min[0] = min[0].min(p.x);
+        min[1] = min[1].min(p.y);
+        min[2] = min[2].min(p.z);
+        max[0] = max[0].max(p.x);
+        max[1] = max[1].max(p.y);
+        max[2] = max[2].max(p.z);
+    }
+    Some((min, max))
+}
+
+/// Check if two AABBs overlap after inflating each by `margin`.
+fn aabbs_overlap(a: &([f64; 3], [f64; 3]), b: &([f64; 3], [f64; 3]), margin: f64) -> bool {
+    for d in 0..3 {
+        if a.0[d] - margin > b.1[d] + margin {
+            return false;
+        }
+        if b.0[d] - margin > a.1[d] + margin {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn create_loops_stores<C, S>(
     geom_shell0: &Shell<Point3, C, S>,
     poly_shell0: &Shell<Point3, PolylineCurve, Option<PolygonMesh>>,
@@ -692,6 +741,15 @@ where
     let mut poly_loops_store1: LoopsStore<_, _> = poly_shell1.face_iter().collect();
     let store0_len = geom_loops_store0.len();
     let store1_len = geom_loops_store1.len();
+    // Pre-compute face AABBs for spatial culling of face pairs.
+    let aabbs0: Vec<Option<([f64; 3], [f64; 3])>> = (0..store0_len)
+        .map(|i| compute_face_aabb(&poly_shell0[i]))
+        .collect();
+    let aabbs1: Vec<Option<([f64; 3], [f64; 3])>> = (0..store1_len)
+        .map(|j| compute_face_aabb(&poly_shell1[j]))
+        .collect();
+    let aabb_margin = tol * 2.0;
+
     // Pre-identify coplanar face pairs for asymmetric classification later.
     let mut coplanar_faces0 = rustc_hash::FxHashSet::default();
     let mut coplanar_faces1 = rustc_hash::FxHashSet::default();
@@ -699,6 +757,12 @@ where
     let mut coplanar_pairs: Vec<(usize, usize)> = Vec::new();
     for i in 0..store0_len {
         for j in 0..store1_len {
+            // Skip coplanar check if face AABBs don't overlap.
+            if let (Some(aabb0), Some(aabb1)) = (&aabbs0[i], &aabbs1[j]) {
+                if !aabbs_overlap(aabb0, aabb1, aabb_margin) {
+                    continue;
+                }
+            }
             if coplanar_splitting::check_coplanar_faces(
                 &geom_shell0[i],
                 &geom_shell1[j],
@@ -829,6 +893,12 @@ where
             // boundary injection, causing non-manifold topology.
             if coplanar_adj_skip.contains(&(face_index0, face_index1)) {
                 return Some(());
+            }
+            // AABB culling: skip face pairs whose bounding boxes don't overlap.
+            if let (Some(aabb0), Some(aabb1)) = (&aabbs0[face_index0], &aabbs1[face_index1]) {
+                if !aabbs_overlap(aabb0, aabb1, aabb_margin) {
+                    return Some(());
+                }
             }
             let ori0 = geom_shell0[face_index0].orientation();
             let ori1 = geom_shell1[face_index1].orientation();
@@ -980,6 +1050,22 @@ where
                     Some(())
                 })
         })?;
+
+    // Remove degenerate biangle wires from loops stores. Biangles (2 edges,
+    // same EdgeID, opposite orientation) arise in add_edge's (None, None) branch
+    // and cause NotSimpleWire failures in Face::try_new during face division.
+    for loops in geom_loops_store0.iter_mut() {
+        loops.retain(|bw| !is_biangle_wire(&bw.wire));
+    }
+    for loops in poly_loops_store0.iter_mut() {
+        loops.retain(|bw| !is_biangle_wire(&bw.wire));
+    }
+    for loops in geom_loops_store1.iter_mut() {
+        loops.retain(|bw| !is_biangle_wire(&bw.wire));
+    }
+    for loops in poly_loops_store1.iter_mut() {
+        loops.retain(|bw| !is_biangle_wire(&bw.wire));
+    }
 
     // Inject coplanar boundary loops for through-hole detection.
     // When a cylindrical cut exits through the opposite face, the cylinder's
