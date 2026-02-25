@@ -77,7 +77,11 @@ impl<P, C, S> FacesClassification<P, C, S> {
             } else if or_count > and_count {
                 Some(ShapesOpStatus::Or)
             } else {
-                None // Tied or no matches — leave as Unknown for ray_cast_classify
+                // Tied or no boundary matches — leave as Unknown for ray_cast_classify.
+                // The improved 8-ray ray_cast_classify with escalated perturbation and
+                // face-normal fallback handles these cases more accurately than a
+                // static tiebreak preference.
+                None
             };
             if let Some(s) = status {
                 comp.iter().for_each(|face| {

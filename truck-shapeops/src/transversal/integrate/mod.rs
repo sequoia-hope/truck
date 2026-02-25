@@ -273,19 +273,54 @@ pub(crate) fn compute_shell_extent_poly(
 
 /// Irrational ray directions that avoid grid alignment in triangulated meshes.
 /// Each direction has a dominant axis component plus small irrational offsets.
-pub(crate) fn irrational_ray_dirs() -> [Vector3; 4] {
+/// 8 directions provide robust majority voting for corner-coplanar geometry.
+pub(crate) fn irrational_ray_dirs() -> [Vector3; 8] {
     let sqrt2 = std::f64::consts::SQRT_2;
     let sqrt3 = 3.0f64.sqrt();
     let sqrt5 = 5.0f64.sqrt();
     let sqrt7 = 7.0f64.sqrt();
     let sqrt11 = 11.0f64.sqrt();
     let sqrt13 = 13.0f64.sqrt();
+    let sqrt17 = 17.0f64.sqrt();
+    let sqrt19 = 19.0f64.sqrt();
+    let sqrt23 = 23.0f64.sqrt();
+    let sqrt29 = 29.0f64.sqrt();
     [
         Vector3::new(1.0, sqrt2 / 10.0, sqrt3 / 10.0),
         Vector3::new(sqrt2 / 10.0, 1.0, sqrt5 / 10.0),
         Vector3::new(sqrt3 / 10.0, sqrt5 / 10.0, 1.0),
         Vector3::new(sqrt7 / 10.0, sqrt11 / 10.0, sqrt13 / 10.0),
+        // Additional directions for corner-coplanar robustness
+        Vector3::new(1.0, sqrt17 / 10.0, -sqrt19 / 10.0),
+        Vector3::new(-sqrt23 / 10.0, 1.0, sqrt29 / 10.0),
+        Vector3::new(sqrt19 / 10.0, -sqrt17 / 10.0, 1.0),
+        Vector3::new(sqrt29 / 10.0, sqrt23 / 10.0, sqrt17 / 10.0),
     ]
+}
+
+/// Compute a geometric normal from boundary vertices using Newell's method.
+/// Returns None if the face has fewer than 3 vertices or the normal is degenerate.
+pub(crate) fn geometric_face_normal(verts: &[Point3]) -> Option<Vector3> {
+    if verts.len() < 3 {
+        return None;
+    }
+    // Newell's method: robust for non-planar polygons
+    let mut nx = 0.0;
+    let mut ny = 0.0;
+    let mut nz = 0.0;
+    for i in 0..verts.len() {
+        let curr = verts[i];
+        let next = verts[(i + 1) % verts.len()];
+        nx += (curr.y - next.y) * (curr.z + next.z);
+        ny += (curr.z - next.z) * (curr.x + next.x);
+        nz += (curr.x - next.x) * (curr.y + next.y);
+    }
+    let n = Vector3::new(nx, ny, nz);
+    let mag = n.magnitude();
+    if mag < 1e-15 {
+        return None;
+    }
+    Some(n / mag)
 }
 
 /// Ray-cast a face against a triangulated shell to determine inside/outside.
@@ -325,7 +360,7 @@ fn ray_cast_classify<C, S>(
         }
     };
 
-    // Majority vote: cast all 4 irrational rays, take majority (need >=2 agreeing).
+    // Majority vote: cast all 8 irrational rays, take majority (need >=3 agreeing).
     let majority_vote = |pt: Point3| -> Option<isize> {
         let mut inside = 0u32;
         let mut outside = 0u32;
@@ -341,9 +376,9 @@ fn ray_cast_classify<C, S>(
                 }
             }
         }
-        if inside >= 2 {
+        if inside >= 3 {
             Some(1)
-        } else if outside >= 2 {
+        } else if outside >= 3 {
             Some(0)
         } else {
             None
@@ -389,6 +424,46 @@ fn ray_cast_classify<C, S>(
         }
     }
 
+    // Strategy 3: Escalated perturbation — break corner-coplanar degeneracy
+    // by using 1000x larger offsets to move test points well away from surfaces.
+    let large_perturb = Vector3::new(1.0e-3 * scale, 1.2e-3 * scale, 1.4e-3 * scale);
+    let escalated_vote = |base: Point3| -> Option<isize> {
+        let pt_pos = base + large_perturb;
+        let pt_neg = base - large_perturb;
+        let vote_pos = majority_vote(pt_pos);
+        let vote_neg = majority_vote(pt_neg);
+        match (vote_pos, vote_neg) {
+            (Some(a), Some(b)) if a == b => Some(a),
+            (Some(_), Some(_)) => Some(0), // Disagree → on boundary → outside
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    };
+    if let Some(c) = escalated_vote(centroid) {
+        return Some(c);
+    }
+    for &v in &verts {
+        if let Some(c) = escalated_vote(v) {
+            return Some(c);
+        }
+    }
+
+    // Strategy 4: Face-normal ray — cast along geometric normal of the face.
+    {
+        let normal = geometric_face_normal(&verts);
+        if let Some(dir) = normal {
+            let origin = centroid + dir * (1e-4 * scale);
+            if let Some(c) = cast_ray(origin, dir) {
+                return Some(if c.unsigned_abs() % 2 == 1 { 1 } else { 0 });
+            }
+            // Try opposite direction
+            if let Some(c) = cast_ray(origin, -dir) {
+                return Some(if c.unsigned_abs() % 2 == 1 { 1 } else { 0 });
+            }
+        }
+    }
+
     // Last resort: accept any single non-None result from any direction.
     let centroid_perturbed = centroid + perturb;
     for &d in &dirs {
@@ -398,6 +473,96 @@ fn ray_cast_classify<C, S>(
     }
 
     None
+}
+
+/// Edge-neighbor propagation for faces where ray-cast failed.
+///
+/// Iteratively classifies unresolved faces by majority-voting their edge
+/// adjacency with already-classified faces. This handles corner-coplanar
+/// geometry where all ray-cast strategies fail but neighboring faces are
+/// correctly classified.
+fn classify_by_edge_neighbors<C: Clone, S: Clone>(
+    unresolved: Vec<Face<Point3, C, S>>,
+    and_shell: &mut Shell<Point3, C, S>,
+    or_shell: &mut Shell<Point3, C, S>,
+) -> std::result::Result<(), BooleanStageError> {
+    use rustc_hash::FxHashSet;
+    #[cfg(debug_assertions)]
+    let initial_count = unresolved.len();
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[classify] {} faces unresolved after ray-cast, trying edge-neighbor propagation",
+        initial_count
+    );
+    let mut remaining = unresolved;
+    for _round in 0..10 {
+        if remaining.is_empty() {
+            break;
+        }
+        let mut and_eids: FxHashSet<EdgeID<C>> = FxHashSet::default();
+        for f in and_shell.iter() {
+            for wire in f.boundaries() {
+                for edge in wire.edge_iter() {
+                    and_eids.insert(edge.id());
+                }
+            }
+        }
+        let mut or_eids: FxHashSet<EdgeID<C>> = FxHashSet::default();
+        for f in or_shell.iter() {
+            for wire in f.boundaries() {
+                for edge in wire.edge_iter() {
+                    or_eids.insert(edge.id());
+                }
+            }
+        }
+        let mut next = Vec::new();
+        let mut progress = false;
+        for face in remaining {
+            let mut and_adj = 0usize;
+            let mut or_adj = 0usize;
+            for wire in face.boundaries() {
+                for edge in wire.edge_iter() {
+                    if and_eids.contains(&edge.id()) {
+                        and_adj += 1;
+                    }
+                    if or_eids.contains(&edge.id()) {
+                        or_adj += 1;
+                    }
+                }
+            }
+            if and_adj > or_adj {
+                and_shell.push(face);
+                progress = true;
+            } else if or_adj > and_adj {
+                or_shell.push(face);
+                progress = true;
+            } else if and_adj > 0 {
+                // Tie with both And/Or neighbors: prefer And (intersection boundary).
+                and_shell.push(face);
+                progress = true;
+            } else {
+                next.push(face);
+            }
+        }
+        remaining = next;
+        if !progress {
+            break;
+        }
+    }
+    if !remaining.is_empty() {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[classify] {} faces still unresolved after edge-neighbor propagation",
+            remaining.len()
+        );
+        return Err(BooleanStageError::Classification);
+    }
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[classify] edge-neighbor propagation resolved all {} faces",
+        initial_count
+    );
+    Ok(())
 }
 
 type AltCurveShell<C, S> =
@@ -566,10 +731,12 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
         or0.len(),
         unknown0.len(),
     );
-    unknown0
-        .into_iter()
-        .try_for_each(|face| {
-            // Try overlay-based classification first (handles complex multi-fragment coplanar topology)
+    // Classify unknown0 faces: coplanar → ray-cast → edge-neighbor propagation.
+    // The edge-neighbor fallback handles corner-coplanar geometry where all
+    // ray-cast strategies fail but neighboring faces are correctly classified.
+    {
+        let mut unresolved = Vec::new();
+        for face in unknown0 {
             let coplanar_action = coplanar_overlay::classify_coplanar_via_overlay(
                 &face,
                 shell1,
@@ -577,7 +744,6 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
                 tols.tau_coplanar,
             )
             .or_else(|| {
-                // Fallback: single-point classification for edge cases overlay misses
                 coplanar::classify_coplanar_fragment(&face, shell1, true, tols.tau_coplanar)
             });
             if let Some(action) = coplanar_action {
@@ -586,17 +752,22 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
                     coplanar::CoplanarAction::And => and0.push(face),
                     coplanar::CoplanarAction::Or => or0.push(face),
                 }
-                return Some(());
+                continue;
             }
-            let count = ray_cast_classify(&face, &poly_shell1, Some(&bvh1))?;
-            if count == 1 {
-                and0.push(face);
+            if let Some(count) = ray_cast_classify(&face, &poly_shell1, Some(&bvh1)) {
+                if count == 1 {
+                    and0.push(face);
+                } else {
+                    or0.push(face);
+                }
             } else {
-                or0.push(face);
+                unresolved.push(face);
             }
-            Some(())
-        })
-        .ok_or(BooleanStageError::Classification)?;
+        }
+        if !unresolved.is_empty() {
+            classify_by_edge_neighbors(unresolved, &mut and0, &mut or0)?;
+        }
+    }
     #[cfg(debug_assertions)]
     eprintln!(
         "[classify] shell0 final: and={}, or={}",
@@ -611,10 +782,10 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
         or1.len(),
         unknown1.len(),
     );
-    unknown1
-        .into_iter()
-        .try_for_each(|face| {
-            // Try overlay-based classification first (handles complex multi-fragment coplanar topology)
+    // Classify unknown1 faces: coplanar → ray-cast → edge-neighbor propagation.
+    {
+        let mut unresolved = Vec::new();
+        for face in unknown1 {
             let coplanar_action = coplanar_overlay::classify_coplanar_via_overlay(
                 &face,
                 shell0,
@@ -622,7 +793,6 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
                 tols.tau_coplanar,
             )
             .or_else(|| {
-                // Fallback: single-point classification for edge cases overlay misses
                 coplanar::classify_coplanar_fragment(&face, shell0, false, tols.tau_coplanar)
             });
             if let Some(action) = coplanar_action {
@@ -631,17 +801,22 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
                     coplanar::CoplanarAction::And => and1.push(face),
                     coplanar::CoplanarAction::Or => or1.push(face),
                 }
-                return Some(());
+                continue;
             }
-            let count = ray_cast_classify(&face, &poly_shell0, Some(&bvh0))?;
-            if count == 1 {
-                and1.push(face);
+            if let Some(count) = ray_cast_classify(&face, &poly_shell0, Some(&bvh0)) {
+                if count == 1 {
+                    and1.push(face);
+                } else {
+                    or1.push(face);
+                }
             } else {
-                or1.push(face);
+                unresolved.push(face);
             }
-            Some(())
-        })
-        .ok_or(BooleanStageError::Classification)?;
+        }
+        if !unresolved.is_empty() {
+            classify_by_edge_neighbors(unresolved, &mut and1, &mut or1)?;
+        }
+    }
     #[cfg(debug_assertions)]
     eprintln!(
         "[classify] shell1 final: and={}, or={}",

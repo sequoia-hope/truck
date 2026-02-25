@@ -1331,3 +1331,120 @@ fn two_bosses_then_coplanar_cut() {
         shell.len()
     );
 }
+
+/// Verify that irrational_ray_dirs returns 8 unique directions.
+#[test]
+fn irrational_ray_dirs_returns_8() {
+    use crate::transversal::integrate::irrational_ray_dirs;
+
+    let dirs = irrational_ray_dirs();
+    assert_eq!(dirs.len(), 8, "Should have 8 irrational ray directions");
+
+    // Each direction should be non-zero
+    for (i, d) in dirs.iter().enumerate() {
+        let mag = (d.x * d.x + d.y * d.y + d.z * d.z).sqrt();
+        assert!(
+            mag > 0.1,
+            "Direction {} should be non-zero (mag={:.6})",
+            i,
+            mag
+        );
+    }
+
+    // All directions should be distinct
+    for i in 0..dirs.len() {
+        for j in (i + 1)..dirs.len() {
+            let diff = dirs[i] - dirs[j];
+            let dist = (diff.x * diff.x + diff.y * diff.y + diff.z * diff.z).sqrt();
+            assert!(
+                dist > 0.01,
+                "Directions {} and {} should be distinct (dist={:.6})",
+                i,
+                j,
+                dist
+            );
+        }
+    }
+}
+
+/// Verify that geometric_face_normal computes correct normals.
+#[test]
+fn geometric_face_normal_basic() {
+    use crate::transversal::integrate::geometric_face_normal;
+
+    // XY-plane square: normal should point in +Z or -Z
+    let verts = vec![
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(1.0, 0.0, 0.0),
+        Point3::new(1.0, 1.0, 0.0),
+        Point3::new(0.0, 1.0, 0.0),
+    ];
+    let n = geometric_face_normal(&verts).expect("Should compute normal for planar quad");
+    assert!(
+        n.z.abs() > 0.99,
+        "Normal of XY-plane quad should be along Z (got {:?})",
+        n
+    );
+
+    // Degenerate: too few vertices
+    assert!(geometric_face_normal(&[]).is_none());
+    assert!(geometric_face_normal(&[Point3::origin()]).is_none());
+
+    // Collinear vertices: degenerate normal
+    let collinear = vec![
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(1.0, 0.0, 0.0),
+        Point3::new(2.0, 0.0, 0.0),
+    ];
+    assert!(
+        geometric_face_normal(&collinear).is_none(),
+        "Collinear vertices should produce no normal"
+    );
+}
+
+/// ray_cast_classify with 8 rays should produce stronger consensus for a simple cube.
+#[test]
+fn ray_cast_8_dirs_cube_consensus() {
+    use crate::transversal::integrate::{irrational_ray_dirs, try_ray_cast};
+
+    let v = builder::vertex(Point3::origin());
+    let e = builder::tsweep(&v, Vector3::unit_x());
+    let f = builder::tsweep(&e, Vector3::unit_y());
+    let cube: Solid = builder::tsweep(&f, Vector3::unit_z());
+    let poly_shell = cube.boundaries()[0].triangulation(0.05);
+
+    let dirs = irrational_ray_dirs();
+    assert_eq!(dirs.len(), 8);
+
+    // Point clearly inside: should get strong inside consensus (>=3 of 8)
+    let inside_pt = Point3::new(0.5, 0.5, 0.5);
+    let mut inside_votes = 0u32;
+    for &d in &dirs {
+        if let Some(c) = try_ray_cast(inside_pt, d, &poly_shell) {
+            if c.unsigned_abs() % 2 == 1 {
+                inside_votes += 1;
+            }
+        }
+    }
+    assert!(
+        inside_votes >= 3,
+        "Inside point should get >=3 inside votes with 8 rays (got {})",
+        inside_votes
+    );
+
+    // Point clearly outside: should get strong outside consensus
+    let outside_pt = Point3::new(5.0, 5.0, 5.0);
+    let mut outside_votes = 0u32;
+    for &d in &dirs {
+        if let Some(c) = try_ray_cast(outside_pt, d, &poly_shell) {
+            if c.unsigned_abs() % 2 == 0 {
+                outside_votes += 1;
+            }
+        }
+    }
+    assert!(
+        outside_votes >= 3,
+        "Outside point should get >=3 outside votes with 8 rays (got {})",
+        outside_votes
+    );
+}
