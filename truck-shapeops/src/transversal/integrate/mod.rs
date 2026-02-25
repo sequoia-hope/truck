@@ -491,7 +491,6 @@ fn classify_by_edge_neighbors<C: Clone, S: Clone>(
 ) -> std::result::Result<(), BooleanStageError> {
     use rustc_hash::FxHashSet;
     let initial_count = unresolved.len();
-    #[cfg(debug_assertions)]
     eprintln!(
         "[classify] {} faces unresolved after ray-cast, trying edge-neighbor propagation",
         initial_count
@@ -563,14 +562,12 @@ fn classify_by_edge_neighbors<C: Clone, S: Clone>(
         rpt.faces_resolved = faces_resolved;
     }
     if !remaining.is_empty() {
-        #[cfg(debug_assertions)]
         eprintln!(
             "[classify] {} faces still unresolved after edge-neighbor propagation",
             remaining.len()
         );
         return Err(BooleanStageError::Classification);
     }
-    #[cfg(debug_assertions)]
     eprintln!(
         "[classify] edge-neighbor propagation resolved all {} faces",
         initial_count
@@ -647,7 +644,6 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
 ) -> std::result::Result<ClassifiedShellBuckets<Point3, C, S>, BooleanStageError> {
     nonpositive_tolerance!(tols.tau_model);
     let _total_start = std::time::Instant::now();
-    #[cfg(debug_assertions)]
     eprintln!(
         "[classify] input: shell0={} faces, shell1={} faces",
         shell0.len(),
@@ -679,7 +675,6 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
     )
     .ok_or(BooleanStageError::LoopsStoreCreation)?;
     let _loops_store_elapsed = _total_start.elapsed();
-    #[cfg(debug_assertions)]
     {
         for (fi, loops) in loops_store1.iter().enumerate() {
             let total_edges: usize = loops.iter().map(|w| w.len()).sum();
@@ -737,7 +732,6 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
     cls0.reset_overlapping_coplanar(&coplanar_fids0, shell1, true, tols.tau_coplanar);
     cls1.reset_overlapping_coplanar(&coplanar_fids1, shell0, false, tols.tau_coplanar);
     let [mut and0, mut or0, unknown0] = cls0.and_or_unknown();
-    #[cfg(debug_assertions)]
     eprintln!(
         "[classify] shell0: and={}, or={}, unknown={}",
         and0.len(),
@@ -786,14 +780,12 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
             )?;
         }
     }
-    #[cfg(debug_assertions)]
     eprintln!(
         "[classify] shell0 final: and={}, or={}",
         and0.len(),
         or0.len(),
     );
     let [mut and1, mut or1, unknown1] = cls1.and_or_unknown();
-    #[cfg(debug_assertions)]
     eprintln!(
         "[classify] shell1: and={}, or={}, unknown={}",
         and1.len(),
@@ -840,13 +832,11 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
             )?;
         }
     }
-    #[cfg(debug_assertions)]
     eprintln!(
         "[classify] shell1 final: and={}, or={}",
         and1.len(),
         or1.len(),
     );
-    #[cfg(debug_assertions)]
     eprintln!(
         "[classify] totals: and0+and1={}, or0+or1={}",
         and0.len() + and1.len(),
@@ -967,7 +957,6 @@ fn repair_wires_with_gap_fill<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         .collect();
 
     // Fill gaps: pair degree-1 vertices by proximity and create Line edges
-    #[cfg(debug_assertions)]
     {
         eprintln!(
             "[gap_repair] {} degree-1 vertices in {} edges",
@@ -1012,7 +1001,6 @@ fn repair_wires_with_gap_fill<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 
             // Skip gap filling if the gap is too large (> 5 units — likely wrong face)
             if best_dist > 5.0 {
-                #[cfg(debug_assertions)]
                 eprintln!("[gap_repair] gap too large: {:.4}", best_dist);
                 return None;
             }
@@ -1023,7 +1011,6 @@ fn repair_wires_with_gap_fill<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
             // Create a Line edge from v0 to v1
             let pf = vf.point();
             let pb = vb.point();
-            #[cfg(debug_assertions)]
             eprintln!(
                 "[gap_repair] filling gap: ({:.3},{:.3},{:.3})->({:.3},{:.3},{:.3}) dist={:.4}",
                 pf.x, pf.y, pf.z, pb.x, pb.y, pb.z, best_dist,
@@ -1036,7 +1023,6 @@ fn repair_wires_with_gap_fill<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                 adj.entry(v1).or_default().push((edge_idx, v0));
                 gap_edges.push(gap_edge);
             } else {
-                #[cfg(debug_assertions)]
                 eprintln!("[gap_repair] Edge::try_new failed for gap edge");
                 return None;
             }
@@ -1095,21 +1081,18 @@ fn repair_wires_with_gap_fill<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         }
 
         if stuck {
-            #[cfg(debug_assertions)]
             eprintln!("[gap_repair] graph traversal stuck");
             return None;
         }
 
         let wire: Wire<Point3, C> = wire_edges.into_iter().collect();
         if !wire.is_closed() {
-            #[cfg(debug_assertions)]
             eprintln!(
                 "[gap_repair] reconstructed wire not closed ({} edges)",
                 wire.len()
             );
             return None;
         }
-        #[cfg(debug_assertions)]
         eprintln!("[gap_repair] built wire with {} edges", wire.len());
         result_wires.push(wire);
     }
@@ -1175,7 +1158,6 @@ fn try_split_non_simple_wires<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // wires with edges in wrong order or missing short intersection boundary edges.
     let all_closed = new_wires.iter().all(|w| !w.is_empty() && w.is_closed());
     if !all_closed {
-        #[cfg(debug_assertions)]
         {
             let non_closed_count = new_wires.iter().filter(|w| !w.is_closed()).count();
             let total_edges: usize = new_wires.iter().map(|w| w.len()).sum();
@@ -2377,7 +2359,6 @@ fn split_open_edges_at_interior_vertices<C: ShapeOpsCurve<S>, S: ShapeOpsSurface
         return false;
     }
 
-    #[cfg(debug_assertions)]
     eprintln!(
         "[split_propagation] found {} edges to split at interior vertices",
         splits.len(),
@@ -2564,7 +2545,6 @@ fn fill_open_edge_loops<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // Check if all vertices have degree 2 (required for valid loops)
     let all_degree_2 = adj.values().all(|neighbors| neighbors.len() == 2);
     if !all_degree_2 {
-        #[cfg(debug_assertions)]
         {
             let non2: Vec<_> = adj.iter().filter(|(_, n)| n.len() != 2).collect();
             eprintln!(
@@ -2675,7 +2655,6 @@ fn fill_open_edge_loops<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         return false;
     }
 
-    #[cfg(debug_assertions)]
     eprintln!(
         "[fill_loops] found {} closed loop(s) from {} open edges",
         loops.len(),
@@ -2708,7 +2687,6 @@ fn fill_open_edge_loops<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         // The loop is planar enough if the smallest extent is < 20% of the largest
         // or if the smallest extent is within model tolerance.
         if min_extent > max_extent * 0.2 && min_extent > tol * 20.0 {
-            #[cfg(debug_assertions)]
             eprintln!(
                 "[fill_loops] loop not planar enough (min_extent {:.4} > 20% of max_extent {:.4})",
                 min_extent, max_extent,
@@ -2770,7 +2748,6 @@ fn fill_open_edge_loops<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
             Err(_) => Face::new_unchecked(vec![wire], surface),
         };
 
-        #[cfg(debug_assertions)]
         eprintln!(
             "[fill_loops] added planar face with {} edges, normal=({:.3},{:.3},{:.3})",
             loop_edges.len(),
@@ -2848,7 +2825,6 @@ fn finalize_boolean_shell_inner<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
             r.open_edges_after_weld = open.len();
             r.recovery_level = 0;
         }
-        #[cfg(debug_assertions)]
         eprintln!(
             "[finalize] after weld #1: {} faces, {} open edges",
             shell.len(),
@@ -2874,7 +2850,6 @@ fn finalize_boolean_shell_inner<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                 r.open_edges_after_weld = open.len();
                 r.recovery_level = (i + 1) as u8;
             }
-            #[cfg(debug_assertions)]
             eprintln!(
                 "[finalize] after weld #{}: {} faces, {} open edges",
                 i + 2,
@@ -2896,7 +2871,6 @@ fn finalize_boolean_shell_inner<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // specific edges that prevent shell closure.
     {
         let open_edges = diagnose_open_edges(shell);
-        #[cfg(debug_assertions)]
         if !open_edges.is_empty() {
             eprintln!(
                 "[finalize] {} open edges before targeted reweld:",
@@ -2975,7 +2949,6 @@ fn finalize_boolean_shell_inner<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
             if let Some(ref mut r) = recovery {
                 r.open_edges_after_weld = open.len();
             }
-            #[cfg(debug_assertions)]
             eprintln!(
                 "[finalize] after split propagation + weld: {} open edges",
                 open.len(),
@@ -2985,7 +2958,6 @@ fn finalize_boolean_shell_inner<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 
     // Post-weld Euler validation — always populate recovery report
     populate_euler(&mut recovery, shell);
-    #[cfg(debug_assertions)]
     {
         match validate_euler_characteristic(shell) {
             Ok(()) => {}

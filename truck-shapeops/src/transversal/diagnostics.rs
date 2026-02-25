@@ -19,8 +19,39 @@ pub struct BooleanDiagnostics {
     pub recovery: RecoveryReport,
     /// Edge-neighbor classification propagation report.
     pub edge_neighbor: EdgeNeighborReport,
+    /// Pre-heal vertex unification report.
+    pub pre_heal: Option<PreHealReport>,
+    /// Perturbation cascade report.
+    pub cascade: Option<CascadeReport>,
+    /// Classification method summary.
+    pub classification_summary: Option<ClassificationSummary>,
     /// Warnings about near-tolerance decisions.
     pub warnings: Vec<String>,
+}
+
+impl BooleanDiagnostics {
+    /// One-line human-readable summary of key metrics.
+    pub fn summary_line(&self) -> String {
+        let c = &self.classification;
+        let total_classified = c.shell0_and + c.shell0_or + c.shell1_and + c.shell1_or;
+        let r = &self.recovery;
+        let en = &self.edge_neighbor;
+        let mut parts = vec![
+            format!("faces={}", total_classified),
+            format!("and={}+{}", c.shell0_and, c.shell1_and),
+            format!("or={}+{}", c.shell0_or, c.shell1_or),
+        ];
+        if r.recovery_level > 0 {
+            parts.push(format!("recovery=L{}", r.recovery_level));
+        }
+        if en.faces_resolved > 0 {
+            parts.push(format!("edge_nbr={}", en.faces_resolved));
+        }
+        if let Some(ref cs) = self.cascade {
+            parts.push(format!("cascade={}", cs.attempts));
+        }
+        format!("[bool-diag] {}", parts.join(" "))
+    }
 }
 
 /// Tolerance values used for a boolean operation.
@@ -130,6 +161,43 @@ pub struct EdgeNeighborReport {
     pub faces_resolved: usize,
 }
 
+/// Pre-heal vertex unification report.
+#[derive(Debug, Clone, Default)]
+pub struct PreHealReport {
+    /// Number of unique vertices before healing.
+    pub vertex_count: usize,
+    /// Number of vertices unified by healing.
+    pub healed_count: usize,
+    /// Whether non-manifold issues were detected.
+    pub non_manifold_detected: bool,
+}
+
+/// Perturbation cascade report from `try_boolean_with_perturbation`.
+#[derive(Debug, Clone, Default)]
+pub struct CascadeReport {
+    /// Total number of attempts made.
+    pub attempts: usize,
+    /// Names of strategies tried.
+    pub strategies_tried: Vec<String>,
+    /// Name of the strategy that succeeded (if any).
+    pub final_strategy: Option<String>,
+    /// Whether the cascade exhausted all attempts.
+    pub exhausted: bool,
+}
+
+/// Classification method summary: how many faces were classified by each method.
+#[derive(Debug, Clone, Default)]
+pub struct ClassificationSummary {
+    /// Faces classified via coplanar overlay.
+    pub faces_by_overlay: usize,
+    /// Faces classified via coplanar fragment test.
+    pub faces_by_coplanar: usize,
+    /// Faces classified via ray-cast.
+    pub faces_by_raycast: usize,
+    /// Faces classified via edge-neighbor propagation.
+    pub faces_by_edge_neighbor: usize,
+}
+
 /// Timing per stage of a boolean operation.
 #[derive(Debug, Clone, Default)]
 pub struct TimingReport {
@@ -145,4 +213,77 @@ pub struct TimingReport {
     pub altshell: Duration,
     /// Total time for the entire boolean operation.
     pub total: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_diagnostics_default_values() {
+        let diag = BooleanDiagnostics::default();
+        assert_eq!(diag.classification.shell0_and, 0);
+        assert_eq!(diag.classification.shell0_or, 0);
+        assert_eq!(diag.classification.shell1_and, 0);
+        assert_eq!(diag.classification.shell1_or, 0);
+        assert_eq!(diag.recovery.recovery_level, 0);
+        assert_eq!(diag.edge_neighbor.faces_resolved, 0);
+        assert!(diag.pre_heal.is_none());
+        assert!(diag.cascade.is_none());
+        assert!(diag.classification_summary.is_none());
+        assert!(diag.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_summary_line_format() {
+        let mut diag = BooleanDiagnostics::default();
+        diag.classification.shell0_and = 3;
+        diag.classification.shell0_or = 5;
+        diag.classification.shell1_and = 2;
+        diag.classification.shell1_or = 4;
+        let line = diag.summary_line();
+        assert!(line.starts_with("[bool-diag] "));
+        assert!(line.contains("faces=14"));
+        assert!(line.contains("and=3+2"));
+        assert!(line.contains("or=5+4"));
+        // No recovery or edge-neighbor info when not used
+        assert!(!line.contains("recovery="));
+        assert!(!line.contains("edge_nbr="));
+    }
+
+    #[test]
+    fn test_summary_line_with_recovery() {
+        let mut diag = BooleanDiagnostics::default();
+        diag.classification.shell0_and = 1;
+        diag.classification.shell1_or = 1;
+        diag.recovery.recovery_level = 3;
+        diag.edge_neighbor.faces_resolved = 2;
+        diag.cascade = Some(CascadeReport {
+            attempts: 5,
+            strategies_tried: vec!["direct".into(), "scale-expand".into()],
+            final_strategy: Some("scale-expand".into()),
+            exhausted: false,
+        });
+        let line = diag.summary_line();
+        assert!(line.contains("recovery=L3"));
+        assert!(line.contains("edge_nbr=2"));
+        assert!(line.contains("cascade=5"));
+    }
+
+    #[test]
+    fn test_pre_heal_report_default() {
+        let report = PreHealReport::default();
+        assert_eq!(report.vertex_count, 0);
+        assert_eq!(report.healed_count, 0);
+        assert!(!report.non_manifold_detected);
+    }
+
+    #[test]
+    fn test_cascade_report_default() {
+        let report = CascadeReport::default();
+        assert_eq!(report.attempts, 0);
+        assert!(report.strategies_tried.is_empty());
+        assert!(report.final_strategy.is_none());
+        assert!(!report.exhausted);
+    }
 }
