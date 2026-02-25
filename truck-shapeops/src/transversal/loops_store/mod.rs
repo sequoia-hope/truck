@@ -873,6 +873,128 @@ where
 
         skip
     };
+
+    // ── Phase 1B: Cross-shell coincident vertex detection ──
+    //
+    // Build a set of vertex positions that appear in both shells within
+    // tolerance. When an IC has both endpoints at known coincident positions,
+    // it likely lies along a shared edge and is degenerate. This supplements
+    // the existing midpoint boundary filter with endpoint-aware detection.
+    let coincident_vertex_positions: Vec<Point3> = {
+        // Collect all boundary vertex positions from each shell.
+        let verts0: Vec<Point3> = (0..store0_len)
+            .flat_map(|i| {
+                geom_shell0[i]
+                    .absolute_boundaries()
+                    .iter()
+                    .flat_map(|w| w.vertex_iter().map(|v| v.point()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let verts1: Vec<Point3> = (0..store1_len)
+            .flat_map(|j| {
+                geom_shell1[j]
+                    .absolute_boundaries()
+                    .iter()
+                    .flat_map(|w| w.vertex_iter().map(|v| v.point()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        // Find positions that appear in both shells within tolerance.
+        // Deduplicate results within tolerance to avoid bloating the set.
+        let mut coincident: Vec<Point3> = Vec::new();
+        for &v0 in &verts0 {
+            for &v1 in &verts1 {
+                if (v0 - v1).magnitude() < tol {
+                    // Use midpoint as the canonical coincident position
+                    let mid = Point3::new(
+                        (v0.x + v1.x) * 0.5,
+                        (v0.y + v1.y) * 0.5,
+                        (v0.z + v1.z) * 0.5,
+                    );
+                    // Deduplicate: don't add if we already have a nearby position
+                    if !coincident.iter().any(|&c| (c - mid).magnitude() < tol) {
+                        coincident.push(mid);
+                    }
+                    break; // Each v0 matches at most one canonical position
+                }
+            }
+        }
+        coincident
+    };
+
+    // ── Phase 1B: Coincident-edge face pair skip set ──
+    //
+    // When face i (shell0) and face j (shell1) share a full coincident edge
+    // (both endpoints match within tolerance), the SSI between them produces
+    // degenerate ICs along the shared edge. Skip these face pairs entirely.
+    // This is safe because:
+    // - If faces share an edge but are not coplanar, their only intersection
+    //   IS the shared edge (for planar faces, this is geometrically guaranteed).
+    // - The shared edge topology is preserved from the input shells.
+    let edge_coincident_skip: rustc_hash::FxHashSet<(usize, usize)> = {
+        let mut skip = rustc_hash::FxHashSet::default();
+        if !coincident_vertex_positions.is_empty() {
+            // Collect edge endpoints per face for both shells.
+            let edges0: Vec<Vec<(Point3, Point3)>> = (0..store0_len)
+                .map(|i| {
+                    geom_shell0[i]
+                        .absolute_boundaries()
+                        .first()
+                        .map(|w| {
+                            w.edge_iter()
+                                .map(|e| (e.front().point(), e.back().point()))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect();
+            let edges1: Vec<Vec<(Point3, Point3)>> = (0..store1_len)
+                .map(|j| {
+                    geom_shell1[j]
+                        .absolute_boundaries()
+                        .first()
+                        .map(|w| {
+                            w.edge_iter()
+                                .map(|e| (e.front().point(), e.back().point()))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect();
+
+            for i in 0..store0_len {
+                for j in 0..store1_len {
+                    // AABB culling
+                    if let (Some(aabb0), Some(aabb1)) = (&aabbs0[i], &aabbs1[j]) {
+                        if !aabbs_overlap(aabb0, aabb1, aabb_margin) {
+                            continue;
+                        }
+                    }
+                    // Already handled by coplanar skip
+                    if coplanar_faces0.contains(&i) && coplanar_faces1.contains(&j) {
+                        continue;
+                    }
+                    // Check if any edge in face i matches any edge in face j
+                    'edge_check: for (f0, b0) in &edges0[i] {
+                        for (f1, b1) in &edges1[j] {
+                            let same_dir =
+                                (*f0 - *f1).magnitude() < tol && (*b0 - *b1).magnitude() < tol;
+                            let opp_dir =
+                                (*f0 - *b1).magnitude() < tol && (*b0 - *f1).magnitude() < tol;
+                            if same_dir || opp_dir {
+                                skip.insert((i, j));
+                                break 'edge_check;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        skip
+    };
+
     (0..store0_len)
         .flat_map(move |i| (0..store1_len).map(move |j| (i, j)))
         .try_for_each(|(face_index0, face_index1)| {
@@ -892,6 +1014,12 @@ where
             // These produce intersection curves that duplicate the coplanar
             // boundary injection, causing non-manifold topology.
             if coplanar_adj_skip.contains(&(face_index0, face_index1)) {
+                return Some(());
+            }
+            // Phase 1B: Skip face pairs that share a coincident edge.
+            // SSI between such pairs produces degenerate ICs along the shared
+            // edge that corrupt loop stores with biangle wires.
+            if edge_coincident_skip.contains(&(face_index0, face_index1)) {
                 return Some(());
             }
             // AABB culling: skip face pairs whose bounding boxes don't overlap.
@@ -957,6 +1085,47 @@ where
                                 .add_independent_loop(BoundaryWire::new(geom_wire, status1));
                         }
                     } else {
+                        // Phase 1C: Skip degenerate short ICs.
+                        // When a vertex of one shell lies on a face of the other,
+                        // the SSI can produce a near-zero-length IC segment.
+                        // These create degenerate edges that corrupt wire topology.
+                        let ic_length: f64 = polyline
+                            .0
+                            .windows(2)
+                            .map(|w| (w[1] - w[0]).magnitude())
+                            .sum();
+                        if ic_length < tol {
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[boolean] Phase 1C: Skipping short IC (length {:.2e} < tol {:.2e})",
+                                ic_length, tol
+                            );
+                            return Some(());
+                        }
+
+                        // Phase 1C: Snap IC endpoints to coincident vertex positions.
+                        // When an IC endpoint is near a known cross-shell coincident
+                        // vertex, snap it to the exact canonical position. This
+                        // prevents numerical noise in SSI from creating near-duplicate
+                        // vertices that lead to non-simple wires.
+                        let mut polyline = polyline;
+                        if !coincident_vertex_positions.is_empty() {
+                            let front = *polyline.0.first().unwrap();
+                            if let Some(&cv) = coincident_vertex_positions
+                                .iter()
+                                .find(|&&cv| (front - cv).magnitude() < tol)
+                            {
+                                *polyline.0.first_mut().unwrap() = cv;
+                            }
+                            let back = *polyline.0.last().unwrap();
+                            if let Some(&cv) = coincident_vertex_positions
+                                .iter()
+                                .find(|&&cv| (back - cv).magnitude() < tol)
+                            {
+                                *polyline.0.last_mut().unwrap() = cv;
+                            }
+                        }
+
                         // Pre-filter degenerate boundary-touching curves BEFORE any
                         // vertex insertion. Coplanar-adjacent intersection curves may
                         // lie along shared boundary edges, corrupting loop stores.
@@ -974,10 +1143,54 @@ where
                         if on_boundary0 && on_boundary1 {
                             return Some(());
                         }
+                        // Phase 1B: Enhanced coincident-vertex IC filtering.
+                        // When BOTH IC endpoints are at known coincident vertex
+                        // positions (shared between shells), the IC lies along a
+                        // shared edge. Use a wider boundary tolerance to catch
+                        // cases where the marching algorithm's numerical noise
+                        // pushes the midpoint slightly off the shared boundary.
+                        if !coincident_vertex_positions.is_empty() {
+                            let front = polyline.front();
+                            let back = polyline.back();
+                            let front_at_cv = coincident_vertex_positions
+                                .iter()
+                                .any(|&cv| (front - cv).magnitude() < tol);
+                            let back_at_cv = coincident_vertex_positions
+                                .iter()
+                                .any(|&cv| (back - cv).magnitude() < tol);
+                            if front_at_cv && back_at_cv {
+                                // Both endpoints at coincident vertices — check
+                                // boundary with wider tolerance.
+                                let wider_tol = boundary_tol * 3.0;
+                                let on_b0 = is_midpoint_on_face_boundary(
+                                    mid,
+                                    &geom_shell0[face_index0],
+                                    wider_tol,
+                                );
+                                let on_b1 = is_midpoint_on_face_boundary(
+                                    mid,
+                                    &geom_shell1[face_index1],
+                                    wider_tol,
+                                );
+                                if on_b0 && on_b1 {
+                                    #[cfg(debug_assertions)]
+                                    eprintln!(
+                                        "[boolean] Phase 1B: Filtering coincident-edge IC \
+                                         (endpoints at coincident vertices, midpoint on boundary)"
+                                    );
+                                    return Some(());
+                                }
+                            }
+                        }
                         // Wrap vertex insertion in a defensive closure: if vertex
                         // projection fails (e.g., at coplanar face boundaries), skip
                         // this curve rather than aborting the entire pipeline.
                         let _ = (|| -> Option<()> {
+                            // Phase 1C: Use snapped polyline endpoints for vertex
+                            // creation. If endpoints were snapped to coincident
+                            // vertex positions above, this ensures add_polygon_vertex
+                            // finds the correct boundary vertex (Front/Back) rather
+                            // than splitting an edge at a near-duplicate position.
                             let pv0 = Vertex::new(polyline.front());
                             let pv1 = Vertex::new(polyline.back());
                             let gv0 = Vertex::new(polyline.front());
