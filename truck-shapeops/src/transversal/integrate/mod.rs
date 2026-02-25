@@ -107,6 +107,8 @@ pub struct BooleanTolerance {
 
 impl BooleanTolerance {
     /// All stages use the same tolerance. Matches legacy single-tol behavior.
+    #[deprecated(note = "Use from_model_tol() for proper per-stage tolerance scaling")]
+    #[allow(dead_code)]
     pub fn uniform(tol: f64) -> Self {
         Self {
             tau_model: tol,
@@ -485,9 +487,9 @@ fn classify_by_edge_neighbors<C: Clone, S: Clone>(
     unresolved: Vec<Face<Point3, C, S>>,
     and_shell: &mut Shell<Point3, C, S>,
     or_shell: &mut Shell<Point3, C, S>,
+    report: Option<&mut diagnostics::EdgeNeighborReport>,
 ) -> std::result::Result<(), BooleanStageError> {
     use rustc_hash::FxHashSet;
-    #[cfg(debug_assertions)]
     let initial_count = unresolved.len();
     #[cfg(debug_assertions)]
     eprintln!(
@@ -495,10 +497,13 @@ fn classify_by_edge_neighbors<C: Clone, S: Clone>(
         initial_count
     );
     let mut remaining = unresolved;
+    let mut rounds_executed = 0u32;
+    let mut faces_resolved = 0usize;
     for _round in 0..10 {
         if remaining.is_empty() {
             break;
         }
+        rounds_executed += 1;
         let mut and_eids: FxHashSet<EdgeID<C>> = FxHashSet::default();
         for f in and_shell.iter() {
             for wire in f.boundaries() {
@@ -533,13 +538,16 @@ fn classify_by_edge_neighbors<C: Clone, S: Clone>(
             if and_adj > or_adj {
                 and_shell.push(face);
                 progress = true;
+                faces_resolved += 1;
             } else if or_adj > and_adj {
                 or_shell.push(face);
                 progress = true;
+                faces_resolved += 1;
             } else if and_adj > 0 {
                 // Tie with both And/Or neighbors: prefer And (intersection boundary).
                 and_shell.push(face);
                 progress = true;
+                faces_resolved += 1;
             } else {
                 next.push(face);
             }
@@ -548,6 +556,11 @@ fn classify_by_edge_neighbors<C: Clone, S: Clone>(
         if !progress {
             break;
         }
+    }
+    if let Some(rpt) = report {
+        rpt.faces_entered = initial_count;
+        rpt.rounds_executed = rounds_executed as usize;
+        rpt.faces_resolved = faces_resolved;
     }
     if !remaining.is_empty() {
         #[cfg(debug_assertions)]
@@ -630,7 +643,7 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
     shell0: &Shell<Point3, C, S>,
     shell1: &Shell<Point3, C, S>,
     tols: &BooleanTolerance,
-    diag: Option<&mut BooleanDiagnostics>,
+    mut diag: Option<&mut BooleanDiagnostics>,
 ) -> std::result::Result<ClassifiedShellBuckets<Point3, C, S>, BooleanStageError> {
     nonpositive_tolerance!(tols.tau_model);
     let _total_start = std::time::Instant::now();
@@ -765,7 +778,12 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
             }
         }
         if !unresolved.is_empty() {
-            classify_by_edge_neighbors(unresolved, &mut and0, &mut or0)?;
+            classify_by_edge_neighbors(
+                unresolved,
+                &mut and0,
+                &mut or0,
+                diag.as_mut().map(|d| &mut d.edge_neighbor),
+            )?;
         }
     }
     #[cfg(debug_assertions)]
@@ -814,7 +832,12 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
             }
         }
         if !unresolved.is_empty() {
-            classify_by_edge_neighbors(unresolved, &mut and1, &mut or1)?;
+            classify_by_edge_neighbors(
+                unresolved,
+                &mut and1,
+                &mut or1,
+                diag.as_mut().map(|d| &mut d.edge_neighbor),
+            )?;
         }
     }
     #[cfg(debug_assertions)]
@@ -859,6 +882,10 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
             tau_area: tols.tau_area,
         };
         diag.classification.faces_coplanar = coplanar_faces0.len() + coplanar_faces1.len();
+        diag.classification.shell0_and = result.and0.len();
+        diag.classification.shell0_or = result.or0.len();
+        diag.classification.shell1_and = result.and1.len();
+        diag.classification.shell1_or = result.or1.len();
         diag.timing.loops_store = _loops_store_elapsed;
         diag.timing.divide_faces = _divide_elapsed - _loops_store_elapsed;
         diag.timing.classification = _classify_elapsed - _divide_elapsed;
@@ -1348,7 +1375,10 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // Phase 0: Position-based vertex unification via spatial grid.
     {
         use truck_base::tolerance::TOLERANCE;
-        let unify_tol = weld_tol.unwrap_or_else(|| (tol * 0.2).max(TOLERANCE.sqrt()));
+        let unify_tol = match weld_tol {
+            Some(wt) => wt.max(TOLERANCE.sqrt()),
+            None => (tol * 0.2).max(TOLERANCE.sqrt()),
+        };
         // Collect all unique vertices (by ID)
         let mut all_verts: Vec<Vertex<Point3>> = Vec::new();
         let mut seen: FxHashSet<Vid> = FxHashSet::default();
@@ -2770,13 +2800,55 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell: &mut Shell<Point3, C, S>,
     tols: &BooleanTolerance,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
+    finalize_boolean_shell_inner(shell, tols, None)
+}
+
+fn finalize_boolean_shell_with_recovery<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell: &mut Shell<Point3, C, S>,
+    tols: &BooleanTolerance,
+    recovery: &mut diagnostics::RecoveryReport,
+) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
+    finalize_boolean_shell_inner(shell, tols, Some(recovery))
+}
+
+/// Populate Euler characteristic in recovery report.
+fn populate_euler<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    recovery: &mut Option<&mut diagnostics::RecoveryReport>,
+    shell: &Shell<Point3, C, S>,
+) {
+    if let Some(ref mut r) = *recovery {
+        match validate_euler_characteristic(shell) {
+            Ok(()) => {
+                r.euler_valid = true;
+                r.euler_chi = 2;
+            }
+            Err((_v, _e, _f, chi)) => {
+                r.euler_valid = false;
+                r.euler_chi = chi;
+            }
+        }
+    }
+}
+
+fn finalize_boolean_shell_inner<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell: &mut Shell<Point3, C, S>,
+    tols: &BooleanTolerance,
+    mut recovery: Option<&mut diagnostics::RecoveryReport>,
+) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
     use truck_topology::shell::ShellCondition;
 
+    // Level 1: use default weld (0.2× tau_model). Using tau_weld (0.4×) here
+    // caused regressions in chained booleans (cut_then_boss_then_cut) where the
+    // wider initial weld merged vertices across small features.
     weld_coincident_edges(shell, tols.tau_model, None);
 
-    #[cfg(debug_assertions)]
     {
         let open = diagnose_open_edges(shell);
+        if let Some(ref mut r) = recovery {
+            r.open_edges_after_weld = open.len();
+            r.recovery_level = 0;
+        }
+        #[cfg(debug_assertions)]
         eprintln!(
             "[finalize] after weld #1: {} faces, {} open edges",
             shell.len(),
@@ -2787,20 +2859,25 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // Try standard assembly
     let boundaries = shell.connected_components();
     if let Ok(solid) = Solid::try_new(boundaries) {
+        populate_euler(&mut recovery, shell);
         return Ok(solid);
     }
 
     // If the shell isn't closed, try wider weld tolerances to close gaps.
-    let wider_tols = [tols.tau_model * 2.0, tols.tau_model * 5.0];
-    for (_i, &wider) in wider_tols.iter().enumerate() {
+    let wider_tols = [tols.tau_weld * 5.0, tols.tau_weld * 12.5];
+    for (i, &wider) in wider_tols.iter().enumerate() {
         weld_coincident_edges(shell, tols.tau_model, Some(wider));
 
-        #[cfg(debug_assertions)]
         {
             let open = diagnose_open_edges(shell);
+            if let Some(ref mut r) = recovery {
+                r.open_edges_after_weld = open.len();
+                r.recovery_level = (i + 1) as u8;
+            }
+            #[cfg(debug_assertions)]
             eprintln!(
                 "[finalize] after weld #{}: {} faces, {} open edges",
-                _i + 2,
+                i + 2,
                 shell.len(),
                 open.len(),
             );
@@ -2808,6 +2885,7 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 
         let boundaries = shell.connected_components();
         if let Ok(solid) = Solid::try_new(boundaries) {
+            populate_euler(&mut recovery, shell);
             return Ok(solid);
         }
     }
@@ -2835,9 +2913,13 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
             }
         }
         if !open_edges.is_empty() {
-            targeted_open_edge_reweld(shell, tols.tau_model * 10.0);
+            if let Some(ref mut r) = recovery {
+                r.recovery_level = 3;
+            }
+            targeted_open_edge_reweld(shell, tols.tau_weld * 25.0);
             let boundaries = shell.connected_components();
             if let Ok(solid) = Solid::try_new(boundaries) {
+                populate_euler(&mut recovery, shell);
                 return Ok(solid);
             }
         }
@@ -2848,15 +2930,19 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // couldn't unify vertices without creating degenerate edges, leaving
     // geometrically-coincident edges with different vertex identities.
     {
+        if let Some(ref mut r) = recovery {
+            r.recovery_level = 4;
+        }
         let reweld_tols = [
-            tols.tau_model * 2.0,
-            tols.tau_model * 5.0,
-            tols.tau_model * 10.0,
+            tols.tau_weld * 5.0,
+            tols.tau_weld * 12.5,
+            tols.tau_weld * 25.0,
         ];
         for &rtol in &reweld_tols {
             position_based_edge_reweld(shell, rtol);
             let boundaries = shell.connected_components();
             if let Ok(solid) = Solid::try_new(boundaries) {
+                populate_euler(&mut recovery, shell);
                 return Ok(solid);
             }
         }
@@ -2867,21 +2953,29 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // original unsplit edge. Split these original edges at interior vertices
     // from the shell, then re-weld to canonicalize the fragments.
     if split_open_edges_at_interior_vertices(shell, tols.tau_model) {
+        if let Some(ref mut r) = recovery {
+            r.recovery_level = 5;
+        }
         weld_coincident_edges(shell, tols.tau_model, None);
         let boundaries = shell.connected_components();
         if let Ok(solid) = Solid::try_new(boundaries) {
+            populate_euler(&mut recovery, shell);
             return Ok(solid);
         }
         // Try wider tolerance
-        weld_coincident_edges(shell, tols.tau_model, Some(tols.tau_model * 5.0));
+        weld_coincident_edges(shell, tols.tau_model, Some(tols.tau_weld * 12.5));
         let boundaries = shell.connected_components();
         if let Ok(solid) = Solid::try_new(boundaries) {
+            populate_euler(&mut recovery, shell);
             return Ok(solid);
         }
 
-        #[cfg(debug_assertions)]
         {
             let open = diagnose_open_edges(shell);
+            if let Some(ref mut r) = recovery {
+                r.open_edges_after_weld = open.len();
+            }
+            #[cfg(debug_assertions)]
             eprintln!(
                 "[finalize] after split propagation + weld: {} open edges",
                 open.len(),
@@ -2889,7 +2983,8 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         }
     }
 
-    // Post-weld Euler validation (debug diagnostic)
+    // Post-weld Euler validation — always populate recovery report
+    populate_euler(&mut recovery, shell);
     #[cfg(debug_assertions)]
     {
         match validate_euler_characteristic(shell) {
@@ -2922,9 +3017,14 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         .iter()
         .all(|s| s.shell_condition() == ShellCondition::Closed);
     if acceptable && all_closed {
+        if let Some(ref mut r) = recovery {
+            r.recovery_level = 6;
+        }
+        populate_euler(&mut recovery, shell);
         return Ok(Solid::new_unchecked(boundaries));
     }
 
+    populate_euler(&mut recovery, shell);
     let boundaries = shell.connected_components();
     Solid::try_new(boundaries)
         .map_err(|e| BooleanStageError::ShellAssembly(format!("Solid::try_new failed: {:?}", e)))
@@ -2936,7 +3036,7 @@ pub fn and_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid1: &Solid<Point3, C, S>,
     tol: f64,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
-    and_result_with_tol(solid0, solid1, &BooleanTolerance::uniform(tol))
+    and_result_with_tol(solid0, solid1, &BooleanTolerance::from_model_tol(tol))
 }
 
 /// AND operation with per-stage tolerance control.
@@ -2966,6 +3066,51 @@ pub fn and_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     })
 }
 
+/// AND operation with per-stage tolerance control, returning diagnostics.
+///
+/// Same as `and_result_with_tol`, but also collects and returns a
+/// `BooleanDiagnostics` report with classification, intersection,
+/// division, and recovery statistics.
+pub fn and_result_with_tol_diag<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    solid1: &Solid<Point3, C, S>,
+    tols: &BooleanTolerance,
+) -> std::result::Result<(Solid<Point3, C, S>, BooleanDiagnostics), BooleanStageError> {
+    with_det_context(|| {
+        let mut diag = BooleanDiagnostics::default();
+        let mut iter0 = solid0.boundaries().iter();
+        let mut iter1 = solid1.boundaries().iter();
+        let shell0 = iter0.next().unwrap();
+        let shell1 = iter1.next().unwrap();
+        let mut classified =
+            classify_one_pair_of_shells_result_with_tol(shell0, shell1, tols, Some(&mut diag))?;
+        let mut and_shell = classified.and0;
+        and_shell.append(&mut classified.and1);
+        for shell in iter0 {
+            let mut classified = classify_one_pair_of_shells_result_with_tol(
+                &and_shell,
+                shell,
+                tols,
+                Some(&mut diag),
+            )?;
+            and_shell = classified.and0;
+            and_shell.append(&mut classified.and1);
+        }
+        for shell in iter1 {
+            let mut classified = classify_one_pair_of_shells_result_with_tol(
+                &and_shell,
+                shell,
+                tols,
+                Some(&mut diag),
+            )?;
+            and_shell = classified.and0;
+            and_shell.append(&mut classified.and1);
+        }
+        let solid = finalize_boolean_shell_with_recovery(&mut and_shell, tols, &mut diag.recovery)?;
+        Ok((solid, diag))
+    })
+}
+
 /// AND operation between two solids.
 pub fn and<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid0: &Solid<Point3, C, S>,
@@ -2990,7 +3135,7 @@ pub fn or_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid1: &Solid<Point3, C, S>,
     tol: f64,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
-    or_result_with_tol(solid0, solid1, &BooleanTolerance::uniform(tol))
+    or_result_with_tol(solid0, solid1, &BooleanTolerance::from_model_tol(tol))
 }
 
 /// OR operation with per-stage tolerance control.
@@ -3019,6 +3164,50 @@ pub fn or_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     })
 }
 
+/// OR operation with per-stage tolerance control, returning diagnostics.
+///
+/// Same as `or_result_with_tol`, but also collects and returns a
+/// `BooleanDiagnostics` report.
+pub fn or_result_with_tol_diag<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    solid1: &Solid<Point3, C, S>,
+    tols: &BooleanTolerance,
+) -> std::result::Result<(Solid<Point3, C, S>, BooleanDiagnostics), BooleanStageError> {
+    with_det_context(|| {
+        let mut diag = BooleanDiagnostics::default();
+        let mut iter0 = solid0.boundaries().iter();
+        let mut iter1 = solid1.boundaries().iter();
+        let shell0 = iter0.next().unwrap();
+        let shell1 = iter1.next().unwrap();
+        let mut classified =
+            classify_one_pair_of_shells_result_with_tol(shell0, shell1, tols, Some(&mut diag))?;
+        let mut or_shell = classified.or0;
+        or_shell.append(&mut classified.or1);
+        for shell in iter0 {
+            let mut classified = classify_one_pair_of_shells_result_with_tol(
+                &or_shell,
+                shell,
+                tols,
+                Some(&mut diag),
+            )?;
+            or_shell = classified.or0;
+            or_shell.append(&mut classified.or1);
+        }
+        for shell in iter1 {
+            let mut classified = classify_one_pair_of_shells_result_with_tol(
+                &or_shell,
+                shell,
+                tols,
+                Some(&mut diag),
+            )?;
+            or_shell = classified.or0;
+            or_shell.append(&mut classified.or1);
+        }
+        let solid = finalize_boolean_shell_with_recovery(&mut or_shell, tols, &mut diag.recovery)?;
+        Ok((solid, diag))
+    })
+}
+
 /// OR operation between two solids.
 pub fn or<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid0: &Solid<Point3, C, S>,
@@ -3044,7 +3233,7 @@ pub fn difference_result<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     solid1: &Solid<Point3, C, S>,
     tol: f64,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
-    difference_result_with_tol(solid0, solid1, &BooleanTolerance::uniform(tol))
+    difference_result_with_tol(solid0, solid1, &BooleanTolerance::from_model_tol(tol))
 }
 
 /// Difference operation with per-stage tolerance control.
@@ -3091,6 +3280,58 @@ pub fn difference_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 
         let mut diff_shell: Shell<Point3, C, S> = all_diff_faces.into_iter().collect();
         finalize_boolean_shell(&mut diff_shell, tols)
+    })
+}
+
+/// Difference operation with per-stage tolerance control, returning diagnostics.
+///
+/// Same as `difference_result_with_tol`, but also collects and returns a
+/// `BooleanDiagnostics` report.
+pub fn difference_result_with_tol_diag<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    solid0: &Solid<Point3, C, S>,
+    solid1: &Solid<Point3, C, S>,
+    tols: &BooleanTolerance,
+) -> std::result::Result<(Solid<Point3, C, S>, BooleanDiagnostics), BooleanStageError> {
+    with_det_context(|| {
+        let mut diag = BooleanDiagnostics::default();
+        let shells0 = solid0.boundaries();
+        let shells1 = solid1.boundaries();
+        let mut all_diff_faces: Vec<Face<Point3, C, S>> = Vec::new();
+
+        for shell0 in shells0.iter() {
+            let mut shell1_iter = shells1.iter();
+            let first_shell1 = shell1_iter.next().unwrap();
+            let ClassifiedShellBuckets { or0, and1, .. } =
+                classify_one_pair_of_shells_result_with_tol(
+                    shell0,
+                    first_shell1,
+                    tols,
+                    Some(&mut diag),
+                )?;
+            let mut diff_faces: Vec<Face<Point3, C, S>> = or0.into_iter().collect();
+            for face in and1.into_iter() {
+                diff_faces.push(face.inverse());
+            }
+            for additional_b in shell1_iter {
+                let diff_shell: Shell<Point3, C, S> = diff_faces.into_iter().collect();
+                let classified = classify_one_pair_of_shells_result_with_tol(
+                    &diff_shell,
+                    additional_b,
+                    tols,
+                    Some(&mut diag),
+                )?;
+                diff_faces = classified.or0.into_iter().collect();
+                for face in classified.and1.into_iter() {
+                    diff_faces.push(face.inverse());
+                }
+            }
+            all_diff_faces.extend(diff_faces);
+        }
+
+        let mut diff_shell: Shell<Point3, C, S> = all_diff_faces.into_iter().collect();
+        let solid =
+            finalize_boolean_shell_with_recovery(&mut diff_shell, tols, &mut diag.recovery)?;
+        Ok((solid, diag))
     })
 }
 

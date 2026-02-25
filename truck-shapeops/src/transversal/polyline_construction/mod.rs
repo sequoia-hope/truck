@@ -6,23 +6,23 @@ use std::collections::VecDeque;
 use truck_base::{cgmath64::*, tolerance::*};
 use truck_meshalgo::prelude::PolylineCurve;
 
-pub fn construct_polylines(lines: &[(Point3, Point3)]) -> Vec<PolylineCurve<Point3>> {
+pub fn construct_polylines(lines: &[(Point3, Point3)], tol: f64) -> Vec<PolylineCurve<Point3>> {
     // Compute adaptive grid spacing from the minimum non-degenerate segment length.
     // This prevents distinct intersection points from collapsing into the same cell
-    // at corner intersections where points are closer together than 2*TOLERANCE.
+    // at corner intersections where points are closer together than 2*tol.
     let min_seg_len = lines
         .iter()
         .map(|(a, b)| {
             let d = b - a;
             (d.x * d.x + d.y * d.y + d.z * d.z).sqrt()
         })
-        .filter(|&len| len > TOLERANCE)
+        .filter(|&len| len > tol)
         .fold(f64::MAX, f64::min);
     let spacing = if min_seg_len < f64::MAX {
-        // Use half the minimum segment length, but never smaller than 2*TOLERANCE
-        (min_seg_len * 0.5).max(2.0 * TOLERANCE)
+        // Use half the minimum segment length, but never smaller than 2*tol
+        (min_seg_len * 0.5).max(2.0 * tol)
     } else {
-        2.0 * TOLERANCE
+        2.0 * tol
     };
 
     let mut graph = Graph::with_spacing(spacing);

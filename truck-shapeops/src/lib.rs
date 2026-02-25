@@ -17,9 +17,10 @@ mod healing;
 pub use healing::{RobustSplitClosedEdgesAndFaces, SplitClosedEdgesAndFaces};
 mod transversal;
 pub use transversal::{
-    and, and_result, and_result_with_tol, and_with_tol, diagnose_open_edges, difference,
-    difference_result, difference_result_with_tol, difference_with_tol, find_non_simple_wires,
-    heal_shell_vertices, or, or_result, or_result_with_tol, or_with_tol,
+    and, and_result, and_result_with_tol, and_result_with_tol_diag, and_with_tol,
+    diagnose_open_edges, difference, difference_result, difference_result_with_tol,
+    difference_result_with_tol_diag, difference_with_tol, find_non_simple_wires,
+    heal_shell_vertices, or, or_result, or_result_with_tol, or_result_with_tol_diag, or_with_tol,
     validate_euler_characteristic, BooleanDiagnostics, BooleanStageError, BooleanTolerance,
     OpenEdgeInfo, ShapeOpsCurve, ShapeOpsSurface,
 };

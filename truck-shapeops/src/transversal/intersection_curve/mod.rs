@@ -1,4 +1,5 @@
 use truck_base::cgmath64::*;
+use truck_base::tolerance::TOLERANCE;
 use truck_geometry::prelude::*;
 use truck_meshalgo::prelude::*;
 
@@ -169,13 +170,16 @@ pub fn intersection_curves<S0, S1>(
     polygon0: &PolygonMesh,
     surface1: S1,
     polygon1: &PolygonMesh,
+    tol: f64,
 ) -> Option<Vec<IntersectionTuple<S0, S1>>>
 where
     S0: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
     S1: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
 {
     let interferences = polygon0.extract_interference(polygon1);
-    let polylines = super::polyline_construction::construct_polylines(&interferences);
+    // Never make polyline grid coarser than the base TOLERANCE
+    let poly_tol = tol.min(TOLERANCE);
+    let polylines = super::polyline_construction::construct_polylines(&interferences, poly_tol);
     polylines
         .into_iter()
         .map(|polyline| {

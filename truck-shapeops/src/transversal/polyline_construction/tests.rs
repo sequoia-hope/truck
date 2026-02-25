@@ -1,4 +1,5 @@
 use super::*;
+use truck_base::tolerance::TOLERANCE;
 
 /// Closed polyline segments in two different orderings must produce
 /// identical vertex sequences after canonicalization.
@@ -17,9 +18,9 @@ fn closed_polyline_direction_canonical() {
     // Reversed direction
     let lines_v3 = vec![(a, d), (d, c), (c, b), (b, a)];
 
-    let poly1 = construct_polylines(&lines_v1);
-    let poly2 = construct_polylines(&lines_v2);
-    let poly3 = construct_polylines(&lines_v3);
+    let poly1 = construct_polylines(&lines_v1, TOLERANCE);
+    let poly2 = construct_polylines(&lines_v2, TOLERANCE);
+    let poly3 = construct_polylines(&lines_v3, TOLERANCE);
 
     assert_eq!(poly1.len(), 1);
     assert_eq!(poly2.len(), 1);
@@ -50,9 +51,9 @@ fn closed_polyline_canonical_3d_triangle() {
     // Starting from different edge
     let lines_rot = vec![(b, c), (c, a), (a, b)];
 
-    let p_fwd = construct_polylines(&lines_fwd);
-    let p_rev = construct_polylines(&lines_rev);
-    let p_rot = construct_polylines(&lines_rot);
+    let p_fwd = construct_polylines(&lines_fwd, TOLERANCE);
+    let p_rev = construct_polylines(&lines_rev, TOLERANCE);
+    let p_rot = construct_polylines(&lines_rot, TOLERANCE);
 
     assert_eq!(p_fwd.len(), 1);
     assert_eq!(p_rev.len(), 1);
@@ -73,7 +74,7 @@ fn deterministic_get_one() {
         (Point3::new(5.0, 5.0, 5.0), Point3::new(6.0, 5.0, 5.0)),
         (Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)),
     ];
-    let poly = construct_polylines(&lines);
+    let poly = construct_polylines(&lines, TOLERANCE);
     assert_eq!(poly.len(), 2);
     // The polyline starting with (0,0,0) should be emitted first
     // because get_one picks lex-smallest PointIndex.
@@ -92,7 +93,7 @@ fn construct_polylines_positive0() {
         (Point3::new(1.0, 1.0, 1.0), Point3::new(0.0, 0.0, 0.0)),
         (Point3::new(1.0, 0.0, 1.0), Point3::new(0.0, 1.0, 1.0)),
     ];
-    let polyline = construct_polylines(&lines);
+    let polyline = construct_polylines(&lines, TOLERANCE);
     assert_eq!(polyline.len(), 1);
     assert_eq!(polyline[0].len(), 9);
 
@@ -123,7 +124,7 @@ fn construct_polylines_positive1() {
         (Point3::new(0.0, 0.0, 1.0), Point3::new(1.0, 0.0, 1.0)),
         (Point3::new(0.0, 1.0, 1.0), Point3::new(0.0, 0.0, 1.0)),
     ];
-    let polyline = construct_polylines(&lines);
+    let polyline = construct_polylines(&lines, TOLERANCE);
     assert_eq!(polyline.len(), 2);
     assert_eq!(polyline[0].len(), 5);
     assert_eq!(polyline[1].len(), 5);
@@ -142,7 +143,7 @@ fn construct_polylines_positive2() {
         (Point3::new(1.0, 1.0, 1.0), Point3::new(0.0, 0.0, 0.0)),
         (Point3::new(1.0, 0.0, 1.0), Point3::new(0.0, 1.0, 1.0)),
     ];
-    let polyline = construct_polylines(&lines);
+    let polyline = construct_polylines(&lines, TOLERANCE);
     assert_eq!(polyline.len(), 1);
     assert_eq!(polyline[0].len(), 9);
 
@@ -173,7 +174,7 @@ fn construct_polylines_positive3() {
         (Point3::new(0.0, 1.0, 0.0), Point3::new(1.0, 1.0, 0.0)),
         (Point3::new(1.0, 0.0, 1.0), Point3::new(0.0, 1.0, 1.0)),
     ];
-    let polyline = construct_polylines(&lines);
+    let polyline = construct_polylines(&lines, TOLERANCE);
     assert_eq!(polyline.len(), 1);
     assert_eq!(polyline[0].len(), 8);
 

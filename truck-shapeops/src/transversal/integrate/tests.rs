@@ -994,6 +994,7 @@ fn test_tolerance_fields_from_model() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_tolerance_uniform_backward_compat() {
     let bt = super::BooleanTolerance::uniform(0.01);
     // uniform mode: all base fields = tol

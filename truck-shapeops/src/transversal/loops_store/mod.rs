@@ -1039,6 +1039,7 @@ where
                 &polygon0,
                 surface1.clone(),
                 &polygon1,
+                tol,
             )?;
             ics.into_iter()
                 .try_for_each(|(polyline, intersection_curve)| {
