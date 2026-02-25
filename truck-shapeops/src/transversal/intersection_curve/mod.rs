@@ -3,6 +3,8 @@ use truck_base::tolerance::TOLERANCE;
 use truck_geometry::prelude::*;
 use truck_meshalgo::prelude::*;
 
+mod analytical;
+
 /// polyline base ntersection curve with parameter
 #[derive(Debug, Clone, derive_more::Deref, derive_more::DerefMut)]
 pub struct IntersectionCurveWithParameters<S0, S1> {
@@ -176,6 +178,12 @@ where
     S0: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
     S1: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
 {
+    // Detect analytical plane-cylinder pair for potential IC refinement.
+    // When detected, mesh-based polyline points are projected onto the exact
+    // intersection curve (ellipse/circle), reducing BSpline drift while
+    // preserving the mesh-based topology (clipping/trimming).
+    let analytical = analytical::try_analytical_plane_cylinder_ic(&surface0, &surface1, tol);
+
     let interferences = polygon0.extract_interference(polygon1);
     // Never make polyline grid coarser than the base TOLERANCE
     let poly_tol = tol.min(TOLERANCE);
@@ -183,12 +191,16 @@ where
     polylines
         .into_iter()
         .map(|polyline| {
+            let refined = match &analytical {
+                Some(a) => analytical::refine_polyline(&polyline, a),
+                None => polyline.clone(),
+            };
             Some((
-                polyline.clone(),
+                refined.clone(),
                 IntersectionCurveWithParameters::try_new(
                     surface0.clone(),
                     surface1.clone(),
-                    polyline,
+                    refined,
                 )?,
             ))
         })
