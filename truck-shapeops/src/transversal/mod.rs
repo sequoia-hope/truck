@@ -67,7 +67,6 @@ pub(crate) fn split_wire_recursive<C: Clone>(
         // Wire is not simple but has no repeated front vertices — this means
         // the non-simplicity comes from position-based coincidence (different
         // vertex IDs at the same position). We can't split by vertex ID.
-        #[cfg(debug_assertions)]
         {
             eprintln!(
                 "[split_wire] depth={}: {} edges, not simple, but no repeated vertex IDs (position-based coincidence?)",
@@ -135,7 +134,6 @@ pub(crate) fn split_wire_recursive<C: Clone>(
         }
     }
 
-    #[cfg(debug_assertions)]
     {
         eprintln!(
             "[split_wire] depth={}: FAILED {} edges, {} repeated verts, closed={}",

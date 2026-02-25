@@ -430,10 +430,9 @@ where
                     }
                     Some((new_face, status))
                 }
-                Err(_e_outer) => {
+                Err(e_outer) => {
                     // Diagnose the failure: individual wire simplicity vs.
                     // inter-wire vertex sharing (disjoint_wires check).
-                    #[cfg(debug_assertions)]
                     {
                         let all_simple = wires.iter().all(|w| w.is_simple());
                         let all_closed = wires.iter().all(|w| w.is_closed());
@@ -441,7 +440,7 @@ where
                         eprintln!(
                             "[boolean] Face::try_new failed: {:?} \
                              (wires={}, all_simple={}, all_closed={}, disjoint={})",
-                            _e_outer,
+                            e_outer,
                             wires.len(),
                             all_simple,
                             all_closed,
@@ -547,7 +546,6 @@ where
                             if !fixed_wires.is_empty()
                                 && fixed_wires.len() < wires.len()
                             {
-                                #[cfg(debug_assertions)]
                                 eprintln!(
                                     "[boolean] Removed {} fully-embedded \
                                      wires, retrying Face::try_new",
@@ -628,8 +626,7 @@ where
                             if let Ok(mut new_face) =
                                 Face::try_new(merged, surface.clone())
                             {
-                                #[cfg(debug_assertions)]
-                                eprintln!(
+                                    eprintln!(
                                     "[boolean] merge+splice recovered face \
                                      ({} wires → {} wires)",
                                     wires.len(),
@@ -720,7 +717,6 @@ where
                 });
 
                 if has_degenerate_loop {
-                    #[cfg(debug_assertions)]
                     eprintln!(
                         "[boolean] Skipping degenerate loop in divide_face \
                          — using undivided face"
@@ -735,7 +731,6 @@ where
                             // Zero fragments — preserve original face as Unknown
                             // so downstream classification (overlay → coplanar →
                             // ray-cast) can determine its status.
-                            #[cfg(debug_assertions)]
                             eprintln!(
                                 "[divide_face] face {} produced 0 fragments \
                                  — preserving as Unknown",
@@ -747,7 +742,6 @@ where
                             res.push(face.clone(), ShapesOpStatus::Unknown);
                         }
                         Some(vec) => {
-                            #[cfg(debug_assertions)]
                             eprintln!(
                                 "[divide_face] face {} produced {} fragments",
                                 idx,
@@ -763,7 +757,6 @@ where
                         None => {
                             // Face division failed — preserve the original face
                             // as Unknown rather than aborting the entire boolean.
-                            #[cfg(debug_assertions)]
                             eprintln!(
                                 "[divide_face] face {} division failed \
                                  — preserving as Unknown",

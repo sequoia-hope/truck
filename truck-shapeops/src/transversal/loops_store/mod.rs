@@ -1064,7 +1064,6 @@ where
                             }
                         };
                         if is_degenerate {
-                            #[cfg(debug_assertions)]
                             eprintln!(
                                 "[boolean] Skipping degenerate closed IC: {} points within tol",
                                 polyline.0.len()
@@ -1096,7 +1095,6 @@ where
                             .map(|w| (w[1] - w[0]).magnitude())
                             .sum();
                         if ic_length < tol {
-                            #[cfg(debug_assertions)]
                             eprintln!(
                                 "[boolean] Phase 1C: Skipping short IC (length {:.2e} < tol {:.2e})",
                                 ic_length, tol
@@ -1174,7 +1172,6 @@ where
                                     wider_tol,
                                 );
                                 if on_b0 && on_b1 {
-                                    #[cfg(debug_assertions)]
                                     eprintln!(
                                         "[boolean] Phase 1B: Filtering coincident-edge IC \
                                          (endpoints at coincident vertices, midpoint on boundary)"
