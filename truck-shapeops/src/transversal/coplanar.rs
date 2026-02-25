@@ -2,6 +2,7 @@ use truck_base::cgmath64::*;
 use truck_topology::*;
 
 use super::integrate::ShapeOpsSurface;
+use super::robust_classify::signed_plane_distance;
 
 /// What to do with a coplanar overlap fragment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,13 +204,17 @@ pub(crate) fn face_sample_info<C, S: ShapeOpsSurface>(
 /// Check whether two faces are coplanar. Returns `Some(same_sense)` if they are,
 /// `None` if not.
 ///
+/// Uses a two-tier approach:
+/// 1. **Exact test**: Constructs a reference plane from info0's point and normal,
+///    tests info1's point via `robust_orient3d`-based `signed_plane_distance`.
+///    If the distance is exactly 0.0, the faces are exactly coplanar (no tolerance
+///    needed for the distance check).
+/// 2. **Tolerance test**: If not exactly coplanar, checks if the normalized
+///    perpendicular distance is within `tol`.
+///
 /// Angular threshold: `(1 - |dot|) > tol²` approximates `angle > tol` radians.
 /// For `tol = 0.025`: threshold = 0.000625 rad ≈ 0.036°.
 /// For `tol = 0.05`: threshold = 0.0025 rad ≈ 0.14°.
-///
-/// The previous `|dot| <= 1.0 - tol` formula was mathematically incorrect for
-/// separated tolerances: with `tol = 0.25` (from 5× model), it would accept
-/// faces at up to ~75° as "parallel", producing false coplanar detections.
 pub(crate) fn check_coplanar(
     info0: &FaceSampleInfo,
     info1: &FaceSampleInfo,
@@ -222,12 +227,32 @@ pub(crate) fn check_coplanar(
     if (1.0 - dot.abs()) > tol * tol {
         return None;
     }
-    // Points must lie on the same plane (use tol directly, not sqrt(tol),
-    // so that faces separated by eps > tol are not falsely detected as coplanar)
-    let d = info0.point - info1.point;
-    if d.dot(info0.normal).abs() >= tol {
-        return None;
+
+    // Construct a reference plane from info0's point and normal.
+    // We need 3 non-collinear points; use the tangent basis to generate them.
+    let (u_axis, v_axis) = make_tangent_basis(info0.normal);
+    let p0 = info0.point;
+    let p1 = p0 + u_axis;
+    let p2 = p0 + v_axis;
+    let a = [p0.x, p0.y, p0.z];
+    let b = [p1.x, p1.y, p1.z];
+    let c = [p2.x, p2.y, p2.z];
+    let d = [info1.point.x, info1.point.y, info1.point.z];
+
+    // Use signed_plane_distance for exact + normalized distance check
+    match signed_plane_distance(a, b, c, d) {
+        Some(0.0) => {
+            // Exactly coplanar — no tolerance needed
+        }
+        Some(dist) if dist.abs() < tol => {
+            // Within tolerance — near-coplanar
+        }
+        _ => {
+            // Too far from plane or degenerate reference triangle
+            return None;
+        }
     }
+
     Some(dot > 0.0)
 }
 

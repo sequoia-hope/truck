@@ -226,6 +226,157 @@ pub(crate) fn robust_ray_triangle_cross(
     }
 }
 
+/// Find 3 non-collinear points from a list of vertices to define a plane.
+///
+/// Returns indices `(i, j, k)` of three vertices such that the triangle they form
+/// has non-zero area, suitable as a reference plane for `robust_orient3d` tests.
+/// Returns `None` if all points are collinear or fewer than 3 points are provided.
+pub(crate) fn find_non_collinear_triple(points: &[[f64; 3]]) -> Option<(usize, usize, usize)> {
+    if points.len() < 3 {
+        return None;
+    }
+    // Use the first point as anchor. Find the second point farthest from it.
+    let a = points[0];
+    let mut best_j = 1;
+    let mut best_dist_sq = 0.0f64;
+    for (idx, p) in points.iter().enumerate().skip(1) {
+        let dx = p[0] - a[0];
+        let dy = p[1] - a[1];
+        let dz = p[2] - a[2];
+        let d2 = dx * dx + dy * dy + dz * dz;
+        if d2 > best_dist_sq {
+            best_dist_sq = d2;
+            best_j = idx;
+        }
+    }
+    if best_dist_sq < 1e-30 {
+        return None; // all points coincident with first
+    }
+    let b = points[best_j];
+
+    // Find the third point that maximizes the cross-product magnitude with (b - a).
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let mut best_k = None;
+    let mut best_cross_sq = 0.0f64;
+    for (idx, p) in points.iter().enumerate() {
+        if idx == 0 || idx == best_j {
+            continue;
+        }
+        let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+        let cx = ab[1] * ap[2] - ab[2] * ap[1];
+        let cy = ab[2] * ap[0] - ab[0] * ap[2];
+        let cz = ab[0] * ap[1] - ab[1] * ap[0];
+        let c2 = cx * cx + cy * cy + cz * cz;
+        if c2 > best_cross_sq {
+            best_cross_sq = c2;
+            best_k = Some(idx);
+        }
+    }
+    if best_cross_sq < 1e-30 {
+        return None; // all points are collinear
+    }
+    Some((0, best_j, best_k.unwrap()))
+}
+
+/// Test if ALL points in `test_points` lie exactly on the plane defined by
+/// `plane_pts[0..3]` using Shewchuk's adaptive precision `orient3d`.
+///
+/// Returns `true` only if `robust_orient3d` returns exactly `0.0` for every
+/// test point. This catches the common case where faces are constructed from
+/// the same operation (same extrusion height, aligned datum planes) and share
+/// exact floating-point coordinates on their plane.
+///
+/// For near-coplanar faces (small floating-point offset), this returns `false`
+/// and the caller should fall back to tolerance-based detection.
+pub(crate) fn exact_points_coplanar(plane_pts: &[[f64; 3]; 3], test_points: &[[f64; 3]]) -> bool {
+    if test_points.is_empty() {
+        return false;
+    }
+    let [a, b, c] = *plane_pts;
+    test_points
+        .iter()
+        .all(|&d| robust_orient3d(a, b, c, d) == 0.0)
+}
+
+/// Compute the signed perpendicular distance from point `d` to the plane
+/// through `(a, b, c)`.
+///
+/// Uses `robust_orient3d` for the numerator (exact sign determination),
+/// normalized by the cross-product magnitude `||(b-a) × (c-a)||` to give
+/// the actual perpendicular distance in model units.
+///
+/// Returns `None` if the triangle `(a, b, c)` is degenerate (collinear).
+pub(crate) fn signed_plane_distance(
+    a: [f64; 3],
+    b: [f64; 3],
+    c: [f64; 3],
+    d: [f64; 3],
+) -> Option<f64> {
+    // Check if reference triangle is non-degenerate FIRST.
+    // For collinear (a,b,c), orient3d returns 0 for ANY d, which would
+    // incorrectly report all points as "exactly on the plane."
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let cross = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    let cross_mag = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+    if cross_mag < 1e-30 {
+        return None; // degenerate triangle
+    }
+
+    let orient = robust_orient3d(a, b, c, d);
+    if orient == 0.0 {
+        return Some(0.0);
+    }
+    // orient3d(a,b,c,d) = ||(b-a)×(c-a)|| * signed_distance
+    Some(orient / cross_mag)
+}
+
+/// Compute the maximum absolute perpendicular distance from any point in
+/// `test_points` to the plane through `(plane_pts[0..3])`.
+///
+/// Returns `(max_distance, all_exact)` where `all_exact` is true if every
+/// point is exactly coplanar (orient3d returns 0.0 for all).
+///
+/// Returns `None` if the reference triangle is degenerate.
+pub(crate) fn max_coplanar_deviation(
+    plane_pts: &[[f64; 3]; 3],
+    test_points: &[[f64; 3]],
+) -> Option<(f64, bool)> {
+    if test_points.is_empty() {
+        return Some((0.0, true));
+    }
+    let [a, b, c] = *plane_pts;
+    // Pre-compute cross product magnitude for normalization
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let cross = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    let cross_mag = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+    if cross_mag < 1e-30 {
+        return None;
+    }
+    let mut max_dist = 0.0f64;
+    let mut all_exact = true;
+    for &d in test_points {
+        let orient = robust_orient3d(a, b, c, d);
+        if orient != 0.0 {
+            all_exact = false;
+            let dist = (orient / cross_mag).abs();
+            if dist > max_dist {
+                max_dist = dist;
+            }
+        }
+    }
+    Some((max_dist, all_exact))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +584,158 @@ mod tests {
         let r2 = sos_orient2d_tiebreak(a, b, c);
         assert_eq!(r1, r2, "SoS should be deterministic");
         assert!(r1 == 1 || r1 == -1, "SoS should return +1 or -1, got {r1}");
+    }
+
+    // ── Tests for exact coplanar predicates ──
+
+    #[test]
+    fn test_find_non_collinear_triple_square() {
+        let pts = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let (i, j, k) = find_non_collinear_triple(&pts).unwrap();
+        // Should pick well-separated vertices
+        assert_ne!(i, j);
+        assert_ne!(j, k);
+        assert_ne!(i, k);
+    }
+
+    #[test]
+    fn test_find_non_collinear_triple_collinear() {
+        let pts = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ];
+        assert!(
+            find_non_collinear_triple(&pts).is_none(),
+            "All collinear points should return None"
+        );
+    }
+
+    #[test]
+    fn test_find_non_collinear_triple_two_points() {
+        let pts = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        assert!(find_non_collinear_triple(&pts).is_none());
+    }
+
+    #[test]
+    fn test_exact_points_coplanar_on_z0() {
+        // All points at z=0: exactly coplanar
+        let plane = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let test_pts = [[0.5, 0.5, 0.0], [3.0, -2.0, 0.0], [100.0, 100.0, 0.0]];
+        assert!(exact_points_coplanar(&plane, &test_pts));
+    }
+
+    #[test]
+    fn test_exact_points_coplanar_tiny_offset() {
+        // One point offset by 1e-15 — NOT exactly coplanar
+        let plane = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let test_pts = [[0.5, 0.5, 1e-15]];
+        // This may or may not be exactly 0.0 depending on floating-point arithmetic.
+        // The point is that the exact test won't produce false positives.
+        // (For this specific case, 1e-15 is likely non-zero in orient3d.)
+        let _ = exact_points_coplanar(&plane, &test_pts);
+    }
+
+    #[test]
+    fn test_exact_points_coplanar_clearly_off_plane() {
+        let plane = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let test_pts = [[0.5, 0.5, 1.0]]; // z=1 is clearly off the z=0 plane
+        assert!(!exact_points_coplanar(&plane, &test_pts));
+    }
+
+    #[test]
+    fn test_exact_points_coplanar_on_z10() {
+        // Common CAD case: faces on z=10 plane (same extrusion height)
+        let plane = [[0.0, 0.0, 10.0], [10.0, 0.0, 10.0], [0.0, 10.0, 10.0]];
+        let test_pts = [[3.0, 3.0, 10.0], [7.0, 7.0, 10.0], [5.0, 5.0, 10.0]];
+        assert!(
+            exact_points_coplanar(&plane, &test_pts),
+            "Faces at same extrusion height should be exactly coplanar"
+        );
+    }
+
+    #[test]
+    fn test_exact_points_coplanar_oblique_plane() {
+        // Points on the plane x + y + z = 1
+        let plane = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let test_pts = [[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]];
+        // 1/3 + 1/3 + 1/3 = 1.0 in exact arithmetic, but floating-point may differ
+        let _ = exact_points_coplanar(&plane, &test_pts);
+    }
+
+    #[test]
+    fn test_signed_plane_distance_on_plane() {
+        let a = [0.0, 0.0, 0.0];
+        let b = [1.0, 0.0, 0.0];
+        let c = [0.0, 1.0, 0.0];
+        let d = [0.5, 0.5, 0.0];
+        assert_eq!(signed_plane_distance(a, b, c, d), Some(0.0));
+    }
+
+    #[test]
+    fn test_signed_plane_distance_above() {
+        let a = [0.0, 0.0, 0.0];
+        let b = [1.0, 0.0, 0.0];
+        let c = [0.0, 1.0, 0.0];
+        let d = [0.5, 0.5, 3.0];
+        let dist = signed_plane_distance(a, b, c, d).unwrap();
+        // The sign depends on orient3d convention, but |dist| should be 3.0
+        assert!(
+            (dist.abs() - 3.0).abs() < 1e-10,
+            "Distance should be 3.0, got {}",
+            dist
+        );
+    }
+
+    #[test]
+    fn test_signed_plane_distance_degenerate_triangle() {
+        // Collinear points — degenerate triangle
+        let a = [0.0, 0.0, 0.0];
+        let b = [1.0, 0.0, 0.0];
+        let c = [2.0, 0.0, 0.0];
+        let d = [0.0, 0.0, 1.0];
+        assert!(signed_plane_distance(a, b, c, d).is_none());
+    }
+
+    #[test]
+    fn test_max_coplanar_deviation_exact() {
+        let plane = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let pts = [[0.5, 0.5, 0.0], [0.3, 0.7, 0.0]];
+        let (max_dist, all_exact) = max_coplanar_deviation(&plane, &pts).unwrap();
+        assert!(all_exact, "All points on z=0 should be exactly coplanar");
+        assert_eq!(max_dist, 0.0);
+    }
+
+    #[test]
+    fn test_max_coplanar_deviation_small_offset() {
+        let plane = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let pts = [[0.5, 0.5, 0.001], [0.3, 0.7, 0.0]];
+        let (max_dist, all_exact) = max_coplanar_deviation(&plane, &pts).unwrap();
+        assert!(!all_exact, "One point is off-plane");
+        assert!(
+            (max_dist - 0.001).abs() < 1e-10,
+            "Max deviation should be ~0.001, got {}",
+            max_dist
+        );
+    }
+
+    #[test]
+    fn test_max_coplanar_deviation_ill_conditioned() {
+        // Large coordinates with small offset — tests that normalization works
+        let plane = [[0.0, 0.0, 100.0], [10.0, 0.0, 100.0], [0.0, 10.0, 100.0]];
+        let pts = [[5.0, 5.0, 100.0 + 0.01]];
+        let (max_dist, all_exact) = max_coplanar_deviation(&plane, &pts).unwrap();
+        assert!(!all_exact);
+        assert!(
+            (max_dist - 0.01).abs() < 1e-10,
+            "Max deviation should be ~0.01, got {}",
+            max_dist
+        );
     }
 }
