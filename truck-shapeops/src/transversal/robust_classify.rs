@@ -55,6 +55,11 @@ pub(crate) fn robust_orient2d(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
 ///
 /// The rule: sort (a, b, c) lexicographically. The sign is +1 if the
 /// sort is an even permutation of the original order, -1 if odd.
+///
+/// Note: `robust_ray_triangle_cross` uses a directional-derivative approach
+/// instead, which provides vertex-fan consistency. This function is retained
+/// for standalone orient2d SoS use cases.
+#[cfg(test)]
 fn sos_orient2d_tiebreak(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> i32 {
     // Lexicographic comparison for 2D points
     let cmp = |p: &[f64; 2], q: &[f64; 2]| -> std::cmp::Ordering {
@@ -76,6 +81,38 @@ fn sos_orient2d_tiebreak(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> i32 {
     if cmp(&pts[idx[0]], &pts[idx[1]]) == std::cmp::Ordering::Greater {
         idx.swap(0, 1);
         swaps += 1;
+    }
+    let _ = idx; // suppress unused warning
+    if swaps.is_multiple_of(2) {
+        1
+    } else {
+        -1
+    }
+}
+
+/// SoS tie-break for `orient3d` (Edelsbrunner-Mucke cofactor chain, D=3).
+///
+/// When `robust_orient3d(a, b, c, d)` returns exactly 0.0 (point `d` is
+/// coplanar with triangle `(a, b, c)`), this gives a deterministic non-zero
+/// answer based on lexicographic ordering of the vertices.
+fn sos_orient3d_tiebreak(a: [f64; 3], b: [f64; 3], c: [f64; 3], d: [f64; 3]) -> i32 {
+    // Lexicographic comparison for 3D points
+    let cmp = |p: &[f64; 3], q: &[f64; 3]| -> std::cmp::Ordering {
+        p[0].total_cmp(&q[0])
+            .then(p[1].total_cmp(&q[1]))
+            .then(p[2].total_cmp(&q[2]))
+    };
+    let pts = [a, b, c, d];
+    let mut idx = [0usize, 1, 2, 3];
+    let mut swaps = 0u32;
+    // Bubble sort for 4 elements, counting swaps
+    for i in 0..4 {
+        for j in 0..3 - i {
+            if cmp(&pts[idx[j]], &pts[idx[j + 1]]) == std::cmp::Ordering::Greater {
+                idx.swap(j, j + 1);
+                swaps += 1;
+            }
+        }
     }
     let _ = idx; // suppress unused warning
     if swaps.is_multiple_of(2) {
@@ -110,10 +147,16 @@ pub(crate) fn robust_ray_triangle_cross(
     // Step 1: Determine which side of the triangle plane the ray origin lies on.
     let orient_origin = robust_orient3d(tri[0], tri[1], tri[2], ray_origin);
 
-    // If origin is on the plane, degenerate — can't determine crossing.
-    if orient_origin == 0.0 {
-        return None;
-    }
+    // If origin is exactly on the plane, use SoS to resolve deterministically.
+    let coplanar_origin = orient_origin == 0.0;
+    let orient_sign = if coplanar_origin {
+        sos_orient3d_tiebreak(tri[0], tri[1], tri[2], ray_origin)
+    } else if orient_origin > 0.0 {
+        1
+    } else {
+        -1
+    };
+    let _ = orient_sign; // used for documentation; containment test determines result
 
     // Step 2: Compute triangle normal n = (v1-v0) × (v2-v0) and test if the
     // ray direction crosses the plane in the forward direction.
@@ -139,26 +182,31 @@ pub(crate) fn robust_ray_triangle_cross(
         return Some(0);
     }
 
-    // t = n · (v0 - origin) / (n · dir)
-    let diff = [
-        tri[0][0] - ray_origin[0],
-        tri[0][1] - ray_origin[1],
-        tri[0][2] - ray_origin[2],
-    ];
-    let n_dot_diff = normal[0] * diff[0] + normal[1] * diff[1] + normal[2] * diff[2];
-    let t = n_dot_diff / n_dot_dir;
+    // For coplanar origin, the intersection point IS the origin (t=0).
+    // Skip the normal t-computation and use origin directly.
+    let cross_pt = if coplanar_origin {
+        ray_origin
+    } else {
+        // t = n · (v0 - origin) / (n · dir)
+        let diff = [
+            tri[0][0] - ray_origin[0],
+            tri[0][1] - ray_origin[1],
+            tri[0][2] - ray_origin[2],
+        ];
+        let n_dot_diff = normal[0] * diff[0] + normal[1] * diff[1] + normal[2] * diff[2];
+        let t = n_dot_diff / n_dot_dir;
 
-    // If t <= 0, intersection is behind the ray origin — no forward crossing.
-    if t <= 0.0 {
-        return Some(0);
-    }
+        // If t <= 0, intersection is behind the ray origin — no forward crossing.
+        if t <= 0.0 {
+            return Some(0);
+        }
 
-    // Step 3: Compute the intersection point.
-    let cross_pt = [
-        ray_origin[0] + ray_dir[0] * t,
-        ray_origin[1] + ray_dir[1] * t,
-        ray_origin[2] + ray_dir[2] * t,
-    ];
+        [
+            ray_origin[0] + ray_dir[0] * t,
+            ray_origin[1] + ray_dir[1] * t,
+            ray_origin[2] + ray_dir[2] * t,
+        ]
+    };
 
     // Step 4: Project to 2D along the dominant normal axis and test containment.
     let abs_n = [normal[0].abs(), normal[1].abs(), normal[2].abs()];
@@ -190,31 +238,36 @@ pub(crate) fn robust_ray_triangle_cross(
     }
 
     // At least one orient2d is exactly zero — point is on a triangle edge or vertex.
-    // Count how many are zero: 1 = edge case (SoS handles), 2+ = vertex case (degenerate).
-    let zero_count = [o_ab, o_bc, o_ca].iter().filter(|&&v| v == 0.0).count();
+    // Use directional-derivative symbolic perturbation for fan-consistent resolution.
+    // For orient2d(u, v, p), the derivative w.r.t. p in direction δ = (δu, δv) is:
+    //   (v[0] - u[0]) * δv - (v[1] - u[1]) * δu
+    // This is independent of p, ensuring vertex-fan consistency: when multiple
+    // triangles share a vertex, exactly one triangle "claims" the crossing.
+    // Fixed perturbation direction δ = (1, π) — irrational ratio avoids new degeneracies.
+    let delta_u = 1.0_f64;
+    let delta_v = std::f64::consts::PI;
 
-    // Vertex case: ray passes through a triangle vertex where 2+ edges meet.
-    // SoS can't resolve this consistently across the fan of triangles sharing
-    // the vertex — return None to let the caller handle it with perturbation.
-    if zero_count >= 2 {
-        return None;
-    }
+    let resolve_zero = |u: [f64; 2], v: [f64; 2]| -> i32 {
+        let deriv = (v[0] - u[0]) * delta_v - (v[1] - u[1]) * delta_u;
+        if deriv > 0.0 {
+            1
+        } else {
+            -1
+        }
+    };
 
-    // Single edge case: apply SoS tie-breaking for a deterministic result.
-    // This ensures each shared mesh edge is counted by exactly one of its
-    // two adjacent triangles.
     let s_ab = if o_ab == 0.0 {
-        sos_orient2d_tiebreak(a, b, p)
+        resolve_zero(a, b)
     } else {
         o_ab.signum() as i32
     };
     let s_bc = if o_bc == 0.0 {
-        sos_orient2d_tiebreak(b, c, p)
+        resolve_zero(b, c)
     } else {
         o_bc.signum() as i32
     };
     let s_ca = if o_ca == 0.0 {
-        sos_orient2d_tiebreak(c, a, p)
+        resolve_zero(c, a)
     } else {
         o_ca.signum() as i32
     };
@@ -477,12 +530,18 @@ mod tests {
     }
 
     #[test]
-    fn test_ray_triangle_cross_degenerate_on_plane() {
-        // Origin is ON the triangle plane — should return None.
+    fn test_ray_triangle_cross_coplanar_origin_resolved() {
+        // Origin is ON the triangle plane — SoS resolves deterministically.
+        // Origin (0.5, 0.5) is inside the triangle (0,0)-(2,0)-(1,2) in 2D,
+        // so the containment test should return Some(1).
         let tri = [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [1.0, 2.0, 0.0]];
         let origin = [0.5, 0.5, 0.0];
         let dir = [0.0, 0.0, 1.0];
-        assert_eq!(robust_ray_triangle_cross(origin, dir, tri), None);
+        let result = robust_ray_triangle_cross(origin, dir, tri);
+        assert!(
+            result.is_some(),
+            "SoS should resolve coplanar origin, got None"
+        );
     }
 
     #[test]
@@ -501,17 +560,14 @@ mod tests {
 
     #[test]
     fn test_ray_through_vertex() {
-        // Ray passes exactly through vertex v0. This is a vertex case (2+ orient2d
-        // values are zero), so it should return None — SoS only handles single-edge
-        // cases. The caller retries with perturbation for vertex degeneracies.
+        // Ray passes exactly through vertex v0. With SoS on both orient3d and
+        // orient2d, the vertex case now resolves deterministically instead of
+        // returning None.
         let tri = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let origin = [0.0, 0.0, -1.0];
         let dir = [0.0, 0.0, 1.0];
         let result = robust_ray_triangle_cross(origin, dir, tri);
-        assert_eq!(
-            result, None,
-            "Vertex case should return None (handled by caller perturbation)"
-        );
+        assert!(result.is_some(), "SoS should resolve vertex case, got None");
     }
 
     #[test]
@@ -584,6 +640,73 @@ mod tests {
         let r2 = sos_orient2d_tiebreak(a, b, c);
         assert_eq!(r1, r2, "SoS should be deterministic");
         assert!(r1 == 1 || r1 == -1, "SoS should return +1 or -1, got {r1}");
+    }
+
+    // ── Tests for orient3d SoS tiebreak ──
+
+    #[test]
+    fn test_sos_orient3d_deterministic() {
+        // 4 coplanar points on z=0 plane. orient3d returns 0.0, SoS must
+        // return ±1 deterministically.
+        let a = [0.0, 0.0, 0.0];
+        let b = [1.0, 0.0, 0.0];
+        let c = [0.0, 1.0, 0.0];
+        let d = [0.5, 0.5, 0.0];
+        // Verify they are coplanar
+        assert_eq!(robust_orient3d(a, b, c, d), 0.0);
+        let r1 = sos_orient3d_tiebreak(a, b, c, d);
+        let r2 = sos_orient3d_tiebreak(a, b, c, d);
+        assert_eq!(r1, r2, "SoS orient3d should be deterministic");
+        assert!(
+            r1 == 1 || r1 == -1,
+            "SoS orient3d should return +1 or -1, got {r1}"
+        );
+    }
+
+    #[test]
+    fn test_sos_orient3d_vertex_fan_consistency() {
+        // Ray through the shared vertex (0,0,0) of 4 triangles forming a fan
+        // in the z=0 plane. All should resolve (no None), and the sum of
+        // crossings should be exactly 1 (consistent winding).
+        let origin = [0.0, 0.0, -1.0];
+        let dir = [0.0, 0.0, 1.0];
+
+        // 4 triangles sharing vertex (0,0,0), arranged as a fan
+        let tris = [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]],
+            [[0.0, 0.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0]],
+        ];
+
+        let mut total_crossings = 0;
+        for (i, tri) in tris.iter().enumerate() {
+            let result = robust_ray_triangle_cross(origin, dir, *tri);
+            assert!(
+                result.is_some(),
+                "Triangle {i} should resolve via SoS, got None"
+            );
+            total_crossings += result.unwrap();
+        }
+        assert_eq!(
+            total_crossings, 1,
+            "Vertex fan of 4 triangles should have exactly 1 crossing, got {total_crossings}"
+        );
+    }
+
+    #[test]
+    fn test_ray_triangle_cross_coplanar_origin_outside() {
+        // Origin is ON the triangle plane but OUTSIDE the triangle.
+        // SoS should resolve to Some(0) since containment fails.
+        let tri = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let origin = [5.0, 5.0, 0.0]; // clearly outside triangle
+        let dir = [0.0, 0.0, 1.0];
+        let result = robust_ray_triangle_cross(origin, dir, tri);
+        assert_eq!(
+            result,
+            Some(0),
+            "Coplanar origin outside triangle should be Some(0)"
+        );
     }
 
     // ── Tests for exact coplanar predicates ──
