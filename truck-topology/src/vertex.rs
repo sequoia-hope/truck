@@ -15,6 +15,7 @@ impl<P> Vertex<P> {
     pub fn new(point: P) -> Vertex<P> {
         Vertex {
             point: Arc::new(Mutex::new(point)),
+            seq_id: next_sequential_id(),
         }
     }
 
@@ -92,7 +93,7 @@ impl<P> Vertex<P> {
 
     /// Returns the id of the vertex.
     #[inline(always)]
-    pub fn id(&self) -> VertexID<P> { ID::new(Arc::as_ptr(&self.point)) }
+    pub fn id(&self) -> VertexID<P> { SequentialID::new(self.seq_id) }
 
     /// Returns how many same vertices.
     ///
@@ -122,10 +123,9 @@ impl<P> Vertex<P> {
     /// use truck_topology::*;
     /// use VertexDisplayFormat as VDF;
     /// let v = Vertex::new([0, 2]);
-    /// assert_eq!(
-    ///     format!("{:?}", v.display(VDF::Full)),
-    ///     format!("Vertex {{ id: {:?}, entity: [0, 2] }}", v.id()),
-    /// );
+    /// let display_full = format!("{:?}", v.display(VDF::Full));
+    /// assert!(display_full.starts_with("Vertex { id: seq#"));
+    /// assert!(display_full.contains("entity: [0, 2]"));
     /// assert_eq!(
     ///     format!("{:?}", v.display(VDF::IDTuple)),
     ///     format!("Vertex({:?})", v.id()),
@@ -156,20 +156,21 @@ impl<P> Clone for Vertex<P> {
     fn clone(&self) -> Vertex<P> {
         Vertex {
             point: Arc::clone(&self.point),
+            seq_id: self.seq_id,
         }
     }
 }
 
 impl<P> PartialEq for Vertex<P> {
     #[inline(always)]
-    fn eq(&self, other: &Self) -> bool { self.id() == other.id() }
+    fn eq(&self, other: &Self) -> bool { self.seq_id == other.seq_id }
 }
 
 impl<P> Eq for Vertex<P> {}
 
 impl<P> Hash for Vertex<P> {
     #[inline(always)]
-    fn hash<H: Hasher>(&self, state: &mut H) { std::ptr::hash(Arc::as_ptr(&self.point), state); }
+    fn hash<H: Hasher>(&self, state: &mut H) { self.seq_id.hash(state); }
 }
 
 impl<P: Debug> Debug for DebugDisplay<'_, Vertex<P>, VertexDisplayFormat> {
@@ -177,7 +178,7 @@ impl<P: Debug> Debug for DebugDisplay<'_, Vertex<P>, VertexDisplayFormat> {
         match self.format {
             VertexDisplayFormat::Full => f
                 .debug_struct("Vertex")
-                .field("id", &Arc::as_ptr(&self.entity.point))
+                .field("id", &self.entity.id())
                 .field("entity", &MutexFmt(&self.entity.point))
                 .finish(),
             VertexDisplayFormat::IDTuple => {

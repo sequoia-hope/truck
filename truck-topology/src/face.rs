@@ -62,6 +62,7 @@ impl<P, C, S> Face<P, C, S> {
             boundaries,
             orientation: true,
             surface: Arc::new(Mutex::new(surface)),
+            seq_id: next_sequential_id(),
         }
     }
 
@@ -178,6 +179,7 @@ impl<P, C, S> Face<P, C, S> {
             boundaries: self.boundaries.clone(),
             surface: Arc::clone(&self.surface),
             orientation: true,
+            seq_id: self.seq_id,
         }
     }
 
@@ -216,6 +218,7 @@ impl<P, C, S> Face<P, C, S> {
     where S: Clone {
         let surface = self.surface();
         self.surface = Arc::new(Mutex::new(surface));
+        self.seq_id = next_sequential_id();
     }
 
     /// Returns an iterator over the edges.
@@ -607,7 +610,7 @@ impl<P, C, S> Face<P, C, S> {
     /// assert_ne!(face0.id(), face2.id());
     /// ```
     #[inline(always)]
-    pub fn id(&self) -> FaceID<S> { ID::new(Arc::as_ptr(&self.surface)) }
+    pub fn id(&self) -> FaceID<S> { SequentialID::new(self.seq_id) }
 
     /// Returns how many same faces.
     ///
@@ -877,6 +880,7 @@ impl<P, C, S> Face<P, C, S> {
             boundaries: self.boundaries.clone(),
             orientation: self.orientation,
             surface: Arc::new(Mutex::new(self.surface())),
+            seq_id: next_sequential_id(),
         };
         let boundary = &mut face0.boundaries[0];
         let i = boundary
@@ -900,6 +904,7 @@ impl<P, C, S> Face<P, C, S> {
             boundaries: vec![new_wire],
             orientation: self.orientation,
             surface: Arc::new(Mutex::new(self.surface())),
+            seq_id: next_sequential_id(),
         };
         Some((face0, face1))
     }
@@ -1001,6 +1006,7 @@ impl<P, C, S> Face<P, C, S> {
             boundaries,
             orientation: self.orientation(),
             surface: Arc::new(Mutex::new(surface)),
+            seq_id: next_sequential_id(),
         })
     }
 
@@ -1108,6 +1114,7 @@ impl<P, C, S> Clone for Face<P, C, S> {
             boundaries: self.boundaries.clone(),
             orientation: self.orientation,
             surface: Arc::clone(&self.surface),
+            seq_id: self.seq_id,
         }
     }
 }
@@ -1115,8 +1122,7 @@ impl<P, C, S> Clone for Face<P, C, S> {
 impl<P, C, S> PartialEq for Face<P, C, S> {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(Arc::as_ptr(&self.surface), Arc::as_ptr(&other.surface))
-            && self.orientation == other.orientation
+        self.seq_id == other.seq_id && self.orientation == other.orientation
     }
 }
 
@@ -1125,7 +1131,7 @@ impl<P, C, S> Eq for Face<P, C, S> {}
 impl<P, C, S> Hash for Face<P, C, S> {
     #[inline(always)]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        std::ptr::hash(Arc::as_ptr(&self.surface), state);
+        self.seq_id.hash(state);
         self.orientation.hash(state);
     }
 }

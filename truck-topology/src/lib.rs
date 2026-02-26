@@ -85,7 +85,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
-use truck_base::{id::ID, tolerance::*};
+use truck_base::{SequentialID, next_sequential_id, tolerance::*};
 use truck_geotrait::*;
 
 #[cfg(feature = "rclite")]
@@ -108,6 +108,7 @@ const SEARCH_PARAMETER_TRIALS: usize = 100;
 #[derive(Debug)]
 pub struct Vertex<P> {
     point: Arc<Mutex<P>>,
+    seq_id: u64,
 }
 
 /// Edge, which consists two vertices.
@@ -127,6 +128,7 @@ pub struct Edge<P, C> {
     vertices: (Vertex<P>, Vertex<P>),
     orientation: bool,
     curve: Arc<Mutex<C>>,
+    seq_id: u64,
 }
 
 /// Wire, a path or cycle which consists some edges.
@@ -158,6 +160,7 @@ pub struct Face<P, C, S> {
     boundaries: Vec<Wire<P, C>>,
     orientation: bool,
     surface: Arc<Mutex<S>>,
+    seq_id: u64,
 }
 
 /// Shell, a connected compounded faces.
@@ -189,22 +192,9 @@ impl<T> RemoveTry<T> for Result<T> {
 
 /// The id of vertex. `Copy` trait is implemented.
 /// # Details
-/// Since this struct is implemented `Copy` trait,
-/// it is useful to use as a key of hashmaps.
-/// ```
-/// use truck_topology::*;
-/// use std::collections::HashMap;
-///
-/// let v = Vertex::new(0);
-/// let v_id = v.id();
-///
-/// let mut entity_map = HashMap::new();
-/// let mut id_map = HashMap::new();
-///
-/// entity_map.insert(v.clone(), 0); // v must be cloned for sign up the hashmap.
-/// id_map.insert(v_id, 0); // v_id is implemented Copy trait!
-/// ```
-/// The id does not changed even if the value of point changes.
+/// Sequential deterministic ID assigned at vertex creation time.
+/// Since this struct implements `Copy`, it is useful as a key of hashmaps.
+/// The id does not change even if the value of point changes.
 /// ```
 /// use truck_topology::*;
 /// let v = Vertex::new(0);
@@ -218,7 +208,7 @@ impl<T> RemoveTry<T> for Result<T> {
 /// assert_ne!(entity, v.point());
 /// assert_eq!(v_id, v.id());
 /// ```
-pub type VertexID<P> = ID<Mutex<P>>;
+pub type VertexID<P> = SequentialID<Mutex<P>>;
 
 /// The id that does not depend on the direction of the edge.
 /// # Examples
@@ -230,7 +220,7 @@ pub type VertexID<P> = ID<Mutex<P>>;
 /// assert_ne!(edge0, edge1);
 /// assert_eq!(edge0.id(), edge1.id());
 /// ```
-pub type EdgeID<C> = ID<Mutex<C>>;
+pub type EdgeID<C> = SequentialID<Mutex<C>>;
 
 /// The id that does not depend on the direction of the face.
 /// # Examples
@@ -250,7 +240,7 @@ pub type EdgeID<C> = ID<Mutex<C>>;
 /// assert_eq!(face0.id(), face1.id());
 /// assert_ne!(face0.id(), face2.id());
 /// ```
-pub type FaceID<S> = ID<Mutex<S>>;
+pub type FaceID<S> = SequentialID<Mutex<S>>;
 
 /// configuration for vertex display format.
 #[derive(Clone, Copy, Debug)]

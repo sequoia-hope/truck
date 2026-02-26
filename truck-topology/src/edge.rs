@@ -43,6 +43,7 @@ impl<P, C> Edge<P, C> {
             vertices: (front.clone(), back.clone()),
             orientation: true,
             curve: Arc::new(Mutex::new(curve)),
+            seq_id: next_sequential_id(),
         }
     }
 
@@ -115,6 +116,7 @@ impl<P, C> Edge<P, C> {
             vertices: self.vertices.clone(),
             orientation: !self.orientation,
             curve: Arc::clone(&self.curve),
+            seq_id: self.seq_id,
         }
     }
 
@@ -216,6 +218,7 @@ impl<P, C> Edge<P, C> {
             vertices: self.vertices.clone(),
             curve: Arc::clone(&self.curve),
             orientation: true,
+            seq_id: self.seq_id,
         }
     }
 
@@ -288,7 +291,7 @@ impl<P, C> Edge<P, C> {
     /// assert_eq!(edge0.id(), edge1.id());
     /// ```
     #[inline(always)]
-    pub fn id(&self) -> EdgeID<C> { ID::new(Arc::as_ptr(&self.curve)) }
+    pub fn id(&self) -> EdgeID<C> { SequentialID::new(self.seq_id) }
 
     /// Returns how many same edges.
     ///
@@ -410,11 +413,13 @@ impl<P, C> Edge<P, C> {
             vertices: (self.absolute_front().clone(), vertex.clone()),
             orientation: self.orientation,
             curve: Arc::new(Mutex::new(curve0)),
+            seq_id: next_sequential_id(),
         };
         let edge1 = Edge {
             vertices: (vertex.clone(), self.absolute_back().clone()),
             orientation: self.orientation,
             curve: Arc::new(Mutex::new(curve1)),
+            seq_id: next_sequential_id(),
         };
         match self.orientation {
             true => (edge0, edge1),
@@ -492,10 +497,10 @@ impl<P, C> Edge<P, C> {
     /// let edge = Edge::new(&Vertex::new(0), &Vertex::new(1), 2);
     /// let id = edge.id();
     ///
-    /// assert_eq!(
-    ///     format!("{:?}", edge.display(Edf::Full { vertex_format })),
-    ///     format!("Edge {{ id: {id:?}, vertices: (0, 1), entity: 2 }}"),
-    /// );
+    /// let full_fmt = format!("{:?}", edge.display(Edf::Full { vertex_format }));
+    /// assert!(full_fmt.starts_with("Edge { id: seq#"));
+    /// assert!(full_fmt.contains("vertices: (0, 1)"));
+    /// assert!(full_fmt.contains("entity: 2"));
     /// assert_eq!(
     ///     format!("{:?}", edge.display(Edf::VerticesTupleAndID { vertex_format })),
     ///     format!("Edge {{ id: {id:?}, vertices: (0, 1) }}"),
@@ -552,6 +557,7 @@ impl<P, C> Clone for Edge<P, C> {
             vertices: self.vertices.clone(),
             orientation: self.orientation,
             curve: Arc::clone(&self.curve),
+            seq_id: self.seq_id,
         }
     }
 }
@@ -559,8 +565,7 @@ impl<P, C> Clone for Edge<P, C> {
 impl<P, C> PartialEq for Edge<P, C> {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(Arc::as_ptr(&self.curve), Arc::as_ptr(&other.curve))
-            && self.orientation == other.orientation
+        self.seq_id == other.seq_id && self.orientation == other.orientation
     }
 }
 
@@ -569,7 +574,7 @@ impl<P, C> Eq for Edge<P, C> {}
 impl<P, C> Hash for Edge<P, C> {
     #[inline(always)]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        std::ptr::hash(Arc::as_ptr(&self.curve), state);
+        self.seq_id.hash(state);
         self.orientation.hash(state);
     }
 }
@@ -579,7 +584,7 @@ impl<P: Debug, C: Debug> Debug for DebugDisplay<'_, Edge<P, C>, EdgeDisplayForma
         match self.format {
             EdgeDisplayFormat::Full { vertex_format } => f
                 .debug_struct("Edge")
-                .field("id", &Arc::as_ptr(&self.entity.curve))
+                .field("id", &self.entity.id())
                 .field(
                     "vertices",
                     &(

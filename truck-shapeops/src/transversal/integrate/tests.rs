@@ -1014,58 +1014,16 @@ fn test_diagnostics_default() {
 }
 
 // ---------------------------------------------------------------------------
-// DetId tests
+// Deterministic ordering tests
 // ---------------------------------------------------------------------------
+// Note: with_det_context and assign_vertex_det_ids have been removed.
+// SequentialID provides deterministic ordering natively via seq_id fields
+// on Vertex, Edge, and Face, so no explicit context wrapper is needed.
 
 #[test]
-fn test_with_det_context_scoped() {
-    use truck_base::id::DetContext;
-    // Outside any context, assign_vertex_det_ids still works (fallback).
-    let v = builder::vertex(Point3::origin());
-    let e = builder::tsweep(&v, Vector3::unit_x());
-    let f = builder::tsweep(&e, Vector3::unit_y());
-    let cube: Solid = builder::tsweep(&f, Vector3::unit_z());
-    let shell = &cube.boundaries()[0];
-
-    let det_map = super::assign_vertex_det_ids(shell);
-    assert!(!det_map.is_empty(), "Should assign IDs to all vertices");
-
-    // Inside a det context, IDs are sequential from 0.
-    super::with_det_context(|| {
-        let det_map2 = super::assign_vertex_det_ids(shell);
-        assert_eq!(det_map2.len(), det_map.len());
-        // All IDs should be sequential starting from 0
-        let mut ids: Vec<u64> = det_map2.values().map(|d| d.raw()).collect();
-        ids.sort();
-        ids.dedup();
-        assert_eq!(ids.len(), det_map2.len(), "All IDs should be unique");
-        assert_eq!(ids[0], 0, "First DetId should be 0");
-    });
-}
-
-#[test]
-fn test_det_context_deterministic_vertex_ordering() {
-    // Run assign_vertex_det_ids twice on the same shell and verify
-    // the same (Vid → DetId) mapping is produced.
-    let v = builder::vertex(Point3::origin());
-    let e = builder::tsweep(&v, Vector3::unit_x());
-    let f = builder::tsweep(&e, Vector3::unit_y());
-    let cube: Solid = builder::tsweep(&f, Vector3::unit_z());
-    let shell = &cube.boundaries()[0];
-
-    let map1 = super::with_det_context(|| super::assign_vertex_det_ids(shell));
-    let map2 = super::with_det_context(|| super::assign_vertex_det_ids(shell));
-
-    // Same Vid keys should get same DetId values
-    for (vid, det1) in &map1 {
-        let det2 = map2.get(vid).expect("Same vertices should be present");
-        assert_eq!(det1, det2, "Same Vid should get same DetId across contexts");
-    }
-}
-
-#[test]
-fn test_boolean_with_det_context_box_union() {
-    // Verify that boolean operations run successfully with DetId context.
+fn test_boolean_deterministic_box_union() {
+    // Verify that boolean operations run successfully with deterministic
+    // SequentialID-based ordering.
     let v = builder::vertex(Point3::origin());
     let e = builder::tsweep(&v, Vector3::unit_x());
     let f = builder::tsweep(&e, Vector3::unit_y());
@@ -1076,15 +1034,12 @@ fn test_boolean_with_det_context_box_union() {
     let f2 = builder::tsweep(&e2, Vector3::unit_y() * 0.5);
     let boss: Solid = builder::tsweep(&f2, Vector3::unit_z() * 0.5);
 
-    // OR (coplanar) and AND should succeed with DetId context
+    // OR (coplanar) and AND should succeed
     let or_result = crate::or(&cube, &boss, 0.05);
-    assert!(or_result.is_some(), "OR with DetId context should succeed");
+    assert!(or_result.is_some(), "OR should succeed");
 
     let and_result = crate::and(&cube, &boss, 0.05);
-    assert!(
-        and_result.is_some(),
-        "AND with DetId context should succeed"
-    );
+    assert!(and_result.is_some(), "AND should succeed");
 
     // Difference with fully-enclosed tool (non-degenerate)
     let v3 = builder::vertex(Point3::new(0.25, 0.25, 0.25));
@@ -1093,10 +1048,7 @@ fn test_boolean_with_det_context_box_union() {
     let inner: Solid = builder::tsweep(&f3, Vector3::unit_z() * 0.5);
 
     let diff_result = crate::difference(&cube, &inner, 0.05);
-    assert!(
-        diff_result.is_some(),
-        "Difference with DetId context should succeed"
-    );
+    assert!(diff_result.is_some(), "Difference should succeed");
 }
 
 #[test]

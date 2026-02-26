@@ -10,6 +10,7 @@ mod intersection_curve;
 mod loops_store;
 mod polyline_construction;
 pub(crate) mod robust_classify;
+pub(crate) mod winding;
 pub use diagnostics::BooleanDiagnostics;
 pub use integrate::{
     and, and_result, and_result_with_tol, and_result_with_tol_diag, and_with_tol,

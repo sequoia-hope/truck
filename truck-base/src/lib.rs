@@ -27,7 +27,7 @@ pub mod entry_map;
 pub mod hash;
 /// ID structure with `Copy`, `Hash` and `Eq` using raw pointers, plus deterministic IDs
 pub mod id;
-pub use id::{DetContext, DetId};
+pub use id::{DetContext, DetId, SequentialID, next_sequential_id, reset_id_sequence, current_sequence_value};
 pub mod newton;
 /// Setting Tolerance
 pub mod tolerance;
