@@ -178,11 +178,13 @@ where
     S0: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
     S1: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
 {
-    // Detect analytical plane-cylinder pair for potential IC refinement.
+    // Detect analytical surface pair for potential IC refinement.
     // When detected, mesh-based polyline points are projected onto the exact
     // intersection curve (ellipse/circle), reducing BSpline drift while
     // preserving the mesh-based topology (clipping/trimming).
-    let analytical = analytical::try_analytical_plane_cylinder_ic(&surface0, &surface1, tol);
+    // Try plane-cylinder first, then plane-cone.
+    let analytical = analytical::try_analytical_plane_cylinder_ic(&surface0, &surface1, tol)
+        .or_else(|| analytical::try_analytical_plane_cone_ic(&surface0, &surface1, tol));
 
     let interferences = polygon0.extract_interference(polygon1);
     // Never make polyline grid coarser than the base TOLERANCE
