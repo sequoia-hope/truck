@@ -3,9 +3,8 @@
 use super::face_boundary_graph::divide_one_face_graph;
 use super::faces_classification::FacesClassification;
 use super::loops_store::*;
-// Order-insensitive: HashMap is used for polyline caching (EdgeID -> PolylineCurve)
-// and adjacency lookup in rebuild_connected_wires (dead code). Face division iterates
-// over shells (Vec) in index order.
+// Order-insensitive: HashMap is used for polyline caching (EdgeID -> PolylineCurve).
+// Face division iterates over shells (Vec) in index order.
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,7 +15,6 @@ static GRAPH_SUCCESS: AtomicUsize = AtomicUsize::new(0);
 static GRAPH_FALLBACK: AtomicUsize = AtomicUsize::new(0);
 
 /// Returns (graph_successes, graph_fallbacks) counters for v2 face division.
-#[allow(dead_code)]
 pub fn v2_face_division_stats() -> (usize, usize) {
     (
         GRAPH_SUCCESS.load(Ordering::Relaxed),
@@ -36,158 +34,22 @@ where
     C: BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
     S: Clone + SearchParameter<D2, Point = Point3>,
 {
-    // Only try FBG when there are actual IC edges (non-Unknown status).
+    // Try FBG (face boundary graph) as primary when there are IC edges.
+    // FBG must produce at least 2 fragments (actual face split) to be accepted.
+    // A single fragment means no split occurred — fall back to legacy which
+    // handles partial IC paths (T-junctions, partial crossings) better.
     let has_ic = loops.iter().any(|w| w.status() != ShapesOpStatus::Unknown);
     if has_ic {
-        // Run FBG in shadow mode: compute result but don't use it yet.
-        // This lets us measure success rates without risking regressions.
         if let Some(result) = divide_one_face_graph(face, loops, tol, tau_area) {
-            if !result.is_empty() {
+            if result.len() >= 2 {
                 GRAPH_SUCCESS.fetch_add(1, Ordering::Relaxed);
-                eprintln!(
-                    "[FBG] shadow success: {} fragments (legacy fallback used)",
-                    result.len(),
-                );
+                return Some(result);
             }
-        } else {
-            GRAPH_FALLBACK.fetch_add(1, Ordering::Relaxed);
         }
+        GRAPH_FALLBACK.fetch_add(1, Ordering::Relaxed);
     }
-    // Always use legacy path for now — FBG runs in shadow mode.
+    // FBG failed, produced < 2 fragments, or no IC edges — fall back to legacy
     divide_one_face(face, loops, tol, tau_area)
-}
-
-/// Try to rebuild connected closed wires from a pool of edges.
-///
-/// When loops_store produces wires with connectivity issues (gaps, wrong
-/// orientations, or mixed-up edges), this function collects all edges
-/// and reconstructs proper closed wires by graph traversal. Each edge
-/// can be traversed in either direction. Matching uses vertex IDs first,
-/// then falls back to position proximity.
-#[allow(dead_code)]
-fn rebuild_connected_wires<C>(wires: &[Wire<Point3, C>], tol: f64) -> Option<Vec<Wire<Point3, C>>>
-where
-    C: Clone + BoundedCurve<Point = Point3>,
-{
-    // Collect all edges into a pool with both possible directions
-    type Vid = VertexID<Point3>;
-    let mut all_edges: Vec<(Edge<Point3, C>, bool)> = Vec::new(); // (abs_edge, used)
-    for wire in wires {
-        for edge in wire.iter() {
-            all_edges.push((edge.absolute_clone(), false));
-        }
-    }
-
-    if all_edges.is_empty() {
-        return None;
-    }
-
-    // Build adjacency: vertex_id -> list of (edge_index, is_forward, other_vertex_id)
-    let mut adjacency: HashMap<Vid, Vec<(usize, bool, Vid)>> = HashMap::default();
-    for (i, (edge, _)) in all_edges.iter().enumerate() {
-        let fid = edge.front().id();
-        let bid = edge.back().id();
-        adjacency.entry(fid).or_default().push((i, true, bid)); // forward: fid → bid
-        adjacency.entry(bid).or_default().push((i, false, fid)); // backward: bid → fid
-    }
-
-    let mut result_wires: Vec<Wire<Point3, C>> = Vec::new();
-    let n = all_edges.len();
-
-    // Try to build closed wires
-    while let Some(start_idx) = all_edges.iter().position(|(_, used)| !*used) {
-        all_edges[start_idx].1 = true;
-        let start_edge = &all_edges[start_idx].0;
-        let start_vid = start_edge.front().id();
-        let mut current_vid = start_edge.back().id();
-        let mut wire_edges: Vec<Edge<Point3, C>> = vec![start_edge.clone()];
-
-        // Follow the chain until we close the loop or get stuck
-        let mut stuck = false;
-        while current_vid != start_vid {
-            if wire_edges.len() > n {
-                stuck = true;
-                break;
-            }
-
-            // Find an unused edge starting at current_vid
-            let next = adjacency
-                .get(&current_vid)
-                .and_then(|adj| adj.iter().find(|(idx, _, _)| !all_edges[*idx].1))
-                .copied();
-
-            match next {
-                Some((idx, forward, next_vid)) => {
-                    all_edges[idx].1 = true;
-                    let edge = &all_edges[idx].0;
-                    if forward {
-                        wire_edges.push(edge.clone());
-                    } else {
-                        wire_edges.push(edge.inverse());
-                    }
-                    current_vid = next_vid;
-                }
-                None => {
-                    // Try position-based fallback: find an unused edge with
-                    // a vertex near current position
-                    let current_pos = {
-                        // Find the point for current_vid
-                        let last_edge = wire_edges.last().unwrap();
-                        last_edge.back().point()
-                    };
-                    let found = all_edges
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, (_, used))| !*used)
-                        .find_map(|(idx, (edge, _))| {
-                            let fp = edge.front().point();
-                            let bp = edge.back().point();
-                            if (fp - current_pos).magnitude() < tol {
-                                Some((idx, true, edge.back().id()))
-                            } else if (bp - current_pos).magnitude() < tol {
-                                Some((idx, false, edge.front().id()))
-                            } else {
-                                None
-                            }
-                        });
-                    match found {
-                        Some((idx, forward, next_vid)) => {
-                            all_edges[idx].1 = true;
-                            let edge = &all_edges[idx].0;
-                            if forward {
-                                wire_edges.push(edge.clone());
-                            } else {
-                                wire_edges.push(edge.inverse());
-                            }
-                            current_vid = next_vid;
-                        }
-                        None => {
-                            stuck = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        if stuck {
-            // Couldn't build a closed wire — bail out
-            return None;
-        }
-
-        let wire: Wire<Point3, C> = wire_edges.into_iter().collect();
-        if wire.is_closed() {
-            result_wires.push(wire);
-        } else {
-            return None;
-        }
-    }
-
-    if result_wires.is_empty() {
-        return None;
-    }
-
-    Some(result_wires)
 }
 
 /// Merge wires that share vertex IDs into composite figure-8 wires, then split

@@ -1,3 +1,6 @@
+// Phase 1 infrastructure — not yet wired into the boolean hot path.
+#![allow(dead_code)]
+
 //! IC-edge crossing computation and pave block assembly.
 //!
 //! This module computes explicit intersection records between IC polylines

@@ -117,14 +117,23 @@ impl<C: Clone> FaceBoundaryGraph<C> {
                     continue;
                 }
 
-                // Check if we already have a half-edge pair for this edge.
-                // (The same edge can appear in multiple wires, e.g., a boundary
-                // edge shared between the original wire and an IC wire.)
+                // Check if we already have a half-edge for this edge direction.
+                // This happens when an IC edge appears in two BoundaryWires with
+                // complementary statuses (And wire uses forward, Or wire uses inverse).
                 let edge_id = edge.id();
-                let already_exists = half_edges
+                let edge_ori = edge.orientation();
+
+                let existing_idx = half_edges
                     .iter()
-                    .any(|he| he.edge.id() == edge_id && he.forward == edge.orientation());
-                if already_exists {
+                    .position(|he| he.edge.id() == edge_id && he.forward == edge_ori);
+
+                if let Some(idx) = existing_idx {
+                    // Update the found half-edge's status from the second wire.
+                    // The first wire set both HEs to its status; this corrects the
+                    // reverse HE to use the second wire's (complementary) status.
+                    if status != ShapesOpStatus::Unknown {
+                        half_edges[idx].status = status;
+                    }
                     continue;
                 }
 
@@ -167,6 +176,14 @@ impl<C: Clone> FaceBoundaryGraph<C> {
         graph.build_outgoing();
         graph.radial_sort(tol);
 
+        // Check connectivity: FBG only works correctly when all wires share
+        // vertices (IC edges connect boundary and IC wires). Disconnected
+        // components (e.g., a hole wire with no shared vertices) produce
+        // spurious fragments. Fall back to legacy for disconnected graphs.
+        if !graph.is_connected() {
+            return None;
+        }
+
         // Step 4: Link next pointers using the Sugihara & Iri rule.
         graph.link_next();
 
@@ -176,6 +193,33 @@ impl<C: Clone> FaceBoundaryGraph<C> {
         }
 
         Some(graph)
+    }
+
+    /// Check if the graph is connected (all vertices reachable from vertex 0).
+    /// Returns false for disconnected components (e.g., a hole wire with no
+    /// shared vertices with the boundary wire).
+    fn is_connected(&self) -> bool {
+        if self.vertices.is_empty() {
+            return true;
+        }
+        let n = self.vertices.len();
+        let mut visited = vec![false; n];
+        let mut stack = vec![0usize];
+        visited[0] = true;
+        let mut count = 1usize;
+
+        while let Some(v_idx) = stack.pop() {
+            for &he_id in &self.vertices[v_idx].outgoing {
+                let dest = self.half_edges[self.half_edges[he_id].twin].origin;
+                if !visited[dest] {
+                    visited[dest] = true;
+                    count += 1;
+                    stack.push(dest);
+                }
+            }
+        }
+
+        count == n
     }
 
     /// Build outgoing half-edge lists for each vertex.
@@ -311,7 +355,8 @@ impl<C: Clone> FaceBoundaryGraph<C> {
         cycles: &[Vec<usize>],
         surface: &S,
         face_orientation: bool,
-        _tol: f64,
+        tol: f64,
+        tau_area: f64,
     ) -> Vec<FaceFragment<C, S>>
     where
         S: Clone + SearchParameter<D2, Point = Point3>,
@@ -334,6 +379,8 @@ impl<C: Clone> FaceBoundaryGraph<C> {
             let mut edges_for_wire: Vec<Edge<Point3, C>> = Vec::new();
             let mut uv_points: Vec<Point2> = Vec::new();
             let mut cycle_status = ShapesOpStatus::Unknown;
+            let mut and_count = 0usize;
+            let mut or_count = 0usize;
 
             for &he_id in cycle {
                 let he = &self.half_edges[he_id];
@@ -347,10 +394,19 @@ impl<C: Clone> FaceBoundaryGraph<C> {
                 // Collect parametric positions for area computation.
                 uv_points.push(self.vertices[he.origin].uv);
 
-                // Inherit status from IC-derived half-edges.
-                if he.status != ShapesOpStatus::Unknown {
-                    cycle_status = he.status;
+                // Count IC-derived half-edge statuses for majority vote.
+                match he.status {
+                    ShapesOpStatus::And => and_count += 1,
+                    ShapesOpStatus::Or => or_count += 1,
+                    ShapesOpStatus::Unknown => {}
                 }
+            }
+            if and_count > 0 || or_count > 0 {
+                cycle_status = if and_count >= or_count {
+                    ShapesOpStatus::And
+                } else {
+                    ShapesOpStatus::Or
+                };
             }
 
             if edges_for_wire.is_empty() {
@@ -378,12 +434,16 @@ impl<C: Clone> FaceBoundaryGraph<C> {
         let mut holes: Vec<usize> = Vec::new();
 
         for (i, info) in cycle_infos.iter().enumerate() {
+            // Skip degenerate cycles with negligible parametric area
+            // (matches legacy divide_one_face behavior).
+            if info.area.abs() < tau_area {
+                continue;
+            }
             if info.area > 0.0 {
                 outers.push(i);
             } else if info.area < 0.0 {
                 holes.push(i);
             }
-            // Zero-area cycles are degenerate and skipped.
         }
 
         // If no outer boundaries found, nothing to build.
@@ -432,6 +492,17 @@ impl<C: Clone> FaceBoundaryGraph<C> {
             let mut face_status = outer_info.status;
 
             if let Some(hole_indices) = outer_holes.get(&outer_idx) {
+                // Check for area cancellation: when outer + holes sum to nearly
+                // zero, the face is consumed by the intersection (matches legacy
+                // divide_one_face behavior).
+                let hole_area_sum: f64 = hole_indices
+                    .iter()
+                    .map(|&hi| cycle_infos[hi].area)
+                    .sum();
+                if (outer_info.area + hole_area_sum).abs() < tol {
+                    continue; // face consumed
+                }
+
                 for &hole_idx in hole_indices {
                     let hole_info = &cycle_infos[hole_idx];
                     wires.push(hole_info.wire.clone());
@@ -504,7 +575,7 @@ pub fn divide_one_face_graph<C, S>(
     face: &Face<Point3, C, S>,
     loops: &Loops<Point3, C>,
     tol: f64,
-    _tau_area: f64,
+    tau_area: f64,
 ) -> Option<Vec<FaceFragment<C, S>>>
 where
     C: Clone + BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
@@ -518,7 +589,7 @@ where
         return None;
     }
 
-    let fragments = graph.build_fragments(&cycles, &surface, face.orientation(), tol);
+    let fragments = graph.build_fragments(&cycles, &surface, face.orientation(), tol, tau_area);
 
     if fragments.is_empty() {
         return None;
@@ -660,22 +731,34 @@ mod tests {
         assert_eq!(cycles.len(), 3, "split face should produce 3 cycles");
 
         // Build fragments — should get 2 positive-area faces.
-        let fragments = graph.build_fragments(&cycles, &surface, true, 0.01);
+        let fragments = graph.build_fragments(&cycles, &surface, true, 0.01, 1e-10);
         assert_eq!(
             fragments.len(),
             2,
             "should produce exactly 2 face fragments"
         );
+
+        // Verify that the two fragments have complementary And/Or statuses.
+        let statuses: Vec<ShapesOpStatus> = fragments.iter().map(|(_, s)| *s).collect();
+        assert!(
+            statuses.contains(&ShapesOpStatus::And),
+            "one fragment must have And status, got {:?}",
+            statuses
+        );
+        assert!(
+            statuses.contains(&ShapesOpStatus::Or),
+            "one fragment must have Or status, got {:?}",
+            statuses
+        );
     }
 
     /// Test 3: Face with disconnected inner hole wire.
     ///
-    /// The FBG creates separate cycle groups for disconnected boundaries.
-    /// With no IC edges connecting outer and inner boundaries, each component
-    /// produces its own inner/outer cycle pair. build_fragments correctly
-    /// assigns negative-area holes to containing positive-area outers.
+    /// FBG requires a connected graph (all wires share vertices). When the
+    /// inner hole wire is disconnected from the outer boundary, from_loops
+    /// returns None so the caller falls back to the legacy divider.
     #[test]
-    fn face_with_hole() {
+    fn face_with_hole_disconnected_returns_none() {
         // Outer boundary: 3×3 square (CCW).
         let v_outer = Vertex::news([
             Point3::new(0.0, 0.0, 0.0),
@@ -713,28 +796,11 @@ mod tests {
             (inner_wire, ShapesOpStatus::Unknown),
         ]);
         let surface = make_xy_plane();
+        // Disconnected wires → FBG returns None (caller uses legacy divider).
         let graph = FaceBoundaryGraph::from_loops(&loops, &surface, 0.01);
-        assert!(graph.is_some());
-        let mut graph = graph.unwrap();
-
-        let cycles = graph.extract_cycles();
-        // 4 cycles: outer CCW (+), outer exterior CW (-),
-        //           inner CW (-), inner interior CCW (+)
-        assert_eq!(cycles.len(), 4, "disconnected face should produce 4 cycles");
-
-        // build_fragments sees 2 positive-area outers and 2 negative-area holes.
-        // The inner's CW hole (-1) is inside the outer's CCW boundary (+9),
-        // so it gets assigned. The outer's exterior CW (-) is NOT inside
-        // the inner's CCW interior (+), so it remains unassigned.
-        // Result: face with outer+hole, plus the inner's CCW "interior" face.
-        let fragments = graph.build_fragments(&cycles, &surface, true, 0.01);
-        // Note: in practice, faces with holes but no IC edges bypass FBG
-        // entirely (divide_one_face_v2 checks has_ic first). This test
-        // validates the graph geometry even for this edge case.
         assert!(
-            fragments.len() >= 1,
-            "face with hole should produce at least 1 fragment, got {}",
-            fragments.len(),
+            graph.is_none(),
+            "FBG should return None for disconnected wire components"
         );
     }
 

@@ -1,3 +1,6 @@
+// Phase 1 infrastructure — not yet wired into the boolean hot path.
+#![allow(dead_code)]
+
 //! Pave Block types for the deterministic boolean pipeline.
 //!
 //! A *pave block* is a segment of a boundary edge between two IC crossings

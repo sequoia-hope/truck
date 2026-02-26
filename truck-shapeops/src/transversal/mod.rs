@@ -4,15 +4,12 @@ pub(crate) mod coplanar_overlay;
 mod coplanar_splitting;
 pub mod diagnostics;
 mod divide_face;
-#[allow(dead_code)]
 pub(crate) mod face_boundary_graph;
 mod faces_classification;
 mod integrate;
-#[allow(dead_code)]
 pub(crate) mod interference;
 mod intersection_curve;
 mod loops_store;
-#[allow(dead_code)]
 pub(crate) mod pave_block;
 mod polyline_construction;
 pub(crate) mod robust_classify;
