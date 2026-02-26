@@ -240,7 +240,11 @@ mod tests {
     fn classify_inside_cube() {
         let poly = unit_cube_poly_shell();
         let result = winding_number_classify(Point3::new(0.5, 0.5, 0.5), &poly);
-        assert_eq!(result, Some(1), "Center of cube should be classified inside");
+        assert_eq!(
+            result,
+            Some(1),
+            "Center of cube should be classified inside"
+        );
     }
 
     #[test]
@@ -289,11 +293,7 @@ mod tests {
         let poly = unit_cube_poly_shell();
         // Point just inside near a corner
         let result = winding_number_classify(Point3::new(0.01, 0.01, 0.01), &poly);
-        assert_eq!(
-            result,
-            Some(1),
-            "Point inside near corner should be inside"
-        );
+        assert_eq!(result, Some(1), "Point inside near corner should be inside");
         // Point just outside near a corner
         let result = winding_number_classify(Point3::new(-0.01, -0.01, -0.01), &poly);
         assert_eq!(

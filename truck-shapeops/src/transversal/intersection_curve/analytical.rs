@@ -54,7 +54,7 @@ struct SphereParams {
 /// For perpendicular cuts, |axis_u| = |axis_v| = radius (circle).
 /// For oblique cuts, the magnitudes differ (ellipse).
 #[derive(Debug, Clone)]
-struct EllipseParams {
+pub(crate) struct EllipseParams {
     center: Point3,
     axis_u: Vector3,
     axis_v: Vector3,

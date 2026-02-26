@@ -1,5 +1,6 @@
 #![allow(clippy::many_single_char_names)]
 
+use super::face_boundary_graph::divide_one_face_graph;
 use super::faces_classification::FacesClassification;
 use super::loops_store::*;
 // Order-insensitive: HashMap is used for polyline caching (EdgeID -> PolylineCurve)
@@ -7,8 +8,54 @@ use super::loops_store::*;
 // over shells (Vec) in index order.
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use truck_meshalgo::prelude::*;
 use truck_topology::*;
+
+static GRAPH_SUCCESS: AtomicUsize = AtomicUsize::new(0);
+static GRAPH_FALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns (graph_successes, graph_fallbacks) counters for v2 face division.
+#[allow(dead_code)]
+pub fn v2_face_division_stats() -> (usize, usize) {
+    (
+        GRAPH_SUCCESS.load(Ordering::Relaxed),
+        GRAPH_FALLBACK.load(Ordering::Relaxed),
+    )
+}
+
+/// Face division using FBG (face boundary graph) as primary path with
+/// legacy `divide_one_face` as fallback.
+fn divide_one_face_v2<C, S>(
+    face: &Face<Point3, C, S>,
+    loops: &Loops<Point3, C>,
+    tol: f64,
+    tau_area: f64,
+) -> Option<Vec<FaceWithShapesOpStatus<C, S>>>
+where
+    C: BoundedCurve<Point = Point3> + ParameterDivision1D<Point = Point3>,
+    S: Clone + SearchParameter<D2, Point = Point3>,
+{
+    // Only try FBG when there are actual IC edges (non-Unknown status).
+    let has_ic = loops.iter().any(|w| w.status() != ShapesOpStatus::Unknown);
+    if has_ic {
+        // Run FBG in shadow mode: compute result but don't use it yet.
+        // This lets us measure success rates without risking regressions.
+        if let Some(result) = divide_one_face_graph(face, loops, tol, tau_area) {
+            if !result.is_empty() {
+                GRAPH_SUCCESS.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[FBG] shadow success: {} fragments (legacy fallback used)",
+                    result.len(),
+                );
+            }
+        } else {
+            GRAPH_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    // Always use legacy path for now — FBG runs in shadow mode.
+    divide_one_face(face, loops, tol, tau_area)
+}
 
 /// Try to rebuild connected closed wires from a pool of edges.
 ///
@@ -726,7 +773,7 @@ where
                     }
                     res.push(face.clone(), ShapesOpStatus::Unknown);
                 } else {
-                    match divide_one_face(face, loops, tol, tau_area) {
+                    match divide_one_face_v2(face, loops, tol, tau_area) {
                         Some(vec) if vec.is_empty() => {
                             // Zero fragments — preserve original face as Unknown
                             // so downstream classification (overlay → coplanar →

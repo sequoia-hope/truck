@@ -1467,11 +1467,7 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                 let fid = abs.front().id();
                 let bid = abs.back().id();
 
-                let vid_pair = if fid <= bid {
-                    (fid, bid)
-                } else {
-                    (bid, fid)
-                };
+                let vid_pair = if fid <= bid { (fid, bid) } else { (bid, fid) };
 
                 // Sample curve at 3 points within parameter range
                 let curve = abs.curve();
@@ -2698,17 +2694,94 @@ fn fill_open_edge_loops<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     added_any
 }
 
+// --- Phase 4: Single-Pass Shell Assembly (v2) ---
+//
+// Simplified assembly that relies on Phases 1+3 producing correct-by-construction
+// face fragments with shared vertex identities. Only IC edge canonicalization
+// and minimal weld are needed. Falls back to legacy 7-level recovery on failure.
+
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+static ASSEMBLY_V2_SUCCESS: AtomicUsize = AtomicUsize::new(0);
+static ASSEMBLY_V2_FALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+/// Query v2 assembly success/fallback counters.
+pub fn v2_assembly_stats() -> (usize, usize) {
+    (
+        ASSEMBLY_V2_SUCCESS.load(AtomicOrdering::Relaxed),
+        ASSEMBLY_V2_FALLBACK.load(AtomicOrdering::Relaxed),
+    )
+}
+
+/// Canonicalize IC edges: unify edges that represent the same intersection
+/// curve but were independently created from BSpline approximations.
+///
+/// Only performs Phase 1 of weld_coincident_edges (multi-point curve matching)
+/// without the Phase 0 spatial grid vertex unification, since pave blocks
+/// and FBG already share vertices natively.
+fn canonicalize_ic_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell: &mut Shell<Point3, C, S>,
+    tol: f64,
+) {
+    // Use the full weld with conservative tolerance — Phase 0 vertex unification
+    // is idempotent when vertices are already shared, so it's safe.
+    weld_coincident_edges(shell, tol, None);
+}
+
+/// Single-pass shell assembly (v2).
+///
+/// Performs the initial weld (equivalent to legacy recovery level 1) and
+/// checks for shell closure. If the shell closes at level 1, returns the
+/// solid directly — avoiding the more expensive multi-level recovery.
+///
+/// On failure, the shell is left in the post-weld state that legacy
+/// recovery expects at level 1, so the fallback path can continue from
+/// wider weld stages without redundant work.
+fn assemble_boolean_shell_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell: &mut Shell<Point3, C, S>,
+    tols: &BooleanTolerance,
+) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
+    // Step 1: Initial weld — same as legacy level 1.
+    // Uses default weld (0.2× tau_model) to avoid merging across features.
+    canonicalize_ic_edges(shell, tols.tau_model);
+
+    let open = diagnose_open_edges(shell);
+    eprintln!(
+        "[v2_assembly] after canonicalize: {} faces, {} open edges",
+        shell.len(),
+        open.len(),
+    );
+
+    // Step 2: If shell is already closed, assemble directly.
+    if open.is_empty() {
+        let boundaries = shell.connected_components();
+        if let Ok(solid) = Solid::try_new(boundaries) {
+            return Ok(solid);
+        }
+        // Solid::try_new failed (e.g., singular vertices) — also try
+        // new_unchecked for Closed shells (matches legacy level 7).
+        use truck_topology::shell::ShellCondition;
+        let boundaries = shell.connected_components();
+        let all_closed = boundaries
+            .iter()
+            .all(|s| s.shell_condition() == ShellCondition::Closed);
+        if all_closed {
+            return Ok(Solid::new_unchecked(boundaries));
+        }
+    }
+
+    Err(BooleanStageError::ShellAssembly(format!(
+        "v2: {} open edges after weld",
+        open.len()
+    )))
+}
+
 /// Finalize a boolean shell: weld edges and assemble into a Solid.
 ///
-/// Runs `weld_coincident_edges`, then tries `Solid::try_new`. If the shell
-/// is `Oriented` (open boundary) instead of `Closed`, retries with progressively
-/// wider weld tolerances to close small gaps.
-///
-/// Boolean operations may produce T-junction vertices (from vertex unification
-/// in `add_polygon_vertex`) where two wires share a vertex. These vertices are
-/// topologically "singular" (non-manifold local topology), but geometrically
-/// valid for the CAD pipeline. When the shell is `Closed` but has singular
-/// vertices, we accept the solid via `new_unchecked`.
+/// Uses the legacy 7-level recovery pipeline. The v2 assembly path
+/// (`assemble_boolean_shell_v2`) is available but not wired in yet —
+/// it will be enabled once Phases 1+3 (pave blocks + FBG) are fully
+/// integrated and the FBG primary path has a low fallback rate.
 fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell: &mut Shell<Point3, C, S>,
     tols: &BooleanTolerance,
@@ -2716,6 +2789,16 @@ fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     finalize_boolean_shell_inner(shell, tols, None)
 }
 
+/// Finalize with diagnostics recovery tracking.
+fn finalize_boolean_shell_with_recovery_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell: &mut Shell<Point3, C, S>,
+    tols: &BooleanTolerance,
+    recovery: &mut diagnostics::RecoveryReport,
+) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
+    finalize_boolean_shell_inner(shell, tols, Some(recovery))
+}
+
+#[allow(dead_code)]
 fn finalize_boolean_shell_with_recovery<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell: &mut Shell<Point3, C, S>,
     tols: &BooleanTolerance,
@@ -3281,26 +3364,18 @@ pub fn and_result_with_tol_diag<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     let mut and_shell = classified.and0;
     and_shell.append(&mut classified.and1);
     for shell in iter0 {
-        let mut classified = classify_one_pair_of_shells_result_with_tol(
-            &and_shell,
-            shell,
-            tols,
-            Some(&mut diag),
-        )?;
+        let mut classified =
+            classify_one_pair_of_shells_result_with_tol(&and_shell, shell, tols, Some(&mut diag))?;
         and_shell = classified.and0;
         and_shell.append(&mut classified.and1);
     }
     for shell in iter1 {
-        let mut classified = classify_one_pair_of_shells_result_with_tol(
-            &and_shell,
-            shell,
-            tols,
-            Some(&mut diag),
-        )?;
+        let mut classified =
+            classify_one_pair_of_shells_result_with_tol(&and_shell, shell, tols, Some(&mut diag))?;
         and_shell = classified.and0;
         and_shell.append(&mut classified.and1);
     }
-    let solid = finalize_boolean_shell_with_recovery(&mut and_shell, tols, &mut diag.recovery)?;
+    let solid = finalize_boolean_shell_with_recovery_v2(&mut and_shell, tols, &mut diag.recovery)?;
     Ok((solid, diag))
 }
 
@@ -3374,26 +3449,18 @@ pub fn or_result_with_tol_diag<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     let mut or_shell = classified.or0;
     or_shell.append(&mut classified.or1);
     for shell in iter0 {
-        let mut classified = classify_one_pair_of_shells_result_with_tol(
-            &or_shell,
-            shell,
-            tols,
-            Some(&mut diag),
-        )?;
+        let mut classified =
+            classify_one_pair_of_shells_result_with_tol(&or_shell, shell, tols, Some(&mut diag))?;
         or_shell = classified.or0;
         or_shell.append(&mut classified.or1);
     }
     for shell in iter1 {
-        let mut classified = classify_one_pair_of_shells_result_with_tol(
-            &or_shell,
-            shell,
-            tols,
-            Some(&mut diag),
-        )?;
+        let mut classified =
+            classify_one_pair_of_shells_result_with_tol(&or_shell, shell, tols, Some(&mut diag))?;
         or_shell = classified.or0;
         or_shell.append(&mut classified.or1);
     }
-    let solid = finalize_boolean_shell_with_recovery(&mut or_shell, tols, &mut diag.recovery)?;
+    let solid = finalize_boolean_shell_with_recovery_v2(&mut or_shell, tols, &mut diag.recovery)?;
     Ok((solid, diag))
 }
 
@@ -3452,12 +3519,8 @@ pub fn difference_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         }
         for additional_b in shell1_iter {
             let diff_shell: Shell<Point3, C, S> = diff_faces.into_iter().collect();
-            let classified = classify_one_pair_of_shells_result_with_tol(
-                &diff_shell,
-                additional_b,
-                tols,
-                None,
-            )?;
+            let classified =
+                classify_one_pair_of_shells_result_with_tol(&diff_shell, additional_b, tols, None)?;
             diff_faces = classified.or0.into_iter().collect();
             for face in classified.and1.into_iter() {
                 diff_faces.push(face.inverse());
@@ -3487,13 +3550,12 @@ pub fn difference_result_with_tol_diag<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     for shell0 in shells0.iter() {
         let mut shell1_iter = shells1.iter();
         let first_shell1 = shell1_iter.next().unwrap();
-        let ClassifiedShellBuckets { or0, and1, .. } =
-            classify_one_pair_of_shells_result_with_tol(
-                shell0,
-                first_shell1,
-                tols,
-                Some(&mut diag),
-            )?;
+        let ClassifiedShellBuckets { or0, and1, .. } = classify_one_pair_of_shells_result_with_tol(
+            shell0,
+            first_shell1,
+            tols,
+            Some(&mut diag),
+        )?;
         let mut diff_faces: Vec<Face<Point3, C, S>> = or0.into_iter().collect();
         for face in and1.into_iter() {
             diff_faces.push(face.inverse());
@@ -3515,8 +3577,7 @@ pub fn difference_result_with_tol_diag<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     }
 
     let mut diff_shell: Shell<Point3, C, S> = all_diff_faces.into_iter().collect();
-    let solid =
-        finalize_boolean_shell_with_recovery(&mut diff_shell, tols, &mut diag.recovery)?;
+    let solid = finalize_boolean_shell_with_recovery_v2(&mut diff_shell, tols, &mut diag.recovery)?;
     Ok((solid, diag))
 }
 

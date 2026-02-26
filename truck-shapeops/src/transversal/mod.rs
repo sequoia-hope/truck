@@ -4,21 +4,25 @@ pub(crate) mod coplanar_overlay;
 mod coplanar_splitting;
 pub mod diagnostics;
 mod divide_face;
+pub(crate) mod face_boundary_graph;
 mod faces_classification;
 mod integrate;
+pub(crate) mod interference;
 mod intersection_curve;
 mod loops_store;
+pub(crate) mod pave_block;
 mod polyline_construction;
 pub(crate) mod robust_classify;
 pub(crate) mod winding;
 pub use diagnostics::BooleanDiagnostics;
+pub use divide_face::v2_face_division_stats;
 pub use integrate::{
     and, and_result, and_result_with_tol, and_result_with_tol_diag, and_with_tol,
     diagnose_open_edges, difference, difference_result, difference_result_with_tol,
     difference_result_with_tol_diag, difference_with_tol, find_non_simple_wires,
     heal_shell_vertices, or, or_result, or_result_with_tol, or_result_with_tol_diag, or_with_tol,
-    validate_euler_characteristic, BooleanStageError, BooleanTolerance, OpenEdgeInfo,
-    ShapeOpsCurve, ShapeOpsSurface,
+    v2_assembly_stats, validate_euler_characteristic, BooleanStageError, BooleanTolerance,
+    OpenEdgeInfo, ShapeOpsCurve, ShapeOpsSurface,
 };
 
 use truck_geometry::prelude::*;

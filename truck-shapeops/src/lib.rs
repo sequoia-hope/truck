@@ -21,8 +21,8 @@ pub use transversal::{
     diagnose_open_edges, difference, difference_result, difference_result_with_tol,
     difference_result_with_tol_diag, difference_with_tol, find_non_simple_wires,
     heal_shell_vertices, or, or_result, or_result_with_tol, or_result_with_tol_diag, or_with_tol,
-    validate_euler_characteristic, BooleanDiagnostics, BooleanStageError, BooleanTolerance,
-    OpenEdgeInfo, ShapeOpsCurve, ShapeOpsSurface,
+    v2_assembly_stats, v2_face_division_stats, validate_euler_characteristic, BooleanDiagnostics,
+    BooleanStageError, BooleanTolerance, OpenEdgeInfo, ShapeOpsCurve, ShapeOpsSurface,
 };
 /// Diagnostic sub-types for boolean operations.
 pub mod diagnostics {
