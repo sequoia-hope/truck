@@ -770,13 +770,14 @@ fn sample_ellipse(ellipse: &EllipseParams, n_segments: usize) -> PolylineCurve<P
     PolylineCurve(points)
 }
 
-/// Opaque handle to an analytical intersection curve (ellipse or circle).
+/// Opaque handle to one or more analytical intersection curves (ellipses/circles).
 ///
 /// Used to refine mesh-based polylines by projecting their points onto
-/// the exact intersection curve.
+/// the closest exact intersection curve. Most surface pairs produce a single
+/// ellipse; cylinder-cylinder produces two.
 #[derive(Debug, Clone)]
 pub struct AnalyticalIC {
-    ellipse: EllipseParams,
+    ellipses: Vec<EllipseParams>,
 }
 
 /// Try to detect an analytical plane-cylinder intersection.
@@ -802,7 +803,9 @@ where
         };
 
     let ellipse = compute_plane_cylinder_intersection(&plane, &cyl)?;
-    Some(AnalyticalIC { ellipse })
+    Some(AnalyticalIC {
+        ellipses: vec![ellipse],
+    })
 }
 
 /// Try to detect an analytical plane-cone intersection.
@@ -829,7 +832,9 @@ where
     };
 
     let ellipse = compute_plane_cone_intersection(&plane, &cone)?;
-    Some(AnalyticalIC { ellipse })
+    Some(AnalyticalIC {
+        ellipses: vec![ellipse],
+    })
 }
 
 /// Try to detect an analytical plane-sphere intersection.
@@ -856,11 +861,188 @@ where
         };
 
     let ellipse = compute_sphere_plane_intersection(&plane, &sphere)?;
-    Some(AnalyticalIC { ellipse })
+    Some(AnalyticalIC {
+        ellipses: vec![ellipse],
+    })
 }
 
-/// Refine a mesh-based polyline by projecting each point onto the analytical
-/// intersection curve (ellipse/circle).
+/// Compute the intersection of two equal-radius cylinders with intersecting axes.
+///
+/// Returns two ellipses, or None for degenerate/unsupported cases:
+/// - Unequal radii (degree-4 algebraic curves)
+/// - Parallel or coaxial axes
+/// - Skew (non-intersecting) axes
+/// - Near-parallel axes (angle < 60 deg)
+fn compute_cylinder_cylinder_intersection(
+    cyl0: &CylinderParams,
+    cyl1: &CylinderParams,
+) -> Option<Vec<EllipseParams>> {
+    let r0 = cyl0.radius;
+    let r1 = cyl1.radius;
+    let r_max = r0.max(r1);
+
+    // Guard: unequal radii (>1% relative)
+    if (r0 - r1).abs() / r_max > 0.01 {
+        eprintln!(
+            "[analytical] cylinder-cylinder: unequal radii r0={:.4} r1={:.4}, skipping",
+            r0, r1
+        );
+        return None;
+    }
+
+    let r = (r0 + r1) * 0.5; // average radius
+
+    let a0 = cyl0.axis;
+    let a1 = cyl1.axis;
+
+    let cos_angle = a0.dot(a1).abs();
+
+    // Guard: parallel axes (cos > 1 - 1e-6)
+    if cos_angle > 1.0 - 1e-6 {
+        eprintln!("[analytical] cylinder-cylinder: parallel axes, skipping");
+        return None;
+    }
+
+    // Guard: near-parallel (angle < 60 deg means |cos| > 0.5)
+    if cos_angle > 0.5 {
+        eprintln!(
+            "[analytical] cylinder-cylinder: angle {:.1}° < 60°, skipping",
+            cos_angle.acos().to_degrees()
+        );
+        return None;
+    }
+
+    // Compute closest distance between axes (skew test).
+    // Two lines: P0 + t*a0 and P1 + s*a1.
+    // Closest distance = |((P1 - P0) . (a0 x a1))| / |a0 x a1|
+    let cross = a0.cross(a1);
+    let cross_mag = cross.magnitude();
+    if cross_mag < 1e-12 {
+        return None; // degenerate cross product
+    }
+    let diff = cyl1.center - cyl0.center;
+    let dist = diff.dot(cross).abs() / cross_mag;
+
+    // Guard: non-intersecting axes (dist > 5% of R)
+    if dist > 0.05 * r {
+        eprintln!(
+            "[analytical] cylinder-cylinder: skew axes dist={:.6} > 5% of R={:.4}, skipping",
+            dist, r
+        );
+        return None;
+    }
+
+    // Compute axis intersection point.
+    // Solve: P0 + t*a0 = P1 + s*a1 (approximately, in the closest-point sense)
+    // Using: t = ((P1-P0) . a0 - ((P1-P0) . a1)(a0 . a1)) / (1 - (a0.a1)²)
+    let d01 = a0.dot(a1);
+    let denom = 1.0 - d01 * d01;
+    if denom.abs() < 1e-12 {
+        return None;
+    }
+    let d_diff_a0 = diff.dot(a0);
+    let d_diff_a1 = diff.dot(a1);
+    let t = (d_diff_a0 - d_diff_a1 * d01) / denom;
+    let origin = cyl0.center + t * a0;
+
+    // Ensure axes form an acute angle for consistent frame construction.
+    let a1_oriented = if a0.dot(a1) < 0.0 { -a1 } else { a1 };
+    let cos_alpha = a0.dot(a1_oriented).clamp(-1.0, 1.0);
+    let alpha = cos_alpha.acos(); // angle between axes (0, π/2]
+
+    // Build orthonormal frame:
+    //   e1 = a0
+    //   e2 = (a1_oriented - (a1_oriented . a0) * a0).normalize()
+    //   e3 = e1 x e2
+    let e1 = a0;
+    let e2_unnorm = a1_oriented - cos_alpha * a0;
+    let e2_mag = e2_unnorm.magnitude();
+    if e2_mag < 1e-12 {
+        return None;
+    }
+    let e2 = e2_unnorm / e2_mag;
+    let e3 = e1.cross(e2);
+
+    let half_alpha = alpha * 0.5;
+    let cot_half = half_alpha.cos() / half_alpha.sin();
+    let tan_half = half_alpha.tan();
+
+    // Curve 1: X(t) = origin + R*cos(t) * (cot(α/2)*e1 + e2) + R*sin(t) * e3
+    let axis_u1 = r * (cot_half * e1 + e2);
+    let axis_v1 = r * e3;
+
+    // Curve 2: X(t) = origin + R*cos(t) * (-tan(α/2)*e1 + e2) + R*sin(t) * e3
+    let axis_u2 = r * (-tan_half * e1 + e2);
+    let axis_v2 = r * e3;
+
+    Some(vec![
+        EllipseParams {
+            center: origin,
+            axis_u: axis_u1,
+            axis_v: axis_v1,
+        },
+        EllipseParams {
+            center: origin,
+            axis_u: axis_u2,
+            axis_v: axis_v2,
+        },
+    ])
+}
+
+/// Try to detect an analytical cylinder-cylinder intersection.
+///
+/// Returns an `AnalyticalIC` with two ellipses that can be used to refine
+/// mesh-based polylines, or None if the surfaces are not a recognizable
+/// equal-radius cylinder pair with intersecting axes.
+pub fn try_analytical_cylinder_cylinder_ic<S0, S1>(
+    surface0: &S0,
+    surface1: &S1,
+    _tol: f64,
+) -> Option<AnalyticalIC>
+where
+    S0: ParametricSurface3D,
+    S1: ParametricSurface3D,
+{
+    let cyl0 = detect_cylinder(surface0)?;
+    let cyl1 = detect_cylinder(surface1)?;
+    let ellipses = compute_cylinder_cylinder_intersection(&cyl0, &cyl1)?;
+    Some(AnalyticalIC { ellipses })
+}
+
+/// Select the ellipse closest to a polyline from a set of candidates.
+///
+/// For each candidate ellipse, computes the sum of squared projection
+/// distances across all polyline points. Returns the ellipse with the
+/// smallest total distance. O(n*k) where k is typically 1-2.
+fn pick_closest_ellipse<'a>(
+    polyline: &PolylineCurve<Point3>,
+    ellipses: &'a [EllipseParams],
+) -> &'a EllipseParams {
+    debug_assert!(!ellipses.is_empty());
+    if ellipses.len() == 1 {
+        return &ellipses[0];
+    }
+    let mut best_idx = 0;
+    let mut best_cost = f64::MAX;
+    for (i, ell) in ellipses.iter().enumerate() {
+        let cost: f64 = polyline
+            .0
+            .iter()
+            .map(|pt| {
+                let proj = project_to_ellipse(pt, ell);
+                (*pt - proj).magnitude2()
+            })
+            .sum();
+        if cost < best_cost {
+            best_cost = cost;
+            best_idx = i;
+        }
+    }
+    &ellipses[best_idx]
+}
+
+/// Refine a mesh-based polyline by projecting each point onto the closest
+/// analytical intersection curve (ellipse/circle).
 ///
 /// This preserves the mesh-based topology (start/end points, open/closed,
 /// number of segments) while improving point accuracy. The refined points lie
@@ -869,7 +1051,7 @@ pub fn refine_polyline(
     mesh_polyline: &PolylineCurve<Point3>,
     analytical: &AnalyticalIC,
 ) -> PolylineCurve<Point3> {
-    let ellipse = &analytical.ellipse;
+    let ellipse = pick_closest_ellipse(mesh_polyline, &analytical.ellipses);
     let points: Vec<Point3> = mesh_polyline
         .0
         .iter()
@@ -1163,11 +1345,11 @@ mod tests {
     #[test]
     fn test_refine_preserves_point_count() {
         let analytical = AnalyticalIC {
-            ellipse: EllipseParams {
+            ellipses: vec![EllipseParams {
                 center: Point3::new(0.0, 0.0, 5.0),
                 axis_u: Vector3::new(2.0, 0.0, 0.0),
                 axis_v: Vector3::new(0.0, 2.0, 0.0),
-            },
+            }],
         };
 
         let mesh_poly = PolylineCurve(vec![
@@ -1703,7 +1885,7 @@ mod tests {
 
         // Verify the resulting IC
         let ic = result.unwrap();
-        let poly = sample_ellipse(&ic.ellipse, 64);
+        let poly = sample_ellipse(&ic.ellipses[0], 64);
         for pt in &poly.0 {
             // All points should be at z ≈ 3
             assert!((pt.z - 3.0).abs() < 0.1, "z = {}, expected ~3.0", pt.z);
@@ -1969,5 +2151,464 @@ mod tests {
             try_analytical_plane_sphere_ic(&plane, &cylinder, 0.05).is_none(),
             "Cylinder should not be detected as sphere in pipeline"
         );
+    }
+
+    // --- Cylinder-Cylinder tests (Sprint 42) ---
+
+    /// Helper: verify all sampled points lie on both cylinders.
+    fn assert_points_on_both_cylinders(
+        ellipse: &EllipseParams,
+        cyl0: &CylinderParams,
+        cyl1: &CylinderParams,
+        tol: f64,
+    ) {
+        let poly = sample_ellipse(ellipse, 128);
+        for (i, pt) in poly.0.iter().enumerate() {
+            // Distance from cylinder 0 axis
+            let v0 = *pt - cyl0.center;
+            let along0 = v0.dot(cyl0.axis) * cyl0.axis;
+            let perp0 = v0 - along0;
+            let r0 = perp0.magnitude();
+            assert!(
+                (r0 - cyl0.radius).abs() < tol,
+                "point[{}] not on cyl0: r={:.8}, expected {:.8}, diff={:.2e}",
+                i,
+                r0,
+                cyl0.radius,
+                (r0 - cyl0.radius).abs()
+            );
+
+            // Distance from cylinder 1 axis
+            let v1 = *pt - cyl1.center;
+            let along1 = v1.dot(cyl1.axis) * cyl1.axis;
+            let perp1 = v1 - along1;
+            let r1 = perp1.magnitude();
+            assert!(
+                (r1 - cyl1.radius).abs() < tol,
+                "point[{}] not on cyl1: r={:.8}, expected {:.8}, diff={:.2e}",
+                i,
+                r1,
+                cyl1.radius,
+                (r1 - cyl1.radius).abs()
+            );
+        }
+    }
+
+    /// CC1: Two perpendicular equal-radius cylinders along X and Z axes.
+    #[test]
+    fn test_cc1_perpendicular_equal_radius() {
+        let cyl0 = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            radius: 2.0,
+        };
+        let cyl1 = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_x(),
+            radius: 2.0,
+        };
+
+        let ellipses = compute_cylinder_cylinder_intersection(&cyl0, &cyl1).unwrap();
+        assert_eq!(ellipses.len(), 2, "Expected 2 ellipses");
+
+        // Both centers at origin
+        for (i, ell) in ellipses.iter().enumerate() {
+            assert!(
+                (ell.center - Point3::origin()).magnitude() < 1e-10,
+                "ellipse[{}] center not at origin: {:?}",
+                i,
+                ell.center
+            );
+        }
+
+        // For perpendicular axes: both semi-axis pairs are (R*sqrt(2), R)
+        let r = 2.0;
+        let expected_major = r * 2.0_f64.sqrt();
+        for (i, ell) in ellipses.iter().enumerate() {
+            let su = ell.axis_u.magnitude();
+            let sv = ell.axis_v.magnitude();
+            let (minor, major) = if su < sv { (su, sv) } else { (sv, su) };
+            assert!(
+                (minor - r).abs() < 1e-10,
+                "ellipse[{}] minor={:.8}, expected {:.8}",
+                i,
+                minor,
+                r
+            );
+            assert!(
+                (major - expected_major).abs() < 1e-10,
+                "ellipse[{}] major={:.8}, expected {:.8}",
+                i,
+                major,
+                expected_major
+            );
+        }
+
+        // All points lie on both cylinders
+        for ell in &ellipses {
+            assert_points_on_both_cylinders(ell, &cyl0, &cyl1, 1e-6);
+        }
+    }
+
+    /// CC2: Unequal radii → should return None.
+    #[test]
+    fn test_cc2_unequal_radii_returns_none() {
+        let cyl0 = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            radius: 2.0,
+        };
+        let cyl1 = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_x(),
+            radius: 3.0,
+        };
+
+        assert!(
+            compute_cylinder_cylinder_intersection(&cyl0, &cyl1).is_none(),
+            "Unequal radii should return None"
+        );
+    }
+
+    /// CC3: Parallel axes → should return None.
+    #[test]
+    fn test_cc3_parallel_axes_returns_none() {
+        let cyl0 = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            radius: 2.0,
+        };
+        let cyl1 = CylinderParams {
+            center: Point3::new(5.0, 0.0, 0.0),
+            axis: Vector3::unit_z(),
+            radius: 2.0,
+        };
+
+        assert!(
+            compute_cylinder_cylinder_intersection(&cyl0, &cyl1).is_none(),
+            "Parallel axes should return None"
+        );
+    }
+
+    /// CC4: Coaxial cylinders → should return None.
+    #[test]
+    fn test_cc4_coaxial_returns_none() {
+        let cyl0 = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            radius: 2.0,
+        };
+        let cyl1 = CylinderParams {
+            center: Point3::new(0.0, 0.0, 5.0),
+            axis: Vector3::unit_z(),
+            radius: 2.0,
+        };
+
+        assert!(
+            compute_cylinder_cylinder_intersection(&cyl0, &cyl1).is_none(),
+            "Coaxial cylinders should return None"
+        );
+    }
+
+    /// CC5: Skew (non-intersecting) axes → should return None.
+    #[test]
+    fn test_cc5_skew_axes_returns_none() {
+        let cyl0 = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            radius: 1.0,
+        };
+        // Axis along X but offset in Y by 10 (well beyond 5% of R=1)
+        let cyl1 = CylinderParams {
+            center: Point3::new(0.0, 10.0, 0.0),
+            axis: Vector3::unit_x(),
+            radius: 1.0,
+        };
+
+        assert!(
+            compute_cylinder_cylinder_intersection(&cyl0, &cyl1).is_none(),
+            "Skew axes should return None"
+        );
+    }
+
+    /// CC6: 85-degree angle between axes (well above 60° threshold).
+    #[test]
+    fn test_cc6_85_degree_angle() {
+        let alpha = 85.0_f64.to_radians();
+        let cyl0 = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            radius: 1.5,
+        };
+        let cyl1 = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::new(alpha.sin(), 0.0, alpha.cos()).normalize(),
+            radius: 1.5,
+        };
+
+        let ellipses = compute_cylinder_cylinder_intersection(&cyl0, &cyl1).unwrap();
+        assert_eq!(ellipses.len(), 2);
+
+        let r = 1.5;
+        let half_alpha = alpha * 0.5;
+        let expected_semi1 = r / half_alpha.sin();
+        let expected_semi2 = r / half_alpha.cos();
+
+        // Check semi-axes for curve 1
+        let su = ellipses[0].axis_u.magnitude();
+        let sv = ellipses[0].axis_v.magnitude();
+        let (minor, major) = if su < sv { (su, sv) } else { (sv, su) };
+        assert!(
+            (minor - r).abs() < 1e-6,
+            "curve1 minor={:.8}, expected {:.8}",
+            minor,
+            r
+        );
+        assert!(
+            (major - expected_semi1).abs() < 1e-6,
+            "curve1 major={:.8}, expected {:.8}",
+            major,
+            expected_semi1
+        );
+
+        // Check semi-axes for curve 2
+        let su = ellipses[1].axis_u.magnitude();
+        let sv = ellipses[1].axis_v.magnitude();
+        let (minor, major) = if su < sv { (su, sv) } else { (sv, su) };
+        assert!(
+            (minor - r).abs() < 1e-6,
+            "curve2 minor={:.8}, expected {:.8}",
+            minor,
+            r
+        );
+        assert!(
+            (major - expected_semi2).abs() < 1e-6,
+            "curve2 major={:.8}, expected {:.8}",
+            major,
+            expected_semi2
+        );
+
+        for ell in &ellipses {
+            assert_points_on_both_cylinders(ell, &cyl0, &cyl1, 1e-6);
+        }
+    }
+
+    /// CC7: Arbitrary orientation — cylinders with non-axis-aligned directions.
+    #[test]
+    fn test_cc7_arbitrary_orientation() {
+        let a0 = Vector3::new(1.0, 1.0, 0.0).normalize();
+        let a1 = Vector3::new(0.0, 0.0, 1.0);
+        let cyl0 = CylinderParams {
+            center: Point3::new(1.0, 2.0, 3.0),
+            axis: a0,
+            radius: 1.0,
+        };
+        let cyl1 = CylinderParams {
+            center: Point3::new(1.0, 2.0, 3.0),
+            axis: a1,
+            radius: 1.0,
+        };
+
+        let ellipses = compute_cylinder_cylinder_intersection(&cyl0, &cyl1).unwrap();
+        assert_eq!(ellipses.len(), 2);
+
+        // Both centers at (1, 2, 3)
+        for (i, ell) in ellipses.iter().enumerate() {
+            assert!(
+                (ell.center - Point3::new(1.0, 2.0, 3.0)).magnitude() < 1e-8,
+                "ellipse[{}] center at {:?}, expected (1,2,3)",
+                i,
+                ell.center
+            );
+        }
+
+        for ell in &ellipses {
+            assert_points_on_both_cylinders(ell, &cyl0, &cyl1, 1e-6);
+        }
+    }
+
+    /// CC8: Off-center intersection — axes don't pass through origin but do intersect.
+    #[test]
+    fn test_cc8_off_center_intersection() {
+        let cyl0 = CylinderParams {
+            center: Point3::new(5.0, 5.0, 0.0),
+            axis: Vector3::unit_z(),
+            radius: 3.0,
+        };
+        let cyl1 = CylinderParams {
+            center: Point3::new(5.0, 0.0, 5.0),
+            axis: Vector3::unit_y(),
+            radius: 3.0,
+        };
+
+        // Axes: (5,5,t) and (5,s,5) → intersect at (5,5,5)
+        let ellipses = compute_cylinder_cylinder_intersection(&cyl0, &cyl1).unwrap();
+        assert_eq!(ellipses.len(), 2);
+
+        // Center should be at (5, 5, 5)
+        for (i, ell) in ellipses.iter().enumerate() {
+            assert!(
+                (ell.center - Point3::new(5.0, 5.0, 5.0)).magnitude() < 1e-8,
+                "ellipse[{}] center at {:?}, expected (5,5,5)",
+                i,
+                ell.center
+            );
+        }
+
+        for ell in &ellipses {
+            assert_points_on_both_cylinders(ell, &cyl0, &cyl1, 1e-6);
+        }
+    }
+
+    /// CC9: Detection guards — near-parallel angle (55°) returns None.
+    #[test]
+    fn test_cc9_near_parallel_returns_none() {
+        let alpha = 55.0_f64.to_radians(); // < 60° threshold
+        let cyl0 = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            radius: 1.0,
+        };
+        let cyl1 = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::new(alpha.sin(), 0.0, alpha.cos()).normalize(),
+            radius: 1.0,
+        };
+
+        assert!(
+            compute_cylinder_cylinder_intersection(&cyl0, &cyl1).is_none(),
+            "Angle {:.0}° < 60° should return None",
+            alpha.to_degrees()
+        );
+    }
+
+    /// CC10: Polyline refinement with pick_closest_ellipse.
+    #[test]
+    fn test_cc10_polyline_refinement() {
+        // Two perpendicular equal-radius cylinders, R=2
+        let cyl0 = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            radius: 2.0,
+        };
+        let cyl1 = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_x(),
+            radius: 2.0,
+        };
+
+        let ellipses = compute_cylinder_cylinder_intersection(&cyl0, &cyl1).unwrap();
+        let analytical = AnalyticalIC { ellipses };
+
+        // Create a noisy polyline near the first ellipse
+        let ell0 = &analytical.ellipses[0];
+        let mesh_poly = PolylineCurve(
+            (0..10)
+                .map(|i| {
+                    let theta = 2.0 * PI * i as f64 / 10.0;
+                    // Exact point + noise
+                    ell0.center
+                        + theta.cos() * ell0.axis_u
+                        + theta.sin() * ell0.axis_v
+                        + Vector3::new(0.01, -0.02, 0.015)
+                })
+                .collect(),
+        );
+
+        let refined = refine_polyline(&mesh_poly, &analytical);
+        assert_eq!(refined.0.len(), mesh_poly.0.len(), "Point count must match");
+
+        // Refined points should be much closer to the ellipse than noisy ones
+        for (i, pt) in refined.0.iter().enumerate() {
+            let dist0 = dist_to_closest_ellipse(pt, &analytical.ellipses);
+            assert!(
+                dist0 < 1e-8,
+                "refined point[{}] dist={:.2e} to nearest ellipse",
+                i,
+                dist0
+            );
+        }
+    }
+
+    /// CC11: pick_closest_ellipse selects the correct ellipse.
+    #[test]
+    fn test_cc11_pick_closest_ellipse() {
+        let ell0 = EllipseParams {
+            center: Point3::origin(),
+            axis_u: Vector3::new(3.0, 0.0, 0.0),
+            axis_v: Vector3::new(0.0, 2.0, 0.0),
+        };
+        let ell1 = EllipseParams {
+            center: Point3::origin(),
+            axis_u: Vector3::new(0.0, 3.0, 0.0),
+            axis_v: Vector3::new(0.0, 0.0, 2.0),
+        };
+
+        // Polyline near ell0 (in XY plane)
+        let poly_near_0 = PolylineCurve(vec![
+            Point3::new(3.0, 0.0, 0.0),
+            Point3::new(0.0, 2.0, 0.0),
+            Point3::new(-3.0, 0.0, 0.0),
+        ]);
+        let candidates0 = [ell0.clone(), ell1.clone()];
+        let chosen = pick_closest_ellipse(&poly_near_0, &candidates0);
+        // Should pick ell0 (same plane)
+        assert!(
+            (chosen.center - ell0.center).magnitude() < 1e-10
+                && (chosen.axis_u - ell0.axis_u).magnitude() < 1e-10,
+            "Should pick ell0 for XY-plane polyline"
+        );
+
+        // Polyline near ell1 (in YZ plane)
+        let poly_near_1 = PolylineCurve(vec![
+            Point3::new(0.0, 3.0, 0.0),
+            Point3::new(0.0, 0.0, 2.0),
+            Point3::new(0.0, -3.0, 0.0),
+        ]);
+        let candidates1 = [ell0, ell1.clone()];
+        let chosen = pick_closest_ellipse(&poly_near_1, &candidates1);
+        assert!(
+            (chosen.center - ell1.center).magnitude() < 1e-10
+                && (chosen.axis_u - ell1.axis_u).magnitude() < 1e-10,
+            "Should pick ell1 for YZ-plane polyline"
+        );
+    }
+
+    /// CC12: Full pipeline — detect cylinder-cylinder from RevolutedCurve surfaces.
+    #[test]
+    fn test_cc12_full_pipeline() {
+        // Cylinder 0: along Z-axis, radius 2
+        let line0 = Line(Point3::new(2.0, 0.0, 0.0), Point3::new(2.0, 0.0, 10.0));
+        let cyl_surface0 =
+            RevolutedCurve::by_revolution(line0, Point3::origin(), Vector3::unit_z());
+
+        // Cylinder 1: along X-axis, radius 2
+        let line1 = Line(Point3::new(0.0, 2.0, 0.0), Point3::new(10.0, 2.0, 0.0));
+        let cyl_surface1 =
+            RevolutedCurve::by_revolution(line1, Point3::origin(), Vector3::unit_x());
+
+        let result = try_analytical_cylinder_cylinder_ic(&cyl_surface0, &cyl_surface1, 0.05);
+        assert!(
+            result.is_some(),
+            "Failed to detect cylinder-cylinder pair from truck surfaces"
+        );
+
+        let ic = result.unwrap();
+        assert_eq!(ic.ellipses.len(), 2, "Expected 2 ellipses");
+
+        // Verify all points lie on both cylinders
+        let cyl0_params = detect_cylinder(&cyl_surface0).unwrap();
+        let cyl1_params = detect_cylinder(&cyl_surface1).unwrap();
+        for ell in &ic.ellipses {
+            assert_points_on_both_cylinders(ell, &cyl0_params, &cyl1_params, 1e-4);
+        }
+    }
+
+    /// Helper: compute minimum distance from a point to any ellipse in the set.
+    fn dist_to_closest_ellipse(pt: &Point3, ellipses: &[EllipseParams]) -> f64 {
+        ellipses
+            .iter()
+            .map(|ell| (*pt - project_to_ellipse(pt, ell)).magnitude())
+            .fold(f64::MAX, f64::min)
     }
 }

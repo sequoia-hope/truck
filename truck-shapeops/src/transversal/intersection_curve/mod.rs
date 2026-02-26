@@ -185,7 +185,8 @@ where
     // Try plane-cylinder first, then plane-cone.
     let analytical = analytical::try_analytical_plane_cylinder_ic(&surface0, &surface1, tol)
         .or_else(|| analytical::try_analytical_plane_cone_ic(&surface0, &surface1, tol))
-        .or_else(|| analytical::try_analytical_plane_sphere_ic(&surface0, &surface1, tol));
+        .or_else(|| analytical::try_analytical_plane_sphere_ic(&surface0, &surface1, tol))
+        .or_else(|| analytical::try_analytical_cylinder_cylinder_ic(&surface0, &surface1, tol));
 
     let interferences = polygon0.extract_interference(polygon1);
     // Never make polyline grid coarser than the base TOLERANCE
