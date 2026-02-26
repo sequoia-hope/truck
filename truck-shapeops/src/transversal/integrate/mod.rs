@@ -1721,6 +1721,157 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     }
 }
 
+/// Force-merge open edges by geometric endpoint position.
+///
+/// Unlike `weld_coincident_edges` which requires 3-point curve agreement,
+/// this function matches open edges purely by endpoint positions. This handles
+/// cases where two IC approximation curves represent the same intersection
+/// but have different BSpline parameterizations that don't match at sample points.
+///
+/// Only touches edges with ref_count == 1 (open edges). Returns the number
+/// of edges merged.
+fn force_merge_open_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell: &mut Shell<Point3, C, S>,
+    tol: f64,
+) -> usize {
+    use std::collections::BTreeMap;
+
+    // Step 1: Find open edges (ref count == 1)
+    let mut edge_ref_count: BTreeMap<EdgeID<C>, usize> = BTreeMap::new();
+    let mut edge_by_id: BTreeMap<EdgeID<C>, Edge<Point3, C>> = BTreeMap::new();
+
+    for face in shell.iter() {
+        for wire in face.absolute_boundaries().iter() {
+            for edge in wire.iter() {
+                let abs = edge.absolute_clone();
+                *edge_ref_count.entry(abs.id()).or_insert(0) += 1;
+                edge_by_id.entry(abs.id()).or_insert(abs);
+            }
+        }
+    }
+
+    let open_edges: Vec<Edge<Point3, C>> = edge_ref_count
+        .iter()
+        .filter(|(_, &count)| count == 1)
+        .filter_map(|(id, _)| edge_by_id.get(id).cloned())
+        .collect();
+
+    if open_edges.len() < 2 {
+        return 0;
+    }
+
+    // Step 2: Match open edges by endpoint positions
+    let mut merge_map: BTreeMap<EdgeID<C>, Edge<Point3, C>> = BTreeMap::new();
+    let mut used = vec![false; open_edges.len()];
+
+    for i in 0..open_edges.len() {
+        if used[i] {
+            continue;
+        }
+        let ei = &open_edges[i];
+        let fi = ei.front().point();
+        let bi = ei.back().point();
+
+        for j in (i + 1)..open_edges.len() {
+            if used[j] {
+                continue;
+            }
+            let ej = &open_edges[j];
+            let fj = ej.front().point();
+            let bj = ej.back().point();
+
+            // Match same-direction: fi≈fj, bi≈bj
+            let same_dir = (fi - fj).magnitude() < tol && (bi - bj).magnitude() < tol;
+            // Match opposite-direction: fi≈bj, bi≈fj
+            let opp_dir = (fi - bj).magnitude() < tol && (bi - fj).magnitude() < tol;
+
+            if same_dir || opp_dir {
+                // ei is canonical, ej maps to ei
+                merge_map.insert(ej.id(), ei.clone());
+                used[i] = true;
+                used[j] = true;
+                break;
+            }
+        }
+    }
+
+    if merge_map.is_empty() {
+        return 0;
+    }
+
+    let merge_count = merge_map.len();
+
+    // Step 3: Rebuild faces with merged edges
+    let new_faces: Vec<Face<Point3, C, S>> = shell
+        .iter()
+        .map(|face| {
+            let ori = face.orientation();
+            let mut any_merged = false;
+            let new_wires: Vec<Wire<Point3, C>> = face
+                .absolute_boundaries()
+                .iter()
+                .map(|wire| {
+                    let edges: Vec<Edge<Point3, C>> = wire
+                        .iter()
+                        .map(|edge| {
+                            let abs = edge.absolute_clone();
+                            match merge_map.get(&abs.id()) {
+                                Some(canonical) => {
+                                    any_merged = true;
+                                    // Use geometric position to determine direction
+                                    let front_dist = (abs.front().point()
+                                        - canonical.front().point())
+                                    .magnitude();
+                                    let cross_dist =
+                                        (abs.front().point() - canonical.back().point()).magnitude();
+                                    let same_dir = front_dist <= cross_dist;
+                                    if same_dir == edge.orientation() {
+                                        canonical.clone()
+                                    } else {
+                                        canonical.inverse()
+                                    }
+                                }
+                                None => edge.clone(),
+                            }
+                        })
+                        .collect();
+                    edges.into()
+                })
+                .collect();
+
+            if !any_merged {
+                return face.clone();
+            }
+
+            let surface = face.surface();
+            match Face::try_new(new_wires.clone(), surface.clone()) {
+                Ok(mut new_face) => {
+                    if !ori {
+                        new_face.invert();
+                    }
+                    new_face
+                }
+                Err(_) => {
+                    // Fallback: new_unchecked preserves merged edges
+                    let all_closed = new_wires.iter().all(|w| !w.is_empty() && w.is_closed());
+                    if !new_wires.is_empty() && all_closed {
+                        let mut f = Face::new_unchecked(new_wires, surface.clone());
+                        if !ori {
+                            f.invert();
+                        }
+                        f
+                    } else {
+                        face.clone()
+                    }
+                }
+            }
+        })
+        .collect();
+
+    *shell = new_faces.into_iter().collect();
+    merge_count
+}
+
 /// Information about an edge that appears in != 2 faces (open or over-shared).
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -2149,126 +2300,143 @@ fn canonicalize_ic_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     weld_coincident_edges(shell, tol, None);
 }
 
-/// Single-pass shell assembly (v2).
+/// Shell assembly with progressive weld tolerance escalation (v2).
 ///
-/// Performs the initial weld and checks for shell closure. If the shell
-/// closes after the initial weld, returns the solid directly. On failure,
-/// the shell is left in a post-weld state so the caller's fallback path
-/// can continue with progressively wider welds.
+/// Tries 3 levels of weld tolerance before giving up:
+///  - Level 0: default (0.2× tau_model) — conservative, avoids merging across features
+///  - Level 1: tau_weld (0.4× tau_model) — wider, catches IC approximation gaps
+///  - Level 2: tau_edge_cluster (5.0× tau_model) — aggressive, last resort
+///
+/// At each level, if the shell closes, attempts `Solid::try_new` or accepts
+/// a `ShellCondition::Closed` shell via `new_unchecked`.
 fn assemble_boolean_shell_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell: &mut Shell<Point3, C, S>,
     tols: &BooleanTolerance,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
-    // Step 1: Initial weld — same as legacy level 1.
-    // Uses default weld (0.2× tau_model) to avoid merging across features.
-    canonicalize_ic_edges(shell, tols.tau_model);
+    use truck_topology::shell::ShellCondition;
 
-    let open = diagnose_open_edges(shell);
-    eprintln!(
-        "[v2_assembly] after canonicalize: {} faces, {} open edges",
-        shell.len(),
-        open.len(),
-    );
+    // Progressive weld levels: (label, weld_tol override)
+    let levels: [(& str, Option<f64>); 3] = [
+        ("default(0.2x)", None),                    // Level 0: 0.2× tau_model
+        ("tau_weld(0.4x)", Some(tols.tau_weld)),    // Level 1: 0.4× tau_model
+        ("tau_edge_cluster(5.0x)", Some(tols.tau_edge_cluster)), // Level 2: 5.0× tau_model
+    ];
 
-    // Step 2: If shell is already closed, assemble directly.
-    if open.is_empty() {
-        let boundaries = shell.connected_components();
-        if let Ok(solid) = Solid::try_new(boundaries) {
-            return Ok(solid);
+    let mut last_open_count = 0usize;
+
+    for (level, (label, weld_override)) in levels.iter().enumerate() {
+        // Level 0 uses canonicalize_ic_edges (includes Phase 0 + Phase 1).
+        // Higher levels apply incremental weld with wider tolerance.
+        if level == 0 {
+            canonicalize_ic_edges(shell, tols.tau_model);
+        } else {
+            weld_coincident_edges(shell, tols.tau_model, *weld_override);
         }
-        // Solid::try_new failed (e.g., singular vertices) — also try
-        // new_unchecked for Closed shells (matches legacy level 7).
-        use truck_topology::shell::ShellCondition;
-        let boundaries = shell.connected_components();
-        let all_closed = boundaries
-            .iter()
-            .all(|s| s.shell_condition() == ShellCondition::Closed);
-        if all_closed {
-            return Ok(Solid::new_unchecked(boundaries));
+
+        let open = diagnose_open_edges(shell);
+        eprintln!(
+            "[v2_assembly] level {} ({}): {} faces, {} open edges",
+            level, label, shell.len(), open.len(),
+        );
+
+        if open.is_empty() {
+            // Try Solid::try_new first (strict check).
+            let boundaries = shell.connected_components();
+            if let Ok(solid) = Solid::try_new(boundaries) {
+                eprintln!("[v2_assembly] closed at level {} ({})", level, label);
+                return Ok(solid);
+            }
+            // Fallback: accept Closed shells with singular vertices.
+            let boundaries = shell.connected_components();
+            let all_closed = boundaries
+                .iter()
+                .all(|s| s.shell_condition() == ShellCondition::Closed);
+            if all_closed {
+                eprintln!("[v2_assembly] closed (unchecked) at level {} ({})", level, label);
+                return Ok(Solid::new_unchecked(boundaries));
+            }
+        }
+
+        last_open_count = open.len();
+    }
+
+    // Level 3: Force-merge open edges by geometric position.
+    // This bypasses curve matching and pairs open edges purely by endpoint
+    // positions. Handles IC approximation curves that represent the same
+    // intersection but have different BSpline parameterizations.
+    if last_open_count > 0 {
+        let merged = force_merge_open_edges(shell, tols.tau_edge_cluster);
+        if merged > 0 {
+            let open = diagnose_open_edges(shell);
+            eprintln!(
+                "[v2_assembly] level 3 (force_merge): merged {} edge pairs, {} open remain",
+                merged,
+                open.len(),
+            );
+
+            if open.is_empty() {
+                let boundaries = shell.connected_components();
+                if let Ok(solid) = Solid::try_new(boundaries) {
+                    eprintln!("[v2_assembly] closed at level 3 (force_merge)");
+                    return Ok(solid);
+                }
+                let boundaries = shell.connected_components();
+                let all_closed = boundaries
+                    .iter()
+                    .all(|s| s.shell_condition() == ShellCondition::Closed);
+                if all_closed {
+                    eprintln!("[v2_assembly] closed (unchecked) at level 3 (force_merge)");
+                    return Ok(Solid::new_unchecked(boundaries));
+                }
+            }
+
+            last_open_count = open.len();
         }
     }
 
     Err(BooleanStageError::ShellAssembly(format!(
-        "v2: {} open edges after weld",
-        open.len()
+        "v2: {} open edges after all 4 levels (3 weld + force_merge)",
+        last_open_count
     )))
 }
 
 /// Finalize a boolean shell: weld edges and assemble into a Solid.
 ///
-/// Uses v2 assembly (single-pass weld + assemble) as the primary path,
-/// with progressively wider weld fallbacks if the initial pass leaves open edges.
+/// Delegates to `assemble_boolean_shell_v2` which internally escalates
+/// through 3 progressive weld tolerance levels (0.2x → 0.4x → 5.0x tau_model).
 fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell: &mut Shell<Point3, C, S>,
     tols: &BooleanTolerance,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
-    // Try v2 assembly first (single-pass weld + assemble)
-    if let Ok(solid) = assemble_boolean_shell_v2(shell, tols) {
-        return Ok(solid);
-    }
-
-    // V2 failed — try progressively wider welds
-    let wider_tols = [tols.tau_weld * 5.0, tols.tau_weld * 12.5, tols.tau_weld * 25.0];
-    for &wider in &wider_tols {
-        weld_coincident_edges(shell, tols.tau_model, Some(wider));
-        let boundaries = shell.connected_components();
-        if let Ok(solid) = Solid::try_new(boundaries) {
-            return Ok(solid);
-        }
-    }
-
-    // Accept Closed shells with singular vertices
-    use truck_topology::shell::ShellCondition;
-    let boundaries = shell.connected_components();
-    let all_closed = boundaries
-        .iter()
-        .all(|s| s.shell_condition() == ShellCondition::Closed);
-    if all_closed {
-        return Ok(Solid::new_unchecked(boundaries));
-    }
-    Err(BooleanStageError::ShellAssembly(
-        "v2 assembly + wider weld failed".to_string()
-    ))
+    assemble_boolean_shell_v2(shell, tols)
 }
 
 /// Finalize with diagnostics recovery tracking.
+///
+/// Delegates to `assemble_boolean_shell_v2` which internally escalates
+/// through 3 weld tolerance levels. This wrapper just populates
+/// recovery diagnostics.
 fn finalize_boolean_shell_with_recovery_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell: &mut Shell<Point3, C, S>,
     tols: &BooleanTolerance,
     recovery: &mut diagnostics::RecoveryReport,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
-    if let Ok(solid) = assemble_boolean_shell_v2(shell, tols) {
-        recovery.recovery_level = 0;
-        populate_euler(&mut Some(recovery), shell);
-        return Ok(solid);
-    }
+    let result = assemble_boolean_shell_v2(shell, tols);
+    populate_euler(&mut Some(recovery), shell);
 
-    // V2 failed — try progressively wider welds
-    let wider_tols = [tols.tau_weld * 5.0, tols.tau_weld * 12.5, tols.tau_weld * 25.0];
-    for (i, &wider) in wider_tols.iter().enumerate() {
-        recovery.recovery_level = (i + 1) as u8;
-        weld_coincident_edges(shell, tols.tau_model, Some(wider));
-        populate_euler(&mut Some(recovery), shell);
-        let boundaries = shell.connected_components();
-        if let Ok(solid) = Solid::try_new(boundaries) {
-            return Ok(solid);
+    match &result {
+        Ok(_) => {
+            // Determine which level succeeded from open-edge count.
+            // v2 logs the level internally; recovery_level 0 = success.
+            recovery.recovery_level = 0;
+        }
+        Err(_) => {
+            // All 3 levels failed.
+            recovery.recovery_level = 3;
         }
     }
 
-    // Accept Closed shells with singular vertices
-    use truck_topology::shell::ShellCondition;
-    let boundaries = shell.connected_components();
-    let all_closed = boundaries
-        .iter()
-        .all(|s| s.shell_condition() == ShellCondition::Closed);
-    if all_closed {
-        recovery.recovery_level = (wider_tols.len() + 1) as u8;
-        populate_euler(&mut Some(recovery), shell);
-        return Ok(Solid::new_unchecked(boundaries));
-    }
-    Err(BooleanStageError::ShellAssembly(
-        "v2 assembly + wider weld failed".to_string()
-    ))
+    result
 }
 
 /// Populate Euler characteristic in recovery report.

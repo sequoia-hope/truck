@@ -1085,21 +1085,73 @@ where
                                 .add_independent_loop(BoundaryWire::new(geom_wire, status1));
                         }
                     } else {
-                        // Phase 1C: Skip degenerate short ICs.
-                        // When a vertex of one shell lies on a face of the other,
-                        // the SSI can produce a near-zero-length IC segment.
-                        // These create degenerate edges that corrupt wire topology.
+                        // Phase 1C: 3-way short IC classification.
+                        // Short ICs (length < tol) are classified as:
+                        //   (a) shared-edge artifact — both endpoints on BOTH faces' boundaries → skip
+                        //   (b) point-degenerate — <3 points AND extremely short → skip
+                        //   (c) boundary-entry — carries topological info (e.g. cylinder touching
+                        //       cube edge) → keep, let normal IC processing add vertices
                         let ic_length: f64 = polyline
                             .0
                             .windows(2)
                             .map(|w| (w[1] - w[0]).magnitude())
                             .sum();
                         if ic_length < tol {
-                            eprintln!(
-                                "[boolean] Phase 1C: Skipping short IC (length {:.2e} < tol {:.2e})",
-                                ic_length, tol
+                            let front = *polyline.0.first().unwrap();
+                            let back = *polyline.0.last().unwrap();
+
+                            let front_on_b0 = is_midpoint_on_face_boundary(
+                                front,
+                                &geom_shell0[face_index0],
+                                boundary_tol,
                             );
-                            return Some(());
+                            let front_on_b1 = is_midpoint_on_face_boundary(
+                                front,
+                                &geom_shell1[face_index1],
+                                boundary_tol,
+                            );
+                            let back_on_b0 = is_midpoint_on_face_boundary(
+                                back,
+                                &geom_shell0[face_index0],
+                                boundary_tol,
+                            );
+                            let back_on_b1 = is_midpoint_on_face_boundary(
+                                back,
+                                &geom_shell1[face_index1],
+                                boundary_tol,
+                            );
+
+                            // Case 1: shared-edge artifact — both endpoints on BOTH faces' boundaries.
+                            // This is a degenerate IC along an already-shared edge. Skip it.
+                            if (front_on_b0 && front_on_b1) && (back_on_b0 && back_on_b1) {
+                                eprintln!(
+                                    "[boolean] Phase 1C: Skipping shared-edge artifact IC \
+                                     (length {:.2e} < tol {:.2e}, both endpoints on both boundaries)",
+                                    ic_length, tol
+                                );
+                                return Some(());
+                            }
+
+                            // Case 2: point-degenerate — very few points AND extremely short.
+                            if polyline.0.len() < 3 && ic_length < tol * 1e-3 {
+                                eprintln!(
+                                    "[boolean] Phase 1C: Skipping point-degenerate IC \
+                                     (length {:.2e}, {} points)",
+                                    ic_length, polyline.0.len()
+                                );
+                                return Some(());
+                            }
+
+                            // Case 3: boundary-entry IC — carries topological info, keep it.
+                            // Short ICs where at least one endpoint is NOT on both boundaries
+                            // indicate a genuine intersection (e.g. cylinder touching cube edge).
+                            // Let normal IC processing proceed to add vertices to face boundaries.
+                            eprintln!(
+                                "[boolean] Phase 1C: Keeping boundary-entry IC \
+                                 (length {:.2e}, {} points, front_on_b=[{},{}], back_on_b=[{},{}])",
+                                ic_length, polyline.0.len(),
+                                front_on_b0, front_on_b1, back_on_b0, back_on_b1
+                            );
                         }
 
                         // Phase 1C: Snap IC endpoints to coincident vertex positions.
