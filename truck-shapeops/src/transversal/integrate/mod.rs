@@ -1664,7 +1664,13 @@ fn weld_coincident_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                             Some(c) if !used_canonicals.contains(&c.id()) => {
                                 used_canonicals.insert(c.id());
                                 let abs_edge = edge.absolute_clone();
-                                let same_dir = abs_edge.front().id() == c.front().id();
+                                // Use geometric position to determine direction since
+                                // vertex IDs may differ after mapped() or Phase 0 fallback
+                                let front_dist =
+                                    (abs_edge.front().point() - c.front().point()).magnitude();
+                                let cross_dist =
+                                    (abs_edge.front().point() - c.back().point()).magnitude();
+                                let same_dir = front_dist <= cross_dist;
                                 if same_dir == edge.orientation() {
                                     c.clone()
                                 } else {
@@ -2042,7 +2048,15 @@ fn targeted_open_edge_reweld<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                                 if let Some(canonical) = canonical_edges.get(&target_id) {
                                     any_replaced = true;
                                     let abs = edge.absolute_clone();
-                                    let same_dir = abs.front().id() == canonical.front().id();
+                                    // Use geometric position to determine direction since
+                                    // vertex IDs may differ after mapped() or Phase 0 fallback
+                                    let front_dist = (abs.front().point()
+                                        - canonical.front().point())
+                                    .magnitude();
+                                    let cross_dist = (abs.front().point()
+                                        - canonical.back().point())
+                                    .magnitude();
+                                    let same_dir = front_dist <= cross_dist;
                                     if same_dir == edge.orientation() {
                                         canonical.clone()
                                     } else {
@@ -2788,6 +2802,239 @@ fn finalize_boolean_shell_with_recovery<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>
     finalize_boolean_shell_inner(shell, tols, Some(recovery))
 }
 
+/// Force-merge open edges by geometric position with vertex remapping.
+///
+/// This is a more aggressive version of `position_based_edge_reweld` that also
+/// remaps vertices when replacing edges. When an edge E_old is replaced with
+/// canonical E_canon, adjacent edges in the wire that reference E_old's vertices
+/// are updated to use E_canon's vertices. This maintains wire connectivity,
+/// preventing `Face::try_new` from rejecting the rebuilt face.
+///
+/// Falls back to `Face::new_unchecked` instead of `face.clone()` to preserve
+/// the edge replacements even when wire simplicity checks fail.
+fn force_merge_open_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
+    shell: &mut Shell<Point3, C, S>,
+    tol: f64,
+) {
+    use rustc_hash::{FxHashMap, FxHashSet};
+    type Vid = VertexID<Point3>;
+
+    // Step 1: Find all open edges (ref_count == 1)
+    let mut edge_ref_count: std::collections::BTreeMap<EdgeID<C>, usize> =
+        std::collections::BTreeMap::new();
+    for face in shell.iter() {
+        for wire in face.absolute_boundaries().iter() {
+            for edge in wire.iter() {
+                *edge_ref_count.entry(edge.id()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let open_eids: FxHashSet<EdgeID<C>> = edge_ref_count
+        .iter()
+        .filter(|(_, &count)| count == 1)
+        .map(|(id, _)| *id)
+        .collect();
+
+    if open_eids.is_empty() {
+        return;
+    }
+
+    // Step 2: Group open edges by geometric position (endpoints + midpoint)
+    struct OpenEdgeInfo<C2> {
+        edge_id: EdgeID<C2>,
+        edge: Edge<Point3, C2>,
+        front: Point3,
+        back: Point3,
+        midpoint: Point3,
+    }
+
+    let mut open_edges: Vec<OpenEdgeInfo<C>> = Vec::new();
+    for face in shell.iter() {
+        for wire in face.absolute_boundaries().iter() {
+            for edge in wire.iter() {
+                if !open_eids.contains(&edge.id()) {
+                    continue;
+                }
+                let abs = edge.absolute_clone();
+                let curve = abs.curve();
+                let (t0, t1) = curve.range_tuple();
+                let midpoint = curve.subs((t0 + t1) * 0.5);
+                open_edges.push(OpenEdgeInfo {
+                    edge_id: edge.id(),
+                    edge: abs.clone(),
+                    front: abs.front().point(),
+                    back: abs.back().point(),
+                    midpoint,
+                });
+            }
+        }
+    }
+
+    // Find pairs of open edges that are geometric twins
+    let mut edge_to_canonical: FxHashMap<EdgeID<C>, Edge<Point3, C>> = FxHashMap::default();
+    let mut vertex_remap: FxHashMap<Vid, Vertex<Point3>> = FxHashMap::default();
+    let mut matched: FxHashSet<EdgeID<C>> = FxHashSet::default();
+
+    for i in 0..open_edges.len() {
+        let ei = &open_edges[i];
+        if matched.contains(&ei.edge_id) {
+            continue;
+        }
+        for ej in &open_edges[(i + 1)..] {
+            if matched.contains(&ej.edge_id) {
+                continue;
+            }
+            if ei.edge_id == ej.edge_id {
+                continue;
+            }
+
+            // Check forward and reverse matching
+            let fwd_f = (ei.front - ej.front).magnitude();
+            let fwd_b = (ei.back - ej.back).magnitude();
+            let rev_f = (ei.front - ej.back).magnitude();
+            let rev_b = (ei.back - ej.front).magnitude();
+            let mid_d = (ei.midpoint - ej.midpoint).magnitude();
+
+            let fwd_match = fwd_f < tol && fwd_b < tol;
+            let rev_match = rev_f < tol && rev_b < tol;
+
+            if (fwd_match || rev_match) && mid_d < tol {
+                // ei is canonical, ej maps to ei
+                edge_to_canonical.insert(ej.edge_id, ei.edge.clone());
+                matched.insert(ej.edge_id);
+                matched.insert(ei.edge_id);
+
+                // Build vertex remap: ej's vertices → ei's vertices
+                if fwd_match {
+                    if ej.edge.front().id() != ei.edge.front().id() {
+                        vertex_remap.insert(ej.edge.front().id(), ei.edge.front().clone());
+                    }
+                    if ej.edge.back().id() != ei.edge.back().id() {
+                        vertex_remap.insert(ej.edge.back().id(), ei.edge.back().clone());
+                    }
+                } else {
+                    // Reverse match
+                    if ej.edge.front().id() != ei.edge.back().id() {
+                        vertex_remap.insert(ej.edge.front().id(), ei.edge.back().clone());
+                    }
+                    if ej.edge.back().id() != ei.edge.front().id() {
+                        vertex_remap.insert(ej.edge.back().id(), ei.edge.front().clone());
+                    }
+                }
+                break; // each edge matches at most one partner
+            }
+        }
+    }
+
+    if edge_to_canonical.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "[force_merge] merging {} open edge pairs, {} vertex remaps",
+        edge_to_canonical.len(),
+        vertex_remap.len(),
+    );
+
+    // Step 3: Rebuild faces with canonical edges AND remapped vertices
+    let new_faces: Vec<Face<Point3, C, S>> = shell
+        .iter()
+        .map(|face| {
+            let ori = face.orientation();
+            let mut any_changed = false;
+            let new_wires: Vec<Wire<Point3, C>> = face
+                .absolute_boundaries()
+                .iter()
+                .map(|wire| {
+                    let edges: Vec<Edge<Point3, C>> = wire
+                        .iter()
+                        .filter_map(|edge| {
+                            let abs = edge.absolute_clone();
+                            if let Some(canonical) = edge_to_canonical.get(&edge.id()) {
+                                any_changed = true;
+                                // Determine direction: match geometric positions
+                                let front_dist =
+                                    (abs.front().point() - canonical.front().point()).magnitude();
+                                let cross_dist =
+                                    (abs.front().point() - canonical.back().point()).magnitude();
+                                let same_dir = front_dist <= cross_dist;
+                                let result = if same_dir == edge.orientation() {
+                                    canonical.clone()
+                                } else {
+                                    canonical.inverse()
+                                };
+                                Some(result)
+                            } else {
+                                // Check if vertices need remapping
+                                let f = vertex_remap.get(&abs.front().id());
+                                let b = vertex_remap.get(&abs.back().id());
+                                if f.is_none() && b.is_none() {
+                                    return Some(edge.clone());
+                                }
+                                any_changed = true;
+                                let new_front = f.cloned().unwrap_or_else(|| abs.front().clone());
+                                let new_back = b.cloned().unwrap_or_else(|| abs.back().clone());
+                                // Skip degenerate edges
+                                if new_front.id() == new_back.id() {
+                                    return None;
+                                }
+                                match Edge::try_new(&new_front, &new_back, abs.curve()) {
+                                    Ok(new_edge) => {
+                                        if edge.orientation() {
+                                            Some(new_edge)
+                                        } else {
+                                            Some(new_edge.inverse())
+                                        }
+                                    }
+                                    Err(_) => Some(edge.clone()),
+                                }
+                            }
+                        })
+                        .collect();
+                    edges.into()
+                })
+                .collect();
+            if !any_changed {
+                return face.clone();
+            }
+            let surface = face.surface();
+            match Face::try_new(new_wires.clone(), surface.clone()) {
+                Ok(mut new_face) => {
+                    if !ori {
+                        new_face.invert();
+                    }
+                    new_face
+                }
+                Err(_) => {
+                    if let Some(split_face) = try_split_non_simple_wires(&new_wires, &surface, ori)
+                    {
+                        split_face
+                    } else {
+                        // Use new_unchecked to preserve edge/vertex changes.
+                        // NEVER fall back to face.clone() — that reverts the
+                        // canonical edge replacements, leaving open edges.
+                        let all_closed = new_wires.iter().all(|w| !w.is_empty() && w.is_closed());
+                        if !new_wires.is_empty() && all_closed {
+                            let mut f = Face::new_unchecked(new_wires, surface.clone());
+                            if !ori {
+                                f.invert();
+                            }
+                            f
+                        } else {
+                            // Last resort: face.clone() (shouldn't happen with
+                            // vertex remapping maintaining wire connectivity)
+                            face.clone()
+                        }
+                    }
+                }
+            }
+        })
+        .collect();
+
+    *shell = new_faces.into_iter().collect();
+}
+
 /// Populate Euler characteristic in recovery report.
 fn populate_euler<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     recovery: &mut Option<&mut diagnostics::RecoveryReport>,
@@ -2891,10 +3138,20 @@ fn finalize_boolean_shell_inner<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                 r.recovery_level = 3;
             }
             targeted_open_edge_reweld(shell, tols.tau_weld * 25.0);
-            let boundaries = shell.connected_components();
-            if let Ok(solid) = Solid::try_new(boundaries) {
-                populate_euler(&mut recovery, shell);
-                return Ok(solid);
+            {
+                let open_after = diagnose_open_edges(shell);
+                let boundaries = shell.connected_components();
+                eprintln!(
+                    "[finalize] after targeted_reweld: {} faces, {} open, {} components",
+                    shell.len(),
+                    open_after.len(),
+                    boundaries.len(),
+                );
+                if let Ok(solid) = Solid::try_new(boundaries) {
+                    eprintln!("[finalize] ACCEPTED at recovery level 3 (targeted_reweld)");
+                    populate_euler(&mut recovery, shell);
+                    return Ok(solid);
+                }
             }
         }
     }
@@ -2912,13 +3169,59 @@ fn finalize_boolean_shell_inner<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
             tols.tau_weld * 12.5,
             tols.tau_weld * 25.0,
         ];
-        for &rtol in &reweld_tols {
+        for (ri, &rtol) in reweld_tols.iter().enumerate() {
             position_based_edge_reweld(shell, rtol);
+            let open_after = diagnose_open_edges(shell);
             let boundaries = shell.connected_components();
+            eprintln!(
+                "[finalize] after pos_reweld[{}]: {} faces, {} open, {} components",
+                ri,
+                shell.len(),
+                open_after.len(),
+                boundaries.len(),
+            );
             if let Ok(solid) = Solid::try_new(boundaries) {
+                eprintln!(
+                    "[finalize] ACCEPTED at recovery level 4 (pos_reweld[{}])",
+                    ri
+                );
                 populate_euler(&mut recovery, shell);
                 return Ok(solid);
             }
+        }
+    }
+
+    // Force-merge open edges: more aggressive than position_based_edge_reweld.
+    // When replacing an edge with a canonical, also remaps vertices on adjacent
+    // edges to maintain wire connectivity. Uses new_unchecked fallback instead
+    // of face.clone() to preserve changes even when wire simplicity check fails.
+    {
+        let open_before = diagnose_open_edges(shell);
+        if !open_before.is_empty() {
+            if let Some(ref mut r) = recovery {
+                r.recovery_level = 5;
+            }
+            let force_tols = [
+                tols.tau_weld * 5.0,
+                tols.tau_weld * 12.5,
+                tols.tau_weld * 25.0,
+            ];
+            for &ftol in &force_tols {
+                force_merge_open_edges(shell, ftol);
+                // Re-weld after force merge to canonicalize any remaining edges
+                weld_coincident_edges(shell, tols.tau_model, Some(ftol));
+                let boundaries = shell.connected_components();
+                if let Ok(solid) = Solid::try_new(boundaries) {
+                    populate_euler(&mut recovery, shell);
+                    return Ok(solid);
+                }
+            }
+            let open_after = diagnose_open_edges(shell);
+            eprintln!(
+                "[finalize] after force_merge: {} open edges (was {})",
+                open_after.len(),
+                open_before.len(),
+            );
         }
     }
 
@@ -2928,7 +3231,7 @@ fn finalize_boolean_shell_inner<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     // from the shell, then re-weld to canonicalize the fragments.
     if split_open_edges_at_interior_vertices(shell, tols.tau_model) {
         if let Some(ref mut r) = recovery {
-            r.recovery_level = 5;
+            r.recovery_level = 6;
         }
         weld_coincident_edges(shell, tols.tau_model, None);
         let boundaries = shell.connected_components();
@@ -2990,7 +3293,7 @@ fn finalize_boolean_shell_inner<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         .all(|s| s.shell_condition() == ShellCondition::Closed);
     if acceptable && all_closed {
         if let Some(ref mut r) = recovery {
-            r.recovery_level = 6;
+            r.recovery_level = 7;
         }
         populate_euler(&mut recovery, shell);
         return Ok(Solid::new_unchecked(boundaries));
