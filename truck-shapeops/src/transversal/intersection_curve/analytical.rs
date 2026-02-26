@@ -653,4 +653,258 @@ mod tests {
         // First and last points should be identical
         assert_eq!(poly.0[0], poly.0[32]);
     }
+
+    // --- Plane-Cylinder edge case tests (Sprint 40) ---
+
+    /// Helper: verify all sampled points lie on both the plane and the cylinder.
+    fn assert_points_on_plane_and_cylinder(
+        ellipse: &EllipseParams,
+        plane_origin: Point3,
+        plane_normal: Vector3,
+        cyl_axis: Vector3,
+        cyl_center: Point3,
+        radius: f64,
+    ) {
+        let poly = sample_ellipse(ellipse, 128);
+        for pt in &poly.0 {
+            // On the plane
+            let d = plane_normal.dot(*pt - plane_origin).abs();
+            assert!(d < 1e-8, "point not on plane: dist = {d}");
+            // On the cylinder (distance from axis = radius)
+            let v = *pt - cyl_center;
+            let along = v.dot(cyl_axis) * cyl_axis;
+            let perp = v - along;
+            let r = perp.magnitude();
+            assert!(
+                (r - radius).abs() < 1e-8,
+                "point not on cylinder: r = {r}, expected {radius}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plane_cylinder_oblique_30deg() {
+        // Plane normal at 30° from Z-axis (60° from XY-plane)
+        let angle = 30.0_f64.to_radians();
+        let normal = Vector3::new(0.0, angle.sin(), angle.cos()).normalize();
+        let plane = PlaneParams {
+            origin: Point3::origin(),
+            normal,
+        };
+        let cyl = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            radius: 2.0,
+        };
+
+        let ellipse = compute_plane_cylinder_intersection(&plane, &cyl).unwrap();
+
+        // Expected semi-axes: minor = R = 2, major = R / cos(30°)
+        let semi_a = ellipse.axis_u.magnitude();
+        let semi_b = ellipse.axis_v.magnitude();
+        let (minor, major) = if semi_a < semi_b {
+            (semi_a, semi_b)
+        } else {
+            (semi_b, semi_a)
+        };
+        let expected_major = 2.0 / angle.cos();
+        assert!(
+            (minor - 2.0).abs() < 1e-8,
+            "minor = {minor}, expected 2.0"
+        );
+        assert!(
+            (major - expected_major).abs() < 1e-8,
+            "major = {major}, expected {expected_major}"
+        );
+
+        assert_points_on_plane_and_cylinder(
+            &ellipse,
+            Point3::origin(),
+            normal,
+            Vector3::unit_z(),
+            Point3::origin(),
+            2.0,
+        );
+    }
+
+    #[test]
+    fn test_plane_cylinder_oblique_60deg() {
+        // Plane normal at 60° from Z-axis
+        let angle = 60.0_f64.to_radians();
+        let normal = Vector3::new(angle.sin(), 0.0, angle.cos()).normalize();
+        let plane = PlaneParams {
+            origin: Point3::origin(),
+            normal,
+        };
+        let cyl = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            radius: 1.5,
+        };
+
+        let ellipse = compute_plane_cylinder_intersection(&plane, &cyl).unwrap();
+
+        let semi_a = ellipse.axis_u.magnitude();
+        let semi_b = ellipse.axis_v.magnitude();
+        let (minor, major) = if semi_a < semi_b {
+            (semi_a, semi_b)
+        } else {
+            (semi_b, semi_a)
+        };
+        let expected_major = 1.5 / angle.cos();
+        assert!(
+            (minor - 1.5).abs() < 1e-8,
+            "minor = {minor}, expected 1.5"
+        );
+        assert!(
+            (major - expected_major).abs() < 1e-8,
+            "major = {major}, expected {expected_major}"
+        );
+
+        assert_points_on_plane_and_cylinder(
+            &ellipse,
+            Point3::origin(),
+            normal,
+            Vector3::unit_z(),
+            Point3::origin(),
+            1.5,
+        );
+    }
+
+    #[test]
+    fn test_plane_cylinder_oblique_85deg() {
+        // Nearly grazing: plane normal at 85° from Z-axis (5° from parallel)
+        let angle = 85.0_f64.to_radians();
+        let normal = Vector3::new(0.0, angle.sin(), angle.cos()).normalize();
+        let plane = PlaneParams {
+            origin: Point3::origin(),
+            normal,
+        };
+        let cyl = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            radius: 1.0,
+        };
+
+        let ellipse = compute_plane_cylinder_intersection(&plane, &cyl).unwrap();
+
+        // At 85°, major axis = R / cos(85°) ≈ 11.47
+        let semi_a = ellipse.axis_u.magnitude();
+        let semi_b = ellipse.axis_v.magnitude();
+        let (minor, major) = if semi_a < semi_b {
+            (semi_a, semi_b)
+        } else {
+            (semi_b, semi_a)
+        };
+        let expected_major = 1.0 / angle.cos();
+        assert!(
+            (minor - 1.0).abs() < 1e-8,
+            "minor = {minor}, expected 1.0"
+        );
+        assert!(
+            (major - expected_major).abs() < 1e-6,
+            "major = {major}, expected {expected_major}"
+        );
+
+        assert_points_on_plane_and_cylinder(
+            &ellipse,
+            Point3::origin(),
+            normal,
+            Vector3::unit_z(),
+            Point3::origin(),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn test_plane_cylinder_near_parallel_returns_none() {
+        // Plane normal nearly perpendicular to cylinder axis (nearly parallel plane)
+        // dot(normal, axis) < 1e-6, so should return None
+        let normal = Vector3::new(1.0, 0.0, 1e-7).normalize();
+        let plane = PlaneParams {
+            origin: Point3::origin(),
+            normal,
+        };
+        let cyl = CylinderParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            radius: 1.0,
+        };
+        assert!(
+            compute_plane_cylinder_intersection(&plane, &cyl).is_none(),
+            "Near-parallel plane should return None"
+        );
+    }
+
+    #[test]
+    fn test_plane_cylinder_arbitrary_orientation() {
+        // Cylinder with axis along [1,1,1] normalized
+        let axis = Vector3::new(1.0, 1.0, 1.0).normalize();
+        let cyl = CylinderParams {
+            center: Point3::new(1.0, 2.0, 3.0),
+            axis,
+            radius: 0.5,
+        };
+        // Plane perpendicular to cylinder axis at center
+        let plane = PlaneParams {
+            origin: Point3::new(1.0, 2.0, 3.0),
+            normal: axis,
+        };
+
+        let ellipse = compute_plane_cylinder_intersection(&plane, &cyl).unwrap();
+
+        // Perpendicular cut → circle with radius 0.5
+        assert!(
+            (ellipse.axis_u.magnitude() - 0.5).abs() < 1e-10,
+            "axis_u mag = {}",
+            ellipse.axis_u.magnitude()
+        );
+        assert!(
+            (ellipse.axis_v.magnitude() - 0.5).abs() < 1e-10,
+            "axis_v mag = {}",
+            ellipse.axis_v.magnitude()
+        );
+        assert!(
+            ellipse.axis_u.dot(ellipse.axis_v).abs() < 1e-10,
+            "axes not perpendicular"
+        );
+
+        assert_points_on_plane_and_cylinder(
+            &ellipse,
+            Point3::new(1.0, 2.0, 3.0),
+            axis,
+            axis,
+            Point3::new(1.0, 2.0, 3.0),
+            0.5,
+        );
+    }
+
+    #[test]
+    fn test_detect_cylinder_arbitrary_axis() {
+        // Cylinder with axis along [1,1,1] normalized
+        let axis = Vector3::new(1.0, 1.0, 1.0).normalize();
+        // Build a line at distance 3.0 from the axis
+        // Find a point perpendicular to axis at distance 3
+        let perp = axis.cross(Vector3::unit_x()).normalize();
+        let p0 = Point3::origin() + 3.0 * perp;
+        let p1 = p0 + 10.0 * axis;
+        let line = Line(p0, p1);
+        let cylinder = RevolutedCurve::by_revolution(line, Point3::origin(), axis);
+
+        let detected = detect_cylinder(&cylinder);
+        assert!(detected.is_some(), "Failed to detect arbitrary-axis cylinder");
+        let params = detected.unwrap();
+        assert!(
+            (params.axis - axis).magnitude() < 0.01
+                || (params.axis + axis).magnitude() < 0.01,
+            "axis = {:?}, expected {:?}",
+            params.axis,
+            axis
+        );
+        assert!(
+            (params.radius - 3.0).abs() < 0.05,
+            "radius = {}, expected 3.0",
+            params.radius
+        );
+    }
 }
