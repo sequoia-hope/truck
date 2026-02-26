@@ -37,6 +37,16 @@ struct ConeParams {
     half_angle: f64,
 }
 
+/// Parameters describing a detected sphere surface.
+///
+/// A sphere is defined by its center and radius. Points on the sphere
+/// satisfy: |P - center| = radius.
+#[derive(Debug, Clone)]
+struct SphereParams {
+    center: Point3,
+    radius: f64,
+}
+
 /// Parameters describing a plane-cylinder intersection ellipse/circle.
 ///
 /// The curve is parameterized as:
@@ -389,6 +399,181 @@ fn circle_radius_at<S: ParametricSurface3D>(
     Some((center, radius))
 }
 
+/// Try to detect a sphere from a generic parametric surface.
+///
+/// A sphere is a surface of revolution (one periodic direction, period ≈ 2π)
+/// with a curved generatrix (non-zero axial second derivative, unlike
+/// cylinder/cone which have straight generatrices). All surface points
+/// are equidistant from a single center point.
+fn detect_sphere<S: ParametricSurface3D>(surface: &S) -> Option<SphereParams> {
+    let u_per = surface.u_period();
+    let v_per = surface.v_period();
+
+    // Need exactly one periodic direction with period ≈ 2π.
+    // A sphere may also present as both-periodic in some representations;
+    // in that case pick the one closer to 2π.
+    let (is_v_periodic, period) = match (u_per, v_per) {
+        (Some(p), None) => (false, p),
+        (None, Some(p)) => (true, p),
+        (Some(p1), Some(p2)) => {
+            if (p1 - 2.0 * PI).abs() < 0.1 {
+                (false, p1)
+            } else if (p2 - 2.0 * PI).abs() < 0.1 {
+                (true, p2)
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    if (period - 2.0 * PI).abs() > 0.1 {
+        return None;
+    }
+
+    let (u_range, v_range) = surface.parameter_range();
+    let u_is_angular = !is_v_periodic;
+
+    let angular_start = if u_is_angular {
+        param_start(&u_range, 0.0)
+    } else {
+        param_start(&v_range, 0.0)
+    };
+
+    let axial_range = if u_is_angular { &v_range } else { &u_range };
+    let ax_start = param_start(axial_range, 0.0);
+    let ax_end = match axial_range.1 {
+        Bound::Included(v) | Bound::Excluded(v) => v,
+        Bound::Unbounded => PI,
+    };
+
+    // Must NOT have a straight generatrix (that would be cylinder or cone).
+    // Check that axial second derivative is non-zero (curved generatrix).
+    let ax_mid = (ax_start + ax_end) * 0.5;
+    let ang_mid = angular_start + period * 0.25;
+    let axial_curv = if u_is_angular {
+        surface.vvder(ang_mid, ax_mid)
+    } else {
+        surface.uuder(ax_mid, ang_mid)
+    };
+    if axial_curv.magnitude2() < 1e-8 {
+        return None; // straight generatrix → cylinder or cone, not sphere
+    }
+
+    // Sample circles at several axial positions
+    let n_axial = 5;
+    let mut circles: Vec<(f64, Point3, f64)> = Vec::new();
+    for i in 0..n_axial {
+        let t = ax_start + (ax_end - ax_start) * (i as f64 + 0.5) / n_axial as f64;
+        if let Some((center, radius)) =
+            circle_radius_at(surface, t, angular_start, period, u_is_angular)
+        {
+            if radius > 1e-10 {
+                circles.push((t, center, radius));
+            }
+        }
+    }
+
+    if circles.len() < 3 {
+        return None;
+    }
+
+    // For a sphere, all circle centers lie on the revolution axis, and there
+    // exists a unique point (sphere center) equidistant from all points on
+    // all circles. Use two circles to find the sphere center:
+    //   Let s = distance from c0 to sphere center along axis.
+    //   s² + r0² = R² and (d01 - s)² + r1² = R²
+    //   → s = (d01² + r0² - r1²) / (2 * d01)
+    let (_t0, c0, r0) = circles[0];
+    let (_t1, c1, r1) = circles[1];
+    let axis_vec = c1 - c0;
+    if axis_vec.magnitude2() < 1e-20 {
+        return None;
+    }
+    let axis = axis_vec.normalize();
+    let d01 = axis_vec.magnitude();
+
+    let s = (d01 * d01 + r0 * r0 - r1 * r1) / (2.0 * d01);
+    let sphere_center = c0 + s * axis;
+    let r_sq = s * s + r0 * r0;
+    if r_sq < 1e-20 {
+        return None;
+    }
+    let sphere_radius = r_sq.sqrt();
+
+    // Verify with remaining circles
+    for &(_t, ci, ri) in &circles[2..] {
+        let di = (ci - sphere_center).dot(axis).abs();
+        let expected_r_sq = (sphere_radius * sphere_radius - di * di).max(0.0);
+        let expected_r = expected_r_sq.sqrt();
+        if (ri - expected_r).abs() > sphere_radius * 0.02 {
+            return None;
+        }
+    }
+
+    // Also verify with actual surface points at different angular positions
+    for i in 0..4 {
+        let theta = period * i as f64 / 4.0 + angular_start;
+        let axial = ax_start + (ax_end - ax_start) * 0.3;
+        let pt = if u_is_angular {
+            surface.subs(theta, axial)
+        } else {
+            surface.subs(axial, theta)
+        };
+        let dist = (pt - sphere_center).magnitude();
+        if (dist - sphere_radius).abs() > sphere_radius * 0.02 {
+            return None;
+        }
+    }
+
+    Some(SphereParams {
+        center: sphere_center,
+        radius: sphere_radius,
+    })
+}
+
+/// Compute the intersection of a plane and sphere.
+///
+/// The intersection is always a circle (or empty/tangent point).
+/// Returns None if the plane doesn't intersect the sphere interior
+/// (tangent or no intersection).
+fn compute_sphere_plane_intersection(
+    plane: &PlaneParams,
+    sphere: &SphereParams,
+) -> Option<EllipseParams> {
+    let n = plane.normal;
+    // Signed distance from sphere center to plane
+    let d = n.dot(sphere.center - plane.origin);
+
+    // No intersection if distance >= radius (tangent or miss)
+    if d.abs() >= sphere.radius - 1e-10 {
+        return None;
+    }
+
+    // Circle center: projection of sphere center onto plane
+    let circle_center = sphere.center - d * n;
+    // Circle radius: sqrt(R² - d²)
+    let circle_radius = (sphere.radius * sphere.radius - d * d).sqrt();
+
+    if circle_radius < 1e-12 {
+        return None;
+    }
+
+    // Build orthonormal basis in the plane
+    let e1 = if n.x.abs() < 0.9 {
+        n.cross(Vector3::unit_x()).normalize()
+    } else {
+        n.cross(Vector3::unit_y()).normalize()
+    };
+    let e2 = n.cross(e1).normalize();
+
+    Some(EllipseParams {
+        center: circle_center,
+        axis_u: circle_radius * e1,
+        axis_v: circle_radius * e2,
+    })
+}
+
 /// Compute the intersection of a plane and cylinder.
 ///
 /// Returns the ellipse parameters, or None if the plane is parallel to
@@ -644,6 +829,33 @@ where
     };
 
     let ellipse = compute_plane_cone_intersection(&plane, &cone)?;
+    Some(AnalyticalIC { ellipse })
+}
+
+/// Try to detect an analytical plane-sphere intersection.
+///
+/// Returns an `AnalyticalIC` that can be used to refine mesh-based polylines,
+/// or None if the surfaces are not a recognizable plane-sphere pair or if the
+/// intersection is degenerate (tangent or no intersection).
+pub fn try_analytical_plane_sphere_ic<S0, S1>(
+    surface0: &S0,
+    surface1: &S1,
+    _tol: f64,
+) -> Option<AnalyticalIC>
+where
+    S0: ParametricSurface3D,
+    S1: ParametricSurface3D,
+{
+    let (plane, sphere) =
+        if let (Some(p), Some(s)) = (detect_plane(surface0), detect_sphere(surface1)) {
+            (p, s)
+        } else if let (Some(p), Some(s)) = (detect_plane(surface1), detect_sphere(surface0)) {
+            (p, s)
+        } else {
+            return None;
+        };
+
+    let ellipse = compute_sphere_plane_intersection(&plane, &sphere)?;
     Some(AnalyticalIC { ellipse })
 }
 
@@ -1502,5 +1714,260 @@ mod tests {
                 "r = {r}, expected ~1.2 (cone at z=3)"
             );
         }
+    }
+
+    // --- Sphere-Plane tests (Sprint 41) ---
+
+    /// Helper: verify all sampled points lie on both the plane and the sphere.
+    fn assert_points_on_plane_and_sphere(
+        ellipse: &EllipseParams,
+        plane_origin: Point3,
+        plane_normal: Vector3,
+        sphere_center: Point3,
+        sphere_radius: f64,
+    ) {
+        let poly = sample_ellipse(ellipse, 128);
+        for pt in &poly.0 {
+            // On the plane
+            let d = plane_normal.dot(*pt - plane_origin).abs();
+            assert!(d < 1e-8, "point not on plane: dist = {d}");
+            // On the sphere
+            let r = (*pt - sphere_center).magnitude();
+            assert!(
+                (r - sphere_radius).abs() < 1e-8,
+                "point not on sphere: dist from center = {r}, expected {sphere_radius}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sphere_plane_equator() {
+        // Sphere centered at origin, radius 5.
+        // Plane through center (equator) → circle of radius 5.
+        let sphere = SphereParams {
+            center: Point3::origin(),
+            radius: 5.0,
+        };
+        let plane = PlaneParams {
+            origin: Point3::origin(),
+            normal: Vector3::unit_z(),
+        };
+
+        let ellipse = compute_sphere_plane_intersection(&plane, &sphere).unwrap();
+
+        // Circle in XY plane with radius 5
+        assert!((ellipse.axis_u.magnitude() - 5.0).abs() < 1e-10);
+        assert!((ellipse.axis_v.magnitude() - 5.0).abs() < 1e-10);
+        assert!(ellipse.axis_u.dot(ellipse.axis_v).abs() < 1e-10);
+
+        assert_points_on_plane_and_sphere(
+            &ellipse,
+            Point3::origin(),
+            Vector3::unit_z(),
+            Point3::origin(),
+            5.0,
+        );
+    }
+
+    #[test]
+    fn test_sphere_plane_offset_circle() {
+        // Sphere radius 5 at origin, plane at z=3.
+        // Circle radius = sqrt(25 - 9) = 4.
+        let sphere = SphereParams {
+            center: Point3::origin(),
+            radius: 5.0,
+        };
+        let plane = PlaneParams {
+            origin: Point3::new(0.0, 0.0, 3.0),
+            normal: Vector3::unit_z(),
+        };
+
+        let ellipse = compute_sphere_plane_intersection(&plane, &sphere).unwrap();
+
+        assert!((ellipse.axis_u.magnitude() - 4.0).abs() < 1e-10);
+        assert!((ellipse.axis_v.magnitude() - 4.0).abs() < 1e-10);
+        assert!((ellipse.center.z - 3.0).abs() < 1e-10);
+
+        assert_points_on_plane_and_sphere(
+            &ellipse,
+            Point3::new(0.0, 0.0, 3.0),
+            Vector3::unit_z(),
+            Point3::origin(),
+            5.0,
+        );
+    }
+
+    #[test]
+    fn test_sphere_plane_tangent_returns_none() {
+        // Plane tangent to sphere — just touching
+        let sphere = SphereParams {
+            center: Point3::origin(),
+            radius: 5.0,
+        };
+        let plane = PlaneParams {
+            origin: Point3::new(0.0, 0.0, 5.0),
+            normal: Vector3::unit_z(),
+        };
+
+        assert!(compute_sphere_plane_intersection(&plane, &sphere).is_none());
+    }
+
+    #[test]
+    fn test_sphere_plane_no_intersection_returns_none() {
+        // Plane doesn't intersect sphere at all
+        let sphere = SphereParams {
+            center: Point3::origin(),
+            radius: 5.0,
+        };
+        let plane = PlaneParams {
+            origin: Point3::new(0.0, 0.0, 10.0),
+            normal: Vector3::unit_z(),
+        };
+
+        assert!(compute_sphere_plane_intersection(&plane, &sphere).is_none());
+    }
+
+    #[test]
+    fn test_sphere_plane_oblique_through_center() {
+        // Sphere radius 3 at (1, 2, 3), oblique plane through sphere center.
+        // Plane through center → circle radius = sphere radius = 3.
+        let sphere = SphereParams {
+            center: Point3::new(1.0, 2.0, 3.0),
+            radius: 3.0,
+        };
+        let normal = Vector3::new(1.0, 1.0, 1.0).normalize();
+        let plane = PlaneParams {
+            origin: Point3::new(1.0, 2.0, 3.0),
+            normal,
+        };
+
+        let ellipse = compute_sphere_plane_intersection(&plane, &sphere).unwrap();
+
+        assert!((ellipse.axis_u.magnitude() - 3.0).abs() < 1e-10);
+        assert!((ellipse.axis_v.magnitude() - 3.0).abs() < 1e-10);
+
+        assert_points_on_plane_and_sphere(
+            &ellipse,
+            Point3::new(1.0, 2.0, 3.0),
+            normal,
+            Point3::new(1.0, 2.0, 3.0),
+            3.0,
+        );
+    }
+
+    #[test]
+    fn test_sphere_plane_small_circle() {
+        // Sphere radius 10 at origin, plane at z=9.
+        // Circle radius = sqrt(100 - 81) = sqrt(19) ≈ 4.359.
+        let sphere = SphereParams {
+            center: Point3::origin(),
+            radius: 10.0,
+        };
+        let plane = PlaneParams {
+            origin: Point3::new(0.0, 0.0, 9.0),
+            normal: Vector3::unit_z(),
+        };
+
+        let ellipse = compute_sphere_plane_intersection(&plane, &sphere).unwrap();
+        let expected_r = 19.0_f64.sqrt();
+
+        assert!(
+            (ellipse.axis_u.magnitude() - expected_r).abs() < 1e-10,
+            "axis_u = {}, expected {}",
+            ellipse.axis_u.magnitude(),
+            expected_r
+        );
+        assert!(
+            (ellipse.axis_v.magnitude() - expected_r).abs() < 1e-10,
+            "axis_v = {}, expected {}",
+            ellipse.axis_v.magnitude(),
+            expected_r
+        );
+
+        assert_points_on_plane_and_sphere(
+            &ellipse,
+            Point3::new(0.0, 0.0, 9.0),
+            Vector3::unit_z(),
+            Point3::origin(),
+            10.0,
+        );
+    }
+
+    #[test]
+    fn test_sphere_plane_negative_offset() {
+        // Sphere radius 5 at origin, plane at z=-4.
+        // Circle radius = sqrt(25 - 16) = 3.
+        let sphere = SphereParams {
+            center: Point3::origin(),
+            radius: 5.0,
+        };
+        let plane = PlaneParams {
+            origin: Point3::new(0.0, 0.0, -4.0),
+            normal: Vector3::unit_z(),
+        };
+
+        let ellipse = compute_sphere_plane_intersection(&plane, &sphere).unwrap();
+
+        assert!((ellipse.axis_u.magnitude() - 3.0).abs() < 1e-10);
+        assert!((ellipse.axis_v.magnitude() - 3.0).abs() < 1e-10);
+        assert!((ellipse.center.z - (-4.0)).abs() < 1e-10);
+
+        assert_points_on_plane_and_sphere(
+            &ellipse,
+            Point3::new(0.0, 0.0, -4.0),
+            Vector3::unit_z(),
+            Point3::origin(),
+            5.0,
+        );
+    }
+
+    #[test]
+    fn test_cylinder_not_detected_as_sphere() {
+        let line = Line(Point3::new(2.0, 0.0, 0.0), Point3::new(2.0, 0.0, 10.0));
+        let cylinder = RevolutedCurve::by_revolution(line, Point3::origin(), Vector3::unit_z());
+        assert!(
+            detect_sphere(&cylinder).is_none(),
+            "Cylinder should not be detected as sphere"
+        );
+    }
+
+    #[test]
+    fn test_cone_not_detected_as_sphere() {
+        let line = Line(Point3::new(0.0, 0.0, 0.0), Point3::new(2.0, 0.0, 5.0));
+        let cone = RevolutedCurve::by_revolution(line, Point3::origin(), Vector3::unit_z());
+        assert!(
+            detect_sphere(&cone).is_none(),
+            "Cone should not be detected as sphere"
+        );
+    }
+
+    #[test]
+    fn test_plane_not_detected_as_sphere() {
+        let plane = Plane::new(
+            Point3::origin(),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        );
+        assert!(
+            detect_sphere(&plane).is_none(),
+            "Plane should not be detected as sphere"
+        );
+    }
+
+    #[test]
+    fn test_sphere_pipeline_rejects_cylinder() {
+        // try_analytical_plane_sphere_ic should return None for plane+cylinder
+        let plane = Plane::new(
+            Point3::new(-5.0, -5.0, 3.0),
+            Point3::new(5.0, -5.0, 3.0),
+            Point3::new(-5.0, 5.0, 3.0),
+        );
+        let line = Line(Point3::new(2.0, 0.0, 0.0), Point3::new(2.0, 0.0, 10.0));
+        let cylinder = RevolutedCurve::by_revolution(line, Point3::origin(), Vector3::unit_z());
+
+        assert!(
+            try_analytical_plane_sphere_ic(&plane, &cylinder, 0.05).is_none(),
+            "Cylinder should not be detected as sphere in pipeline"
+        );
     }
 }
