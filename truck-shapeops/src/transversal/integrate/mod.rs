@@ -2719,6 +2719,7 @@ pub fn v2_assembly_stats() -> (usize, usize) {
 /// Only performs Phase 1 of weld_coincident_edges (multi-point curve matching)
 /// without the Phase 0 spatial grid vertex unification, since pave blocks
 /// and FBG already share vertices natively.
+#[allow(dead_code)]
 fn canonicalize_ic_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell: &mut Shell<Point3, C, S>,
     tol: f64,
@@ -2737,6 +2738,7 @@ fn canonicalize_ic_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 /// On failure, the shell is left in the post-weld state that legacy
 /// recovery expects at level 1, so the fallback path can continue from
 /// wider weld stages without redundant work.
+#[allow(dead_code)]
 fn assemble_boolean_shell_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell: &mut Shell<Point3, C, S>,
     tols: &BooleanTolerance,
