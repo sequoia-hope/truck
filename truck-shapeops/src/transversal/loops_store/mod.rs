@@ -1144,15 +1144,7 @@ where
 
                             // Case 1: shared-edge artifact — both endpoints on BOTH faces' boundaries.
                             // This is a degenerate IC along an already-shared edge. Skip it.
-                            // Guard: only reliable when ic_length > boundary_tol. When the IC is
-                            // much shorter than boundary_tol, ALL points on the IC are within
-                            // boundary_tol of both boundaries regardless of whether it runs along
-                            // a shared edge or crosses at a boundary intersection. The boundary
-                            // proximity check is meaningless in that regime.
-                            if ic_length > boundary_tol
-                                && (front_on_b0 && front_on_b1)
-                                && (back_on_b0 && back_on_b1)
-                            {
+                            if (front_on_b0 && front_on_b1) && (back_on_b0 && back_on_b1) {
                                 eprintln!(
                                     "[boolean] Phase 1C: Skipping shared-edge artifact IC \
                                      (length {:.2e} < tol {:.2e}, both endpoints on both boundaries)",
@@ -1270,6 +1262,10 @@ where
                             // of a boundary vertex, we snap to the exact corner
                             // position so add_polygon_vertex returns Front/Back
                             // instead of Inner(near-boundary-t).
+                            // Corner-touch vertex snapping: only snap endpoints
+                            // that are actually within tolerance of a boundary vertex.
+                            // This prevents figure-8 wires at face corners (MV3 fix)
+                            // while avoiding false snaps for well-separated ICs.
                             let bverts0: Vec<Point3> = geom_shell0[face_index0]
                                 .absolute_boundaries()
                                 .iter()
@@ -1281,38 +1277,35 @@ where
                                 .flat_map(|w| w.vertex_iter().map(|v| v.point()))
                                 .collect();
 
-                            let mut front_pt = polyline.front();
-                            let mut back_pt = polyline.back();
+                            // Use a tight snap radius: tol * 0.1 instead of tol.
+                            // This prevents snapping IC endpoints that are merely
+                            // "near" a face boundary vertex (e.g., at edge midpoints)
+                            // while still catching exact corner touches (< 0.1*tol).
+                            let snap_tol = tol * 0.1;
 
                             // Snap IC front endpoint to boundary vertices of both faces
                             if let Some(snapped) = interference::find_corner_touch_snap(
-                                front_pt, &bverts0, tol,
+                                polyline.front(), &bverts0, snap_tol,
                             ) {
-                                front_pt = snapped;
                                 *polyline.0.first_mut().unwrap() = snapped;
                             }
                             if let Some(snapped) = interference::find_corner_touch_snap(
-                                front_pt, &bverts1, tol,
+                                polyline.front(), &bverts1, snap_tol,
                             ) {
-                                front_pt = snapped;
                                 *polyline.0.first_mut().unwrap() = snapped;
                             }
 
                             // Snap IC back endpoint to boundary vertices of both faces
                             if let Some(snapped) = interference::find_corner_touch_snap(
-                                back_pt, &bverts0, tol,
+                                polyline.back(), &bverts0, snap_tol,
                             ) {
-                                back_pt = snapped;
                                 *polyline.0.last_mut().unwrap() = snapped;
                             }
                             if let Some(snapped) = interference::find_corner_touch_snap(
-                                back_pt, &bverts1, tol,
+                                polyline.back(), &bverts1, snap_tol,
                             ) {
-                                back_pt = snapped;
                                 *polyline.0.last_mut().unwrap() = snapped;
                             }
-
-                            let _ = (front_pt, back_pt); // used for snapping above
 
                             let pv0 = Vertex::new(polyline.front());
                             let pv1 = Vertex::new(polyline.back());
