@@ -238,7 +238,12 @@ impl SearchParameter<D2> for Plane {
         _: usize,
     ) -> Option<(f64, f64)> {
         let v = self.get_parameter(point);
-        match v[2].so_small() {
+        // Relaxed tolerance: v[2] is the perpendicular distance to the plane
+        // (normal is unit-length). IC vertices from boolean operations may have
+        // small off-plane drift (up to ~1e-5). The (u, v) parameters from
+        // get_parameter are the exact orthogonal projection regardless of
+        // off-plane distance, so returning them is geometrically correct.
+        match v[2].abs() < 1.0e-4 {
             true => Some((v[0], v[1])),
             false => None,
         }

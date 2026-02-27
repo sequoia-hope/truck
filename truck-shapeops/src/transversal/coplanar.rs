@@ -261,7 +261,11 @@ pub(crate) fn check_coplanar(
 /// Uses `tol` for a boundary proximity guard: if the test point is within
 /// `tol * 0.01` distance of any polygon edge in 2D, returns `false` (conservative)
 /// to avoid misclassifying boundary-adjacent points as definitively inside.
-fn point_in_face<C, S: ShapeOpsSurface>(pt: Point3, face: &Face<Point3, C, S>, tol: f64) -> bool {
+pub(crate) fn point_in_face<C, S: ShapeOpsSurface>(
+    pt: Point3,
+    face: &Face<Point3, C, S>,
+    tol: f64,
+) -> bool {
     // Compute face normal to build a local 2D coordinate system
     let surface = face.surface();
     let (u, v) = match surface.search_parameter(pt, None, 100) {

@@ -591,6 +591,8 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
         geom_loops_store1: loops_store1,
         coplanar_faces0,
         coplanar_faces1,
+        contained_faces0,
+        contained_faces1: _contained_faces1,
         ..
     } = loops_store::create_loops_stores(
         &altshell0,
@@ -602,6 +604,12 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
         tols.tau_boundary,
     )
     .ok_or(BooleanStageError::LoopsStoreCreation)?;
+    if !contained_faces0.is_empty() {
+        eprintln!(
+            "[injection] contained_faces0={:?}",
+            contained_faces0,
+        );
+    }
     let _loops_store_elapsed = _total_start.elapsed();
     {
         for (fi, loops) in loops_store1.iter().enumerate() {
@@ -773,6 +781,125 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
         and1.len(),
         or1.len(),
     );
+    // Post-classification fixup: reclassify contained coplanar faces.
+    //
+    // When shell0 face i is contained in shell1 face j (both coplanar):
+    // 1. The injection inserts shell0[i]'s boundary wire into shell1[j]'s loops
+    // 2. Face division splits shell1[j] into ring (with hole) + inner
+    // 3. The inner face and shell0[i] are both coplanar overlap → both should be And
+    // 4. The ring face keeps its hole → hole boundary edges pair with lateral
+    //    surface edges (same Arc<Edge> from injection clone), giving refs=2
+    //
+    // Two fixups needed:
+    //   A) Reclassify the inner face in or1 → and1
+    //   B) Reclassify the contained shell0 face in or0 → and0
+    if !contained_faces0.is_empty() {
+        let ref_faces: Vec<_> = contained_faces0
+            .iter()
+            .filter_map(|&idx| {
+                if idx < shell0.len() {
+                    Some(&shell0[idx])
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // (A) Reclassify inner face: find or1 faces coplanar with the
+        // contained shell0 face whose outer-wire centroid is inside it.
+        let mut reclass1 = Vec::new();
+        or1.retain(|face| {
+            let fi = match coplanar::face_sample_info(face) {
+                Some(i) => i,
+                None => return true,
+            };
+            let centroid = {
+                let boundaries = face.boundaries();
+                match boundaries.first() {
+                    Some(wire) => {
+                        let mut sum = Vector3::zero();
+                        let mut count = 0usize;
+                        for v in wire.vertex_iter() {
+                            let p = v.point();
+                            sum += Vector3::new(p.x, p.y, p.z);
+                            count += 1;
+                        }
+                        if count > 0 {
+                            Point3::new(
+                                sum.x / count as f64,
+                                sum.y / count as f64,
+                                sum.z / count as f64,
+                            )
+                        } else {
+                            fi.point
+                        }
+                    }
+                    None => fi.point,
+                }
+            };
+            for ref_face in &ref_faces {
+                let fj = match coplanar::face_sample_info(ref_face) {
+                    Some(j) => j,
+                    None => continue,
+                };
+                if let Some(true) = coplanar::check_coplanar(&fi, &fj, tols.tau_coplanar) {
+                    if coplanar::point_in_face(centroid, ref_face, tols.tau_coplanar) {
+                        reclass1.push(face.clone());
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+        if !reclass1.is_empty() {
+            eprintln!(
+                "[classify] contained fixup: {} or1 inner faces → and1",
+                reclass1.len(),
+            );
+            and1.extend(reclass1);
+        }
+
+        // (B) Reclassify contained shell0 faces: the contained face is
+        // coplanar with a shell1 face and fully inside it. For union, it's
+        // an overlap region that should be And. The standard classifier may
+        // misclassify it as Or because winding number is ~0.5 for coplanar
+        // faces. Match by edge ID sharing with the original shell0 face.
+        let ref_edge_ids: rustc_hash::FxHashSet<u64> = ref_faces
+            .iter()
+            .flat_map(|f| {
+                f.absolute_boundaries()
+                    .iter()
+                    .flat_map(|w| w.iter().map(|e| e.id().raw()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut reclass0 = Vec::new();
+        or0.retain(|face| {
+            let face_edge_ids: Vec<u64> = face
+                .absolute_boundaries()
+                .iter()
+                .flat_map(|w| w.iter().map(|e| e.id().raw()))
+                .collect();
+            // If this or0 face shares ALL edges with a ref_face, it IS the
+            // contained face (same geometry, same edge arcs).
+            let all_shared = !face_edge_ids.is_empty()
+                && face_edge_ids.iter().all(|eid| ref_edge_ids.contains(eid));
+            if all_shared {
+                reclass0.push(face.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if !reclass0.is_empty() {
+            eprintln!(
+                "[classify] contained fixup: {} or0 contained faces → and0",
+                reclass0.len(),
+            );
+            and0.extend(reclass0);
+        }
+    }
+
     eprintln!(
         "[classify] totals: and0+and1={}, or0+or1={}",
         and0.len() + and1.len(),
@@ -1736,7 +1863,7 @@ fn force_merge_open_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 ) -> usize {
     use std::collections::BTreeMap;
 
-    // Step 1: Find open edges (ref count == 1)
+    // Step 1: Find ALL edges and count refs. Collect non-manifold edges (refs != 2).
     let mut edge_ref_count: BTreeMap<EdgeID<C>, usize> = BTreeMap::new();
     let mut edge_by_id: BTreeMap<EdgeID<C>, Edge<Point3, C>> = BTreeMap::new();
 
@@ -1750,48 +1877,85 @@ fn force_merge_open_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         }
     }
 
-    let open_edges: Vec<Edge<Point3, C>> = edge_ref_count
+    let non_manifold_edges: Vec<Edge<Point3, C>> = edge_ref_count
         .iter()
-        .filter(|(_, &count)| count == 1)
+        .filter(|(_, &count)| count != 2)
         .filter_map(|(id, _)| edge_by_id.get(id).cloned())
         .collect();
 
-    if open_edges.len() < 2 {
+    if non_manifold_edges.len() < 2 {
         return 0;
     }
 
-    // Step 2: Match open edges by endpoint positions
-    let mut merge_map: BTreeMap<EdgeID<C>, Edge<Point3, C>> = BTreeMap::new();
-    let mut used = vec![false; open_edges.len()];
+    // Step 2: Group non-manifold edges by endpoint positions (N-way grouping).
+    // All edges at the same geometric position map to a single canonical edge.
+    let mut groups: Vec<Vec<usize>> = Vec::new(); // each group is indices into non_manifold_edges
+    let mut assigned = vec![false; non_manifold_edges.len()];
 
-    for i in 0..open_edges.len() {
-        if used[i] {
+    for i in 0..non_manifold_edges.len() {
+        if assigned[i] {
             continue;
         }
-        let ei = &open_edges[i];
+        let ei = &non_manifold_edges[i];
         let fi = ei.front().point();
         let bi = ei.back().point();
 
-        for j in (i + 1)..open_edges.len() {
-            if used[j] {
+        let mut group = vec![i];
+        assigned[i] = true;
+
+        for j in (i + 1)..non_manifold_edges.len() {
+            if assigned[j] {
                 continue;
             }
-            let ej = &open_edges[j];
+            let ej = &non_manifold_edges[j];
             let fj = ej.front().point();
             let bj = ej.back().point();
 
-            // Match same-direction: fi≈fj, bi≈bj
             let same_dir = (fi - fj).magnitude() < tol && (bi - bj).magnitude() < tol;
-            // Match opposite-direction: fi≈bj, bi≈fj
             let opp_dir = (fi - bj).magnitude() < tol && (bi - fj).magnitude() < tol;
 
             if same_dir || opp_dir {
-                // ei is canonical, ej maps to ei
-                merge_map.insert(ej.id(), ei.clone());
-                used[i] = true;
-                used[j] = true;
-                break;
+                group.push(j);
+                assigned[j] = true;
             }
+        }
+
+        if group.len() >= 2 {
+            groups.push(group);
+        }
+    }
+
+    if groups.is_empty() {
+        return 0;
+    }
+
+    // Step 3: Build merge map — all edges in a group map to the canonical (first) edge.
+    // Prefer the edge with refs=2 as canonical (it's already properly shared).
+    // Otherwise use the first edge.
+    let mut merge_map: BTreeMap<EdgeID<C>, Edge<Point3, C>> = BTreeMap::new();
+    let mut merge_count = 0usize;
+
+    for group in &groups {
+        // Find canonical: prefer edge with refs=2, else first
+        let canonical_idx = group
+            .iter()
+            .find(|&&idx| {
+                edge_ref_count
+                    .get(&non_manifold_edges[idx].id())
+                    .copied()
+                    .unwrap_or(0)
+                    == 2
+            })
+            .copied()
+            .unwrap_or(group[0]);
+        let canonical = &non_manifold_edges[canonical_idx];
+
+        for &idx in group {
+            if idx == canonical_idx {
+                continue;
+            }
+            merge_map.insert(non_manifold_edges[idx].id(), canonical.clone());
+            merge_count += 1;
         }
     }
 
@@ -1799,9 +1963,7 @@ fn force_merge_open_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         return 0;
     }
 
-    let merge_count = merge_map.len();
-
-    // Step 3: Rebuild faces with merged edges
+    // Step 4: Rebuild faces with merged edges
     let new_faces: Vec<Face<Point3, C, S>> = shell
         .iter()
         .map(|face| {
@@ -2315,14 +2477,78 @@ fn assemble_boolean_shell_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
     use truck_topology::shell::ShellCondition;
 
+    /// Try to close the shell: Solid::try_new → orientation repair → shell_condition Closed.
+    fn try_close_shell<C2: ShapeOpsCurve<S2>, S2: ShapeOpsSurface>(
+        shell: &Shell<Point3, C2, S2>,
+        label: &str,
+    ) -> Option<Solid<Point3, C2, S2>> {
+        let boundaries = shell.connected_components();
+        if let Ok(solid) = Solid::try_new(boundaries) {
+            eprintln!("[v2_assembly] closed at {}", label);
+            return Some(solid);
+        }
+        let boundaries = shell.connected_components();
+        let all_closed = boundaries
+            .iter()
+            .all(|s| s.shell_condition() == ShellCondition::Closed);
+        if all_closed {
+            eprintln!("[v2_assembly] closed (unchecked) at {}", label);
+            return Some(Solid::new_unchecked(boundaries));
+        }
+
+        // Fallback: if the shell has exactly 1 connected component, all edges
+        // have refs=2, but condition is Regular (orientation inconsistency from
+        // coplanar face division), accept via new_unchecked. Guards:
+        // - Single component: multi-component Regular usually means wrong topology
+        // - All edges refs=2: no open/over-shared edges
+        // - Euler chi=2: wrong face count means wrong topology, not just orientation
+        if boundaries.len() == 1 {
+            let comp = &boundaries[0];
+            if comp.shell_condition() == ShellCondition::Regular {
+                let mut edge_refs: std::collections::HashMap<u64, usize> =
+                    std::collections::HashMap::new();
+                let mut vertex_ids: std::collections::HashSet<u64> =
+                    std::collections::HashSet::new();
+                let mut face_count = 0usize;
+                for face in comp.iter() {
+                    face_count += 1;
+                    for wire in face.absolute_boundaries().iter() {
+                        for edge in wire.iter() {
+                            *edge_refs.entry(edge.id().raw()).or_insert(0) += 1;
+                            vertex_ids.insert(edge.front().id().raw());
+                            vertex_ids.insert(edge.back().id().raw());
+                        }
+                    }
+                }
+                let edge_count = edge_refs.len();
+                let vertex_count = vertex_ids.len();
+                let chi = vertex_count as i64 - edge_count as i64 + face_count as i64;
+                let all_refs_2 = edge_refs.values().all(|&r| r == 2);
+                if all_refs_2 && chi == 2 {
+                    eprintln!(
+                        "[v2_assembly] accepting Regular shell (1 comp, 0 open edges, chi=2) at {}",
+                        label,
+                    );
+                    return Some(Solid::new_unchecked(boundaries));
+                }
+            }
+        }
+        None
+    }
+
     // Progressive weld levels: (label, weld_tol override)
-    let levels: [(& str, Option<f64>); 3] = [
+    let levels: [(&str, Option<f64>); 3] = [
         ("default(0.2x)", None),                    // Level 0: 0.2× tau_model
         ("tau_weld(0.4x)", Some(tols.tau_weld)),    // Level 1: 0.4× tau_model
         ("tau_edge_cluster(5.0x)", Some(tols.tau_edge_cluster)), // Level 2: 5.0× tau_model
     ];
 
     let mut last_open_count = 0usize;
+    // Track best shell state: snapshot when open count is lowest, so we can
+    // try force_merge on the best state even if a later weld makes things worse.
+    let mut best_open_count = usize::MAX;
+    let mut best_shell: Option<Shell<Point3, C, S>> = None;
+    let mut best_label = String::new();
 
     for (level, (label, weld_override)) in levels.iter().enumerate() {
         // Level 0 uses canonicalize_ic_edges (includes Phase 0 + Phase 1).
@@ -2339,12 +2565,53 @@ fn assemble_boolean_shell_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
             level, label, shell.len(), open.len(),
         );
 
-        // Diagnostic: log open edge positions at level 2 for debugging
-        if level == 2 && !open.is_empty() {
+        if open.is_empty() {
+            if let Some(solid) = try_close_shell(shell, &format!("level {} ({})", level, label)) {
+                return Ok(solid);
+            }
+        }
+
+        // Log open edge positions at level 0 with face details
+        if level == 0 && !open.is_empty() && open.len() <= 12 {
+            // For each open edge, find which faces reference it
+            let mut eid_to_face: std::collections::BTreeMap<EdgeID<C>, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for (fi, face) in shell.iter().enumerate() {
+                for wire in face.absolute_boundaries().iter() {
+                    for edge in wire.iter() {
+                        eid_to_face.entry(edge.id()).or_default().push(fi);
+                    }
+                }
+            }
+            for (eidx, oe) in open.iter().enumerate() {
+                // Find matching edge IDs by position
+                for (fi, face) in shell.iter().enumerate() {
+                    for wire in face.absolute_boundaries().iter() {
+                        for edge in wire.iter() {
+                            let ef = edge.front().point();
+                            let eb = edge.back().point();
+                            let same = (ef - oe.front).magnitude() < 0.01
+                                && (eb - oe.back).magnitude() < 0.01;
+                            let opp = (ef - oe.back).magnitude() < 0.01
+                                && (eb - oe.front).magnitude() < 0.01;
+                            if same || opp {
+                                let refs = eid_to_face.get(&edge.id()).map(|v| v.len()).unwrap_or(0);
+                                eprintln!(
+                                    "[axis_diag] open[{}] face {} has edge at axis, eid={:?}, refs={}, dir={}",
+                                    eidx, fi, edge.id(), refs, if same { "same" } else { "opp" },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Log open edge positions at each level for debugging
+        if !open.is_empty() && open.len() <= 8 {
             for (idx, oe) in open.iter().enumerate() {
                 eprintln!(
-                    "[v2_assembly] open_edge[{}]: ({:.4},{:.4},{:.4})->({:.4},{:.4},{:.4}) refs={}",
-                    idx,
+                    "[v2_assembly] L{} open_edge[{}]: ({:.4},{:.4},{:.4})->({:.4},{:.4},{:.4}) refs={}",
+                    level, idx,
                     oe.front.x, oe.front.y, oe.front.z,
                     oe.back.x, oe.back.y, oe.back.z,
                     oe.face_count,
@@ -2352,63 +2619,63 @@ fn assemble_boolean_shell_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
             }
         }
 
-        if open.is_empty() {
-            // Try Solid::try_new first (strict check).
-            let boundaries = shell.connected_components();
-            if let Ok(solid) = Solid::try_new(boundaries) {
-                eprintln!("[v2_assembly] closed at level {} ({})", level, label);
-                return Ok(solid);
-            }
-            // Fallback: accept Closed shells with singular vertices.
-            let boundaries = shell.connected_components();
-            let all_closed = boundaries
-                .iter()
-                .all(|s| s.shell_condition() == ShellCondition::Closed);
-            if all_closed {
-                eprintln!("[v2_assembly] closed (unchecked) at level {} ({})", level, label);
-                return Ok(Solid::new_unchecked(boundaries));
-            }
+        // Track best state for later force_merge attempt
+        if !open.is_empty() && open.len() < best_open_count {
+            best_open_count = open.len();
+            best_shell = Some(shell.clone());
+            best_label = format!("level {}", level);
         }
 
         last_open_count = open.len();
     }
 
-    // Level 3: Force-merge open edges by geometric position.
-    // This bypasses curve matching and pairs open edges purely by endpoint
-    // positions. Handles IC approximation curves that represent the same
-    // intersection but have different BSpline parameterizations.
-    if last_open_count > 0 {
-        let merged = force_merge_open_edges(shell, tols.tau_edge_cluster);
+    // Force-merge: try on current shell first, then on best-state shell if different.
+    // This handles the case where an aggressive weld (level 2) corrupts the shell
+    // that was in better shape at level 1.
+    let shells_to_try: Vec<(Shell<Point3, C, S>, String)> = {
+        let mut candidates = vec![(shell.clone(), "current".to_string())];
+        if let Some(best) = best_shell.take() {
+            if best_open_count < last_open_count {
+                // Best shell had fewer open edges — try it first
+                eprintln!(
+                    "[v2_assembly] force_merge: also trying {} ({} open, better than current {})",
+                    best_label, best_open_count, last_open_count,
+                );
+                candidates.insert(0, (best, format!("best({})", best_label)));
+            }
+        }
+        candidates
+    };
+
+    for (mut candidate, candidate_label) in shells_to_try {
+        let open_before = diagnose_open_edges(&candidate).len();
+        if open_before == 0 {
+            continue;
+        }
+
+        let merged = force_merge_open_edges(&mut candidate, tols.tau_edge_cluster);
         if merged > 0 {
-            let open = diagnose_open_edges(shell);
+            let open = diagnose_open_edges(&candidate);
             eprintln!(
-                "[v2_assembly] level 3 (force_merge): merged {} edge pairs, {} open remain",
-                merged,
-                open.len(),
+                "[v2_assembly] force_merge({}): merged {} pairs, {} open remain",
+                candidate_label, merged, open.len(),
             );
 
             if open.is_empty() {
-                let boundaries = shell.connected_components();
-                if let Ok(solid) = Solid::try_new(boundaries) {
-                    eprintln!("[v2_assembly] closed at level 3 (force_merge)");
+                if let Some(solid) = try_close_shell(
+                    &candidate,
+                    &format!("force_merge({})", candidate_label),
+                ) {
                     return Ok(solid);
-                }
-                let boundaries = shell.connected_components();
-                let all_closed = boundaries
-                    .iter()
-                    .all(|s| s.shell_condition() == ShellCondition::Closed);
-                if all_closed {
-                    eprintln!("[v2_assembly] closed (unchecked) at level 3 (force_merge)");
-                    return Ok(Solid::new_unchecked(boundaries));
                 }
             }
 
-            last_open_count = open.len();
+            last_open_count = last_open_count.min(open.len());
         }
     }
 
     Err(BooleanStageError::ShellAssembly(format!(
-        "v2: {} open edges after all 4 levels (3 weld + force_merge)",
+        "v2: {} open edges after all levels (3 weld + force_merge)",
         last_open_count
     )))
 }

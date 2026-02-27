@@ -545,6 +545,8 @@ fn inject_coplanar_boundary_loops<C, S>(
     coplanar_faces0: &rustc_hash::FxHashSet<usize>,
     coplanar_faces1: &rustc_hash::FxHashSet<usize>,
     tol: f64,
+    contained_faces0: &mut rustc_hash::FxHashSet<usize>,
+    contained_faces1: &mut rustc_hash::FxHashSet<usize>,
 ) where
     C: Clone,
     S: Clone,
@@ -611,6 +613,16 @@ fn inject_coplanar_boundary_loops<C, S>(
                 for wire in poly_shell1[j].absolute_boundaries().iter() {
                     inject_boundary_wire(wire, &mut poly_loops_store0[i], status);
                 }
+                // Track STRICT containment: face j from shell1 is fully
+                // contained in face i from shell0 (but NOT vice versa).
+                // For mutual containment (equal-sized faces), the standard
+                // shell0=And, shell1=Or asymmetry handles classification.
+                // Strict containment needs special handling because the
+                // containing face's ring fragment + side faces already
+                // define the boundary, making the contained face redundant.
+                if !i_in_j {
+                    contained_faces1.insert(j);
+                }
             }
 
             if i_in_j {
@@ -627,6 +639,11 @@ fn inject_coplanar_boundary_loops<C, S>(
                 }
                 for wire in poly_shell0[i].absolute_boundaries().iter() {
                     inject_boundary_wire(wire, &mut poly_loops_store1[j], status);
+                }
+                // Track STRICT containment: face i from shell0 is fully
+                // contained in face j from shell1 (but NOT vice versa).
+                if !j_in_i {
+                    contained_faces0.insert(i);
                 }
             }
 
@@ -688,6 +705,12 @@ pub struct LoopsStoreQuadruple<C> {
     pub coplanar_faces0: rustc_hash::FxHashSet<usize>,
     /// Face indices in shell1 that are coplanar with some face in shell0.
     pub coplanar_faces1: rustc_hash::FxHashSet<usize>,
+    /// Face indices in shell0 that are fully contained within a coplanar face
+    /// from shell1 (their boundary was injected into shell1's loops_store).
+    pub contained_faces0: rustc_hash::FxHashSet<usize>,
+    /// Face indices in shell1 that are fully contained within a coplanar face
+    /// from shell0 (their boundary was injected into shell0's loops_store).
+    pub contained_faces1: rustc_hash::FxHashSet<usize>,
 }
 
 /// Compute axis-aligned bounding box from polygon mesh positions.
@@ -1213,6 +1236,28 @@ where
                             boundary_tol,
                         );
                         if on_boundary0 && on_boundary1 {
+                            eprintln!(
+                                "[ic_filter] SKIP midpoint-on-both-boundaries IC ({},{}) mid=({:.4},{:.4},{:.4})",
+                                face_index0, face_index1, mid.x, mid.y, mid.z,
+                            );
+                            return Some(());
+                        }
+                        // Also filter ICs where either face is in the coplanar set AND
+                        // the IC midpoint lies on that face's boundary. This catches
+                        // degenerate ICs between a coplanar face and a non-coplanar
+                        // face from the other shell (e.g., revolve cap at axis edge).
+                        if coplanar_faces0.contains(&face_index0) && on_boundary0 {
+                            eprintln!(
+                                "[ic_filter] SKIP coplanar-boundary IC ({},{}) mid on shell0 boundary",
+                                face_index0, face_index1,
+                            );
+                            return Some(());
+                        }
+                        if coplanar_faces1.contains(&face_index1) && on_boundary1 {
+                            eprintln!(
+                                "[ic_filter] SKIP coplanar-boundary IC ({},{}) mid on shell1 boundary",
+                                face_index0, face_index1,
+                            );
                             return Some(());
                         }
                         // Phase 1B: Enhanced coincident-vertex IC filtering.
@@ -1401,6 +1446,8 @@ where
     // cap is coplanar with that face. Normal intersection curves fail (parallel
     // normals), so we detect full containment and inject the contained face's
     // boundary as a hole in the containing face.
+    let mut contained_faces0 = rustc_hash::FxHashSet::default();
+    let mut contained_faces1 = rustc_hash::FxHashSet::default();
     if !coplanar_faces0.is_empty() || !coplanar_faces1.is_empty() {
         inject_coplanar_boundary_loops(
             geom_shell0,
@@ -1414,6 +1461,8 @@ where
             &coplanar_faces0,
             &coplanar_faces1,
             tol,
+            &mut contained_faces0,
+            &mut contained_faces1,
         );
     }
 
@@ -1424,6 +1473,8 @@ where
         _poly_loops_store1: poly_loops_store1,
         coplanar_faces0,
         coplanar_faces1,
+        contained_faces0,
+        contained_faces1,
     })
 }
 
