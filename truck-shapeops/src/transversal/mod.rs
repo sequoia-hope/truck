@@ -16,13 +16,14 @@ pub(crate) mod robust_classify;
 pub(crate) mod winding;
 pub use diagnostics::BooleanDiagnostics;
 pub use divide_face::v2_face_division_stats;
+#[allow(unused_imports)]
 pub use integrate::{
     and, and_result, and_result_with_tol, and_result_with_tol_diag, and_with_tol,
     diagnose_open_edges, difference, difference_result, difference_result_with_tol,
     difference_result_with_tol_diag, difference_with_tol, find_non_simple_wires,
     heal_shell_vertices, or, or_result, or_result_with_tol, or_result_with_tol_diag, or_with_tol,
-    v2_assembly_stats, validate_euler_characteristic, BooleanStageError, BooleanTolerance,
-    OpenEdgeInfo, ShapeOpsCurve, ShapeOpsSurface,
+    radial_assembly_stats, v2_assembly_stats, validate_euler_characteristic, BooleanStageError,
+    BooleanTolerance, OpenEdgeInfo, ShapeOpsCurve, ShapeOpsSurface,
 };
 
 use truck_geometry::prelude::*;

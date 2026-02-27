@@ -495,10 +495,7 @@ impl<C: Clone> FaceBoundaryGraph<C> {
                 // Check for area cancellation: when outer + holes sum to nearly
                 // zero, the face is consumed by the intersection (matches legacy
                 // divide_one_face behavior).
-                let hole_area_sum: f64 = hole_indices
-                    .iter()
-                    .map(|&hi| cycle_infos[hi].area)
-                    .sum();
+                let hole_area_sum: f64 = hole_indices.iter().map(|&hi| cycle_infos[hi].area).sum();
                 if (outer_info.area + hole_area_sum).abs() < tol {
                     continue; // face consumed
                 }

@@ -5,6 +5,8 @@ use truck_geometry::prelude::*;
 use truck_meshalgo::prelude::*;
 use truck_topology::*;
 
+pub(crate) mod radial_assembly;
+
 /// Per-stage tolerance configuration for boolean operations.
 ///
 /// Different stages of the boolean pipeline have different precision needs:
@@ -605,10 +607,7 @@ fn classify_one_pair_of_shells_result_with_tol<C: ShapeOpsCurve<S>, S: ShapeOpsS
     )
     .ok_or(BooleanStageError::LoopsStoreCreation)?;
     if !contained_faces0.is_empty() {
-        eprintln!(
-            "[injection] contained_faces0={:?}",
-            contained_faces0,
-        );
+        eprintln!("[injection] contained_faces0={:?}", contained_faces0,);
     }
     let _loops_store_elapsed = _total_start.elapsed();
     {
@@ -1984,8 +1983,9 @@ fn force_merge_open_edges<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                                     let front_dist = (abs.front().point()
                                         - canonical.front().point())
                                     .magnitude();
-                                    let cross_dist =
-                                        (abs.front().point() - canonical.back().point()).magnitude();
+                                    let cross_dist = (abs.front().point()
+                                        - canonical.back().point())
+                                    .magnitude();
                                     let same_dir = front_dist <= cross_dist;
                                     if same_dir == edge.orientation() {
                                         canonical.clone()
@@ -2447,6 +2447,12 @@ pub fn v2_assembly_stats() -> (usize, usize) {
     )
 }
 
+/// Query radial assembly success/fallback counters.
+#[allow(dead_code)]
+pub fn radial_assembly_stats() -> (usize, usize) {
+    radial_assembly::radial_assembly_stats()
+}
+
 /// Canonicalize IC edges: unify edges that represent the same intersection
 /// curve but were independently created from BSpline approximations.
 ///
@@ -2538,8 +2544,8 @@ fn assemble_boolean_shell_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 
     // Progressive weld levels: (label, weld_tol override)
     let levels: [(&str, Option<f64>); 3] = [
-        ("default(0.2x)", None),                    // Level 0: 0.2× tau_model
-        ("tau_weld(0.4x)", Some(tols.tau_weld)),    // Level 1: 0.4× tau_model
+        ("default(0.2x)", None),                 // Level 0: 0.2× tau_model
+        ("tau_weld(0.4x)", Some(tols.tau_weld)), // Level 1: 0.4× tau_model
         ("tau_edge_cluster(5.0x)", Some(tols.tau_edge_cluster)), // Level 2: 5.0× tau_model
     ];
 
@@ -2562,7 +2568,10 @@ fn assemble_boolean_shell_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
         let open = diagnose_open_edges(shell);
         eprintln!(
             "[v2_assembly] level {} ({}): {} faces, {} open edges",
-            level, label, shell.len(), open.len(),
+            level,
+            label,
+            shell.len(),
+            open.len(),
         );
 
         if open.is_empty() {
@@ -2595,7 +2604,8 @@ fn assemble_boolean_shell_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
                             let opp = (ef - oe.back).magnitude() < 0.01
                                 && (eb - oe.front).magnitude() < 0.01;
                             if same || opp {
-                                let refs = eid_to_face.get(&edge.id()).map(|v| v.len()).unwrap_or(0);
+                                let refs =
+                                    eid_to_face.get(&edge.id()).map(|v| v.len()).unwrap_or(0);
                                 eprintln!(
                                     "[axis_diag] open[{}] face {} has edge at axis, eid={:?}, refs={}, dir={}",
                                     eidx, fi, edge.id(), refs, if same { "same" } else { "opp" },
@@ -2658,14 +2668,15 @@ fn assemble_boolean_shell_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
             let open = diagnose_open_edges(&candidate);
             eprintln!(
                 "[v2_assembly] force_merge({}): merged {} pairs, {} open remain",
-                candidate_label, merged, open.len(),
+                candidate_label,
+                merged,
+                open.len(),
             );
 
             if open.is_empty() {
-                if let Some(solid) = try_close_shell(
-                    &candidate,
-                    &format!("force_merge({})", candidate_label),
-                ) {
+                if let Some(solid) =
+                    try_close_shell(&candidate, &format!("force_merge({})", candidate_label))
+                {
                     return Ok(solid);
                 }
             }
@@ -2682,36 +2693,71 @@ fn assemble_boolean_shell_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
 
 /// Finalize a boolean shell: weld edges and assemble into a Solid.
 ///
-/// Delegates to `assemble_boolean_shell_v2` which internally escalates
-/// through 3 progressive weld tolerance levels (0.2x → 0.4x → 5.0x tau_model).
+/// Tries radial assembly first (topology-first edge pairing), falls back
+/// to v2 assembly (progressive weld tolerance escalation) on failure.
 fn finalize_boolean_shell<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell: &mut Shell<Point3, C, S>,
     tols: &BooleanTolerance,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
+    // Try radial assembly first
+    let faces: Vec<Face<Point3, C, S>> = shell.iter().cloned().collect();
+    match radial_assembly::assemble_shell_radial(&faces, tols.tau_model) {
+        Ok(solid) => {
+            radial_assembly::RADIAL_SUCCESS.fetch_add(1, AtomicOrdering::Relaxed);
+            eprintln!("[finalize] radial assembly succeeded");
+            return Ok(solid);
+        }
+        Err(e) => {
+            radial_assembly::RADIAL_FALLBACK.fetch_add(1, AtomicOrdering::Relaxed);
+            eprintln!(
+                "[finalize] radial assembly failed ({}), falling back to v2",
+                e
+            );
+        }
+    }
+
+    // Fallback: v2 progressive weld assembly
     assemble_boolean_shell_v2(shell, tols)
 }
 
 /// Finalize with diagnostics recovery tracking.
 ///
-/// Delegates to `assemble_boolean_shell_v2` which internally escalates
-/// through 3 weld tolerance levels. This wrapper just populates
-/// recovery diagnostics.
+/// Tries radial assembly first, falls back to v2 progressive weld.
+/// Populates recovery diagnostics.
 fn finalize_boolean_shell_with_recovery_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
     shell: &mut Shell<Point3, C, S>,
     tols: &BooleanTolerance,
     recovery: &mut diagnostics::RecoveryReport,
 ) -> std::result::Result<Solid<Point3, C, S>, BooleanStageError> {
+    // Try radial assembly first
+    let faces: Vec<Face<Point3, C, S>> = shell.iter().cloned().collect();
+    match radial_assembly::assemble_shell_radial(&faces, tols.tau_model) {
+        Ok(solid) => {
+            radial_assembly::RADIAL_SUCCESS.fetch_add(1, AtomicOrdering::Relaxed);
+            eprintln!("[finalize_diag] radial assembly succeeded");
+            let result_shell = &solid.boundaries()[0];
+            populate_euler(&mut Some(recovery), result_shell);
+            recovery.recovery_level = 0;
+            return Ok(solid);
+        }
+        Err(e) => {
+            radial_assembly::RADIAL_FALLBACK.fetch_add(1, AtomicOrdering::Relaxed);
+            eprintln!(
+                "[finalize_diag] radial assembly failed ({}), falling back to v2",
+                e
+            );
+        }
+    }
+
+    // Fallback: v2 progressive weld assembly
     let result = assemble_boolean_shell_v2(shell, tols);
     populate_euler(&mut Some(recovery), shell);
 
     match &result {
         Ok(_) => {
-            // Determine which level succeeded from open-edge count.
-            // v2 logs the level internally; recovery_level 0 = success.
             recovery.recovery_level = 0;
         }
         Err(_) => {
-            // All 3 levels failed.
             recovery.recovery_level = 3;
         }
     }
