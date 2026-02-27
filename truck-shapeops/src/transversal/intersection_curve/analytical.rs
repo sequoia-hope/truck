@@ -47,6 +47,21 @@ struct SphereParams {
     radius: f64,
 }
 
+/// Parameters describing a detected torus surface.
+///
+/// A torus is defined by a center of revolution, a revolution axis,
+/// a major radius (distance from axis to the generatrix circle center),
+/// and a minor radius (radius of the generatrix circle). Points on the
+/// torus satisfy: (sqrt((P - center)_perp² ) - R)² + (P - center)_along² = r²
+/// where _perp and _along are components perpendicular and along the axis.
+#[derive(Debug, Clone)]
+struct TorusParams {
+    center: Point3,    // center of revolution
+    axis: Vector3,     // revolution axis (unit)
+    major_radius: f64, // distance from axis to generatrix circle center (R)
+    minor_radius: f64, // radius of generatrix circle (r)
+}
+
 /// Parameters describing a plane-cylinder intersection ellipse/circle.
 ///
 /// The curve is parameterized as:
@@ -532,6 +547,883 @@ fn detect_sphere<S: ParametricSurface3D>(surface: &S) -> Option<SphereParams> {
     })
 }
 
+/// Try to detect a torus from a generic parametric surface.
+///
+/// Handles two cases:
+/// 1. Both u and v periodic with period ≈ 2π (truck `Torus` analytic type)
+/// 2. One direction periodic (revolution), the other has a closed generatrix
+///    (e.g., `RevolutedCurve<NurbsCurve>` where the NURBS approximates a circle
+///    but doesn't self-report as periodic)
+///
+/// Detection algorithm:
+/// 1. Check for at least one periodic direction with period ≈ 2π
+/// 2. For the other direction, check if it's closed (front ≈ back)
+/// 3. Sample circles at several positions — radii must be bounded away from 0
+/// 4. Fit major_radius (R) and minor_radius (r)
+/// 5. Verify sampled points lie on the fitted torus
+fn detect_torus<S: ParametricSurface3D>(surface: &S) -> Option<TorusParams> {
+    let u_per = surface.u_period();
+    let v_per = surface.v_period();
+
+    let (u_range, v_range) = surface.parameter_range();
+    let u_start = param_start(&u_range, 0.0);
+    let u_end = match u_range.1 {
+        Bound::Included(v) | Bound::Excluded(v) => v,
+        Bound::Unbounded => 2.0 * PI,
+    };
+    let v_start = param_start(&v_range, 0.0);
+    let v_end = match v_range.1 {
+        Bound::Included(v) | Bound::Excluded(v) => v,
+        Bound::Unbounded => 2.0 * PI,
+    };
+
+    let u_span = u_end - u_start;
+    let v_span = v_end - v_start;
+
+    // A torus needs at least one periodic direction (revolution angle).
+    // The other direction is the generatrix (may be periodic for analytical torus,
+    // or non-periodic NURBS for RevolutedCurve<NurbsCurve>).
+    //
+    // For RevolutedCurve<NurbsCurve> (circle profile revolved around axis):
+    //   u = generatrix (NURBS circle): range [0,1], NOT periodic, NOT closed
+    //   v = revolution angle: range [0,2π), period = 2π
+    //
+    // For analytical Torus type:
+    //   u = one angle: range [0,2π), period = 2π
+    //   v = other angle: range [0,2π), period = 2π
+
+    // Check for periodic direction with period ≈ 2π
+    let u_periodic =
+        matches!(u_per, Some(p) if (p - 2.0 * PI).abs() < 0.1) || ((u_span - 2.0 * PI).abs() < 0.1);
+    let v_periodic =
+        matches!(v_per, Some(p) if (p - 2.0 * PI).abs() < 0.1) || ((v_span - 2.0 * PI).abs() < 0.1);
+
+    // Need at least one periodic direction to be a surface of revolution
+    if !u_periodic && !v_periodic {
+        return None;
+    }
+
+    // For each periodic direction, sample revolution circles and try to fit torus.
+    // The periodic direction sweeps revolution circles; the other is the generatrix.
+    //
+    // Strategy: sample circles at N positions along the generatrix direction.
+    // For each position, fit a circle using 3 points in the revolution direction.
+    // Then check: are circle centers collinear? Do radii vary between R-r and R+r?
+
+    // For each periodic direction, sample revolution circles and extract torus params.
+    //
+    // For a torus with the periodic direction as revolution angle:
+    // - Fix generatrix parameter, sweep revolution → circle
+    // - All circles share the SAME center (the torus center on the axis)
+    // - Radii vary between R-r and R+r
+    // - Circle normals are all parallel (= axis direction)
+    //
+    // We extract axis from circle normals, torus center from circle centers,
+    // and R, r from the radius variation.
+
+    let try_revolution_direction = |rev_start: f64,
+                                    rev_span: f64,
+                                    gen_start: f64,
+                                    gen_span: f64,
+                                    rev_is_u: bool|
+     -> Option<TorusParams> {
+        let sample = |rev: f64, gx: f64| -> Point3 {
+            if rev_is_u {
+                surface.subs(rev, gx)
+            } else {
+                surface.subs(gx, rev)
+            }
+        };
+
+        // Step 1: Get the revolution axis from a circle at the generatrix midpoint.
+        let g_mid = gen_start + gen_span * 0.5;
+        let p1 = sample(rev_start, g_mid);
+        let p2 = sample(rev_start + rev_span / 3.0, g_mid);
+        let p3 = sample(rev_start + 2.0 * rev_span / 3.0, g_mid);
+        let mid_center = circumcenter_3d(p1, p2, p3)?;
+        let mid_radius = (p1 - mid_center).magnitude();
+        if mid_radius < 1e-10 {
+            return None;
+        }
+        let p4 = sample(rev_start + rev_span / 4.0, g_mid);
+        if ((p4 - mid_center).magnitude() - mid_radius).abs() > mid_radius * 0.05 {
+            return None; // not a circle
+        }
+        let axis_raw = (p2 - p1).cross(p3 - p1);
+        if axis_raw.magnitude2() < 1e-20 {
+            return None;
+        }
+        let axis = axis_raw.normalize();
+
+        // Step 2: Verify that circles at a few other positions share the same axis.
+        for &frac in &[0.2, 0.35, 0.65, 0.8] {
+            let g = gen_start + gen_span * frac;
+            let q1 = sample(rev_start, g);
+            let q2 = sample(rev_start + rev_span / 3.0, g);
+            let q3 = sample(rev_start + 2.0 * rev_span / 3.0, g);
+            let n = (q2 - q1).cross(q3 - q1);
+            if n.magnitude2() > 1e-20 {
+                let dot = n.normalize().dot(axis).abs();
+                if dot < 0.95 {
+                    return None; // different axis → not revolution circles
+                }
+            }
+        }
+
+        // Step 3: Find R and r using geometric exploration.
+        //
+        // Problem: NURBS generatrix parameterization may be highly non-uniform,
+        // making parameter-uniform sampling cluster near one position.
+        //
+        // Solution: Use GEOMETRIC binary search to find the extremes.
+        // At the midpoint we have mid_center (on axis) and mid_radius.
+        // The perpendicular distance from mid_center to the axis gives us the
+        // axis-offset at this generatrix position.
+        //
+        // For a torus: revolution radius varies from R-r to R+r.
+        // We search for the generatrix positions with min and max radius.
+
+        // First, sample radii at a fine grid of generatrix positions
+        let n_samples = 200;
+        let mut best_min_radius = f64::MAX;
+        let mut best_max_radius = 0.0_f64;
+        let mut best_min_g = gen_start;
+        let mut best_max_g = gen_start;
+        let mut any_center: Option<Point3> = None;
+
+        for j in 0..n_samples {
+            let g = gen_start + gen_span * j as f64 / n_samples as f64;
+            let q1 = sample(rev_start, g);
+            let q2 = sample(rev_start + rev_span / 3.0, g);
+            let q3 = sample(rev_start + 2.0 * rev_span / 3.0, g);
+            if let Some(center) = circumcenter_3d(q1, q2, q3) {
+                let r = (q1 - center).magnitude();
+                if r > 1e-10 {
+                    if r < best_min_radius {
+                        best_min_radius = r;
+                        best_min_g = g;
+                    }
+                    if r > best_max_radius {
+                        best_max_radius = r;
+                        best_max_g = g;
+                    }
+                    if any_center.is_none() {
+                        any_center = Some(center);
+                    }
+                }
+            }
+        }
+
+        if best_max_radius < 1e-10 || any_center.is_none() {
+            return None;
+        }
+
+        // Refine min and max with binary search around the found positions
+        let refine_extremum = |init_g: f64, seeking_min: bool| -> f64 {
+            let delta = gen_span / n_samples as f64;
+            let mut best_g = init_g;
+            let mut best_r = if seeking_min { f64::MAX } else { 0.0_f64 };
+
+            // Search in neighborhood of init_g
+            for step in &[delta, delta / 4.0, delta / 16.0, delta / 64.0] {
+                let g_lo = (best_g - step * 4.0).max(gen_start);
+                let g_hi = (best_g + step * 4.0).min(gen_start + gen_span);
+                for k in 0..20 {
+                    let g = g_lo + (g_hi - g_lo) * k as f64 / 19.0;
+                    let q1 = sample(rev_start, g);
+                    let q2 = sample(rev_start + rev_span / 3.0, g);
+                    let q3 = sample(rev_start + 2.0 * rev_span / 3.0, g);
+                    if let Some(center) = circumcenter_3d(q1, q2, q3) {
+                        let r = (q1 - center).magnitude();
+                        let is_better = if seeking_min {
+                            r < best_r && r > 1e-10
+                        } else {
+                            r > best_r
+                        };
+                        if is_better {
+                            best_r = r;
+                            best_g = g;
+                        }
+                    }
+                }
+            }
+            best_r
+        };
+
+        let r_min_refined = refine_extremum(best_min_g, true);
+        let r_max_refined = refine_extremum(best_max_g, false);
+
+        // Use the ANY center to get torus center (all centers lie on axis)
+        // The torus center is best estimated from the mid_center (step 1)
+        let center_centroid = mid_center;
+
+        let major_radius = (r_max_refined + r_min_refined) / 2.0;
+        let minor_radius = (r_max_refined - r_min_refined) / 2.0;
+
+        if minor_radius < major_radius * 0.005 {
+            return None; // cylinder (no variation)
+        }
+        if minor_radius < 1e-10 {
+            return None;
+        }
+        if major_radius < minor_radius * 0.1 {
+            return None; // spindle
+        }
+
+        let torus = TorusParams {
+            center: center_centroid,
+            axis,
+            major_radius,
+            minor_radius,
+        };
+
+        if verify_torus_fit_ranges(surface, &torus, u_start, u_span, v_start, v_span) {
+            return Some(torus);
+        }
+
+        None
+    };
+
+    // Try v as revolution direction (most common for RevolutedCurve: v=revolution angle)
+    if v_periodic {
+        if let Some(torus) = try_revolution_direction(v_start, v_span, u_start, u_span, false) {
+            return Some(torus);
+        }
+    }
+
+    // Try u as revolution direction
+    if u_periodic {
+        if let Some(torus) = try_revolution_direction(u_start, u_span, v_start, v_span, true) {
+            return Some(torus);
+        }
+    }
+
+    None
+}
+
+/// Verify that sampled surface points lie on the fitted torus.
+fn verify_torus_fit_ranges<S: ParametricSurface3D>(
+    surface: &S,
+    torus: &TorusParams,
+    u_start: f64,
+    u_span: f64,
+    v_start: f64,
+    v_span: f64,
+) -> bool {
+    let n_samples = 8;
+    for i in 0..n_samples {
+        let u = u_start + u_span * i as f64 / n_samples as f64;
+        for j in 0..n_samples {
+            let v = v_start + v_span * j as f64 / n_samples as f64;
+            let pt = surface.subs(u, v);
+            let d = torus_distance(&pt, torus);
+            if d > torus.minor_radius * 0.1 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Detect a surface of revolution's axis from a generic parametric surface.
+///
+/// A surface of revolution has one periodic direction (period ≈ 2π) where
+/// sweeping traces circles. This function extracts just the revolution axis
+/// (a point + direction), which is sufficient for per-point refinement
+/// when paired with a plane.
+///
+/// Unlike `detect_torus`, this works on partial arcs (e.g., individual faces
+/// of a multi-face torus solid) because it only needs one revolution circle
+/// to determine the axis — it does NOT need to determine R or r.
+fn detect_revolution_axis<S: ParametricSurface3D>(surface: &S) -> Option<RevolutionAxisParams> {
+    let u_per = surface.u_period();
+    let v_per = surface.v_period();
+
+    let (u_range, v_range) = surface.parameter_range();
+    let u_start = param_start(&u_range, 0.0);
+    let u_end = match u_range.1 {
+        Bound::Included(v) | Bound::Excluded(v) => v,
+        Bound::Unbounded => 2.0 * PI,
+    };
+    let v_start = param_start(&v_range, 0.0);
+    let v_end = match v_range.1 {
+        Bound::Included(v) | Bound::Excluded(v) => v,
+        Bound::Unbounded => 2.0 * PI,
+    };
+
+    let u_span = u_end - u_start;
+    let v_span = v_end - v_start;
+
+    // Need exactly one periodic direction with period ≈ 2π
+    let u_periodic =
+        matches!(u_per, Some(p) if (p - 2.0 * PI).abs() < 0.1) || ((u_span - 2.0 * PI).abs() < 0.1);
+    let v_periodic =
+        matches!(v_per, Some(p) if (p - 2.0 * PI).abs() < 0.1) || ((v_span - 2.0 * PI).abs() < 0.1);
+
+    if !u_periodic && !v_periodic {
+        return None;
+    }
+
+    // Must NOT be a plane (no periodicity expected, but guard)
+    // Must have curved generatrix to distinguish from cylinder/cone
+    // (Those are already handled by their own detectors, but we verify
+    // that this IS a revolution surface by checking circle fit.)
+
+    let try_axis = |rev_start: f64,
+                    rev_span: f64,
+                    gen_start: f64,
+                    gen_span: f64,
+                    rev_is_u: bool|
+     -> Option<RevolutionAxisParams> {
+        let sample = |rev: f64, gx: f64| -> Point3 {
+            if rev_is_u {
+                surface.subs(rev, gx)
+            } else {
+                surface.subs(gx, rev)
+            }
+        };
+
+        // Sample a revolution circle at the generatrix midpoint
+        let g_mid = gen_start + gen_span * 0.5;
+        let p1 = sample(rev_start, g_mid);
+        let p2 = sample(rev_start + rev_span / 3.0, g_mid);
+        let p3 = sample(rev_start + 2.0 * rev_span / 3.0, g_mid);
+
+        let center = circumcenter_3d(p1, p2, p3)?;
+        let radius = (p1 - center).magnitude();
+        if radius < 1e-10 {
+            return None;
+        }
+
+        // Verify it's actually a circle (4th point check)
+        let p4 = sample(rev_start + rev_span / 4.0, g_mid);
+        if ((p4 - center).magnitude() - radius).abs() > radius * 0.05 {
+            return None;
+        }
+
+        // Extract axis direction from the circle normal
+        let axis_raw = (p2 - p1).cross(p3 - p1);
+        if axis_raw.magnitude2() < 1e-20 {
+            return None;
+        }
+        let axis = axis_raw.normalize();
+
+        // Verify axis at another generatrix position (if the generatrix span allows)
+        if gen_span > 1e-6 {
+            let g_other = gen_start + gen_span * 0.25;
+            let q1 = sample(rev_start, g_other);
+            let q2 = sample(rev_start + rev_span / 3.0, g_other);
+            let q3 = sample(rev_start + 2.0 * rev_span / 3.0, g_other);
+            let n2 = (q2 - q1).cross(q3 - q1);
+            if n2.magnitude2() > 1e-20 {
+                let dot = n2.normalize().dot(axis).abs();
+                if dot < 0.95 {
+                    return None; // different axis → not a surface of revolution
+                }
+            }
+        }
+
+        Some(RevolutionAxisParams {
+            axis_point: center,
+            axis_dir: axis,
+        })
+    };
+
+    // Try v as revolution direction (most common for RevolutedCurve)
+    if v_periodic {
+        if let Some(params) = try_axis(v_start, v_span, u_start, u_span, false) {
+            return Some(params);
+        }
+    }
+
+    // Try u as revolution direction
+    if u_periodic {
+        if let Some(params) = try_axis(u_start, u_span, v_start, v_span, true) {
+            return Some(params);
+        }
+    }
+
+    None
+}
+
+/// Refine a single point onto the revolution-surface ∩ plane intersection.
+///
+/// For a point P near a revolution-surface/plane intersection, the refined
+/// point preserves P's azimuthal angle and perpendicular distance from the
+/// revolution axis, and finds the axial position where this lands on the
+/// cutting plane.
+///
+/// Result: P' = axis_point + t*axis_dir + radius*radial_dir
+/// where t is chosen so that n · (P' - plane_origin) = 0.
+fn refine_point_on_revsurf_plane(pt: &Point3, rsp: &RevSurfPlaneParams) -> Point3 {
+    let a = rsp.axis_dir;
+    let n = rsp.plane_normal;
+
+    // Build orthonormal frame perpendicular to axis
+    let e_r = if a.x.abs() < 0.9 {
+        a.cross(Vector3::unit_x()).normalize()
+    } else {
+        a.cross(Vector3::unit_y()).normalize()
+    };
+    let e_t = a.cross(e_r).normalize();
+
+    // Decompose pt into cylindrical coordinates relative to axis
+    let d = *pt - rsp.axis_point;
+    let r_coord = d.dot(e_r);
+    let t_coord = d.dot(e_t);
+    let radius = (r_coord * r_coord + t_coord * t_coord).sqrt();
+    if radius < 1e-12 {
+        return *pt; // on axis — can't determine azimuthal angle
+    }
+
+    let theta = t_coord.atan2(r_coord);
+    let radial = theta.cos() * e_r + theta.sin() * e_t;
+
+    // Solve for axial position t:
+    //   n · (axis_point + t*a + radius*radial - plane_origin) = 0
+    //   t * (n·a) = n · (plane_origin - axis_point) - radius * (n·radial)
+    let n_dot_a = n.dot(a);
+    if n_dot_a.abs() < 1e-12 {
+        // Plane parallel to axis — fall back to simple plane projection
+        let dist = n.dot(*pt - rsp.plane_origin);
+        return *pt - dist * n;
+    }
+
+    let numerator = n.dot(rsp.plane_origin - rsp.axis_point) - radius * n.dot(radial);
+    let t = numerator / n_dot_a;
+
+    rsp.axis_point + t * a + radius * radial
+}
+
+/// Compute the distance from a point to the torus surface.
+///
+/// For a torus with center C, axis A, major radius R, minor radius r:
+/// distance = | sqrt(perp² ) - R | - r  where perp = |P-C - ((P-C)·A)·A|
+/// This simplifies to: sqrt( (sqrt(perp²) - R)² + along² ) - r
+fn torus_distance(pt: &Point3, torus: &TorusParams) -> f64 {
+    let v = *pt - torus.center;
+    let along = v.dot(torus.axis);
+    let perp_vec = v - along * torus.axis;
+    let perp = perp_vec.magnitude();
+    let dist_to_tube_center = ((perp - torus.major_radius).powi(2) + along * along).sqrt();
+    (dist_to_tube_center - torus.minor_radius).abs()
+}
+
+/// Compute the intersection of a plane and torus.
+///
+/// For the common CAD case where the plane contains the torus axis or is
+/// perpendicular to it, the intersection is one or two circles.
+///
+/// General torus-plane intersection is a quartic curve. We handle:
+/// 1. Plane perpendicular to torus axis → 1 or 2 circles
+/// 2. Plane containing the torus axis → 2 circles (inner + outer)
+/// 3. General oblique plane → sample points on the exact intersection
+///
+/// Returns a vector of EllipseParams (circles are a special case of ellipses).
+fn compute_torus_plane_intersection(
+    plane: &PlaneParams,
+    torus: &TorusParams,
+) -> Option<Vec<EllipseParams>> {
+    let n = plane.normal;
+    let a = torus.axis;
+    let dot_na = n.dot(a).abs();
+
+    // Case 1: Plane perpendicular to torus axis (dot_na ≈ 1)
+    // The intersection is 0, 1, or 2 circles in the plane.
+    if dot_na > 1.0 - 1e-6 {
+        return compute_torus_perpendicular_plane(plane, torus);
+    }
+
+    // Case 2: Plane contains the torus axis (dot_na ≈ 0)
+    // Intersection is 2 circles (inner ring at R-r and outer ring at R+r)
+    if dot_na < 1e-6 {
+        return compute_torus_axial_plane(plane, torus);
+    }
+
+    // Case 3: General oblique plane — use sampling approach
+    // Sample points on the torus-plane intersection by sweeping the revolution angle
+    // and finding where the generatrix circle intersects the plane
+    compute_torus_oblique_plane(plane, torus)
+}
+
+/// Torus-plane intersection when plane is perpendicular to the torus axis.
+///
+/// The plane cuts the torus into 0, 1, or 2 circles:
+/// - If |d| > r: no intersection
+/// - If |d| = r: 1 circle at radius R (tangent)
+/// - If |d| < r: 2 circles at radii R ± sqrt(r² - d²)
+fn compute_torus_perpendicular_plane(
+    plane: &PlaneParams,
+    torus: &TorusParams,
+) -> Option<Vec<EllipseParams>> {
+    // Signed distance from torus center to plane along the axis
+    let d = plane.normal.dot(torus.center - plane.origin);
+
+    let r = torus.minor_radius;
+    let big_r = torus.major_radius;
+
+    // No intersection if plane is beyond the torus extent
+    if d.abs() >= r - 1e-10 {
+        return None;
+    }
+
+    // The cross-section radii: R ± sqrt(r² - d²)
+    let h = (r * r - d * d).sqrt();
+    let r_outer = big_r + h;
+    let r_inner = big_r - h;
+
+    // Build orthonormal basis in the plane
+    let n = plane.normal;
+    let e1 = if n.x.abs() < 0.9 {
+        n.cross(Vector3::unit_x()).normalize()
+    } else {
+        n.cross(Vector3::unit_y()).normalize()
+    };
+    let e2 = n.cross(e1).normalize();
+
+    // Circle center: projection of torus center onto the plane
+    let circle_center = torus.center - d * plane.normal;
+
+    let mut ellipses = Vec::new();
+
+    // Outer circle (always exists if d < r)
+    if r_outer > 1e-12 {
+        ellipses.push(EllipseParams {
+            center: circle_center,
+            axis_u: r_outer * e1,
+            axis_v: r_outer * e2,
+        });
+    }
+
+    // Inner circle (exists if R > h, i.e., the inner radius is positive)
+    if r_inner > 1e-12 {
+        ellipses.push(EllipseParams {
+            center: circle_center,
+            axis_u: r_inner * e1,
+            axis_v: r_inner * e2,
+        });
+    }
+
+    if ellipses.is_empty() {
+        None
+    } else {
+        Some(ellipses)
+    }
+}
+
+/// Torus-plane intersection when plane contains the torus axis.
+///
+/// The plane slices through the torus tube, producing 2 circles:
+/// one at the "outer" edge (radius R+r projected) and one at the "inner" edge (radius R-r projected).
+/// Actually, when a plane contains the torus axis, it cuts through each tube cross-section
+/// producing 2 circles of radius equal to the minor radius.
+fn compute_torus_axial_plane(
+    plane: &PlaneParams,
+    torus: &TorusParams,
+) -> Option<Vec<EllipseParams>> {
+    let n = plane.normal;
+    let a = torus.axis;
+    let r = torus.minor_radius;
+    let big_r = torus.major_radius;
+
+    // The plane contains the axis. Find the direction perpendicular to
+    // both the normal and the axis — this is the "radial" direction in the plane.
+    let radial = n.cross(a);
+    let radial_mag = radial.magnitude();
+    if radial_mag < 1e-12 {
+        return None; // degenerate
+    }
+    let radial = radial / radial_mag;
+
+    // Two tube cross-section centers: at distance R from center along radial
+    let center1 = torus.center + big_r * radial;
+    let center2 = torus.center - big_r * radial;
+
+    // Each cross-section is a circle of radius r in the plane defined by (a, radial)
+    // But we need the circle to lie in the cutting plane.
+    // The cutting plane contains both 'a' and 'radial', so the circles lie in this plane.
+    let e1 = a;
+    let e2 = radial;
+
+    let mut ellipses = Vec::new();
+
+    // Check plane distance to each center (should be ~0 since plane contains the axis)
+    let d1 = n.dot(center1 - plane.origin).abs();
+    let d2 = n.dot(center2 - plane.origin).abs();
+
+    if d1 < r * 0.1 {
+        ellipses.push(EllipseParams {
+            center: center1,
+            axis_u: r * e1,
+            axis_v: r * e2,
+        });
+    }
+
+    if d2 < r * 0.1 {
+        ellipses.push(EllipseParams {
+            center: center2,
+            axis_u: r * e1,
+            axis_v: r * e2,
+        });
+    }
+
+    if ellipses.is_empty() {
+        None
+    } else {
+        Some(ellipses)
+    }
+}
+
+/// Torus-plane intersection for a general oblique plane.
+///
+/// The intersection is a quartic curve. We approximate it by sweeping the revolution
+/// angle and finding where each generatrix circle intersects the plane. This produces
+/// a high-quality polyline that the mesh-based IC pipeline can use for refinement.
+///
+/// For the CAD boolean use case, we produce circle approximations by fitting ellipses
+/// to the sampled intersection points.
+fn compute_torus_oblique_plane(
+    plane: &PlaneParams,
+    torus: &TorusParams,
+) -> Option<Vec<EllipseParams>> {
+    let n = plane.normal;
+    let a = torus.axis;
+    let big_r = torus.major_radius;
+    let r = torus.minor_radius;
+
+    // Build orthonormal frame for the torus: a, e_r, e_t
+    let e_r = if a.x.abs() < 0.9 {
+        a.cross(Vector3::unit_x()).normalize()
+    } else {
+        a.cross(Vector3::unit_y()).normalize()
+    };
+    let e_t = a.cross(e_r).normalize();
+
+    // For each revolution angle theta, the generatrix circle center is at:
+    //   C(theta) = torus.center + R * (cos(theta) * e_r + sin(theta) * e_t)
+    // The generatrix circle has radius r and lies in the plane spanned by
+    // the axis 'a' and the radial direction at theta.
+    //
+    // A generatrix circle intersects the cutting plane in 0 or 2 points.
+    // We sweep theta and collect all intersection points.
+
+    let n_sweep = 256;
+    let mut intersection_pts: Vec<Point3> = Vec::new();
+
+    for i in 0..n_sweep {
+        let theta = 2.0 * PI * i as f64 / n_sweep as f64;
+        let ct = theta.cos();
+        let st = theta.sin();
+
+        let radial = ct * e_r + st * e_t;
+        let tube_center = torus.center + big_r * radial;
+
+        // Generatrix circle: P(phi) = tube_center + r * (cos(phi) * a + sin(phi) * radial)
+        // Intersect with plane: n . (P(phi) - plane.origin) = 0
+        // n . (tube_center - plane.origin) + r * (cos(phi) * n.a + sin(phi) * n.radial) = 0
+        let d = n.dot(tube_center - plane.origin);
+        let coeff_cos = r * n.dot(a);
+        let coeff_sin = r * n.dot(radial);
+
+        // d + coeff_cos * cos(phi) + coeff_sin * sin(phi) = 0
+        // A * cos(phi - delta) = -d  where A = sqrt(cc² + cs²), delta = atan2(cs, cc)
+        let amplitude = (coeff_cos * coeff_cos + coeff_sin * coeff_sin).sqrt();
+        if amplitude < 1e-15 {
+            continue; // generatrix circle parallel to plane
+        }
+
+        let ratio = -d / amplitude;
+        if ratio.abs() > 1.0 - 1e-12 {
+            if ratio.abs() > 1.0 + 1e-10 {
+                continue; // no intersection
+            }
+            // Tangent — single point
+            let delta = coeff_sin.atan2(coeff_cos);
+            let phi = delta; // cos(phi - delta) = ±1
+            let pt = tube_center + r * (phi.cos() * a + phi.sin() * radial);
+            intersection_pts.push(pt);
+        } else {
+            // Two intersection points
+            let delta = coeff_sin.atan2(coeff_cos);
+            let alpha = ratio.clamp(-1.0, 1.0).acos();
+            for &phi_base in &[delta + alpha, delta - alpha] {
+                let pt = tube_center + r * (phi_base.cos() * a + phi_base.sin() * radial);
+                intersection_pts.push(pt);
+            }
+        }
+    }
+
+    if intersection_pts.len() < 6 {
+        return None;
+    }
+
+    // Separate intersection points into distinct curves.
+    // A general torus-plane intersection has 1 or 2 closed curves.
+    // Sort points into curves by connectivity (nearest-neighbor chain).
+    let curves = separate_into_curves(&intersection_pts, torus.minor_radius * 0.5);
+
+    let mut ellipses = Vec::new();
+    for curve_pts in &curves {
+        if curve_pts.len() < 4 {
+            continue;
+        }
+        // Fit an ellipse to each curve
+        if let Some(ell) = fit_ellipse_to_points(curve_pts, &n) {
+            ellipses.push(ell);
+        }
+    }
+
+    if ellipses.is_empty() {
+        None
+    } else {
+        Some(ellipses)
+    }
+}
+
+/// Separate a set of intersection points into distinct closed curves
+/// by nearest-neighbor chaining with a distance threshold.
+fn separate_into_curves(points: &[Point3], max_gap: f64) -> Vec<Vec<Point3>> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+
+    let mut used = vec![false; points.len()];
+    let mut curves = Vec::new();
+
+    loop {
+        // Find the first unused point
+        let start = used.iter().position(|&u| !u);
+        let start = match start {
+            Some(s) => s,
+            None => break,
+        };
+
+        let mut curve = vec![points[start]];
+        used[start] = true;
+
+        // Greedily chain nearest unused points
+        loop {
+            let last = curve.last().unwrap();
+            let mut best_idx = None;
+            let mut best_dist = max_gap * max_gap;
+
+            for (i, pt) in points.iter().enumerate() {
+                if used[i] {
+                    continue;
+                }
+                let d2 = (*pt - *last).magnitude2();
+                if d2 < best_dist {
+                    best_dist = d2;
+                    best_idx = Some(i);
+                }
+            }
+
+            match best_idx {
+                Some(idx) => {
+                    curve.push(points[idx]);
+                    used[idx] = true;
+                }
+                None => break,
+            }
+        }
+
+        if curve.len() >= 4 {
+            curves.push(curve);
+        } else {
+            // Mark points as used but don't create a curve
+        }
+    }
+
+    curves
+}
+
+/// Fit an ellipse (or circle) to a set of 3D points that lie approximately in a plane.
+///
+/// Uses the plane normal to project points to 2D, computes the center and axes
+/// from the extremes along principal directions in the plane.
+fn fit_ellipse_to_points(points: &[Point3], plane_normal: &Vector3) -> Option<EllipseParams> {
+    if points.len() < 4 {
+        return None;
+    }
+
+    // Compute centroid
+    let n = points.len() as f64;
+    let centroid = Point3::new(
+        points.iter().map(|p| p.x).sum::<f64>() / n,
+        points.iter().map(|p| p.y).sum::<f64>() / n,
+        points.iter().map(|p| p.z).sum::<f64>() / n,
+    );
+
+    // Build 2D frame in the plane
+    let pn = plane_normal.normalize();
+    let e1 = if pn.x.abs() < 0.9 {
+        pn.cross(Vector3::unit_x()).normalize()
+    } else {
+        pn.cross(Vector3::unit_y()).normalize()
+    };
+    let e2 = pn.cross(e1).normalize();
+
+    // Project to 2D and find principal axes via covariance
+    let mut cov_xx = 0.0;
+    let mut cov_xy = 0.0;
+    let mut cov_yy = 0.0;
+
+    for pt in points {
+        let d = *pt - centroid;
+        let x = d.dot(e1);
+        let y = d.dot(e2);
+        cov_xx += x * x;
+        cov_xy += x * y;
+        cov_yy += y * y;
+    }
+
+    cov_xx /= n;
+    cov_xy /= n;
+    cov_yy /= n;
+
+    // Eigenvalues of 2D covariance matrix
+    let trace = cov_xx + cov_yy;
+    let det = cov_xx * cov_yy - cov_xy * cov_xy;
+    let discriminant = (trace * trace - 4.0 * det).max(0.0);
+    let lambda1 = (trace + discriminant.sqrt()) / 2.0;
+    let lambda2 = (trace - discriminant.sqrt()) / 2.0;
+
+    if lambda1 < 1e-20 || lambda2 < 1e-20 {
+        return None;
+    }
+
+    // Eigenvectors
+    let (d1, d2) = if cov_xy.abs() > 1e-15 {
+        let ev1_x = lambda1 - cov_yy;
+        let ev1_y = cov_xy;
+        let ev1_mag = (ev1_x * ev1_x + ev1_y * ev1_y).sqrt();
+        let d1_2d = (ev1_x / ev1_mag, ev1_y / ev1_mag);
+        let d2_2d = (-d1_2d.1, d1_2d.0);
+        (
+            (d1_2d.0 * e1 + d1_2d.1 * e2).normalize(),
+            (d2_2d.0 * e1 + d2_2d.1 * e2).normalize(),
+        )
+    } else {
+        (e1, e2)
+    };
+
+    // Semi-axes from covariance eigenvalues.
+    // For uniformly sampled points on an ellipse, the covariance eigenvalue
+    // equals semi_axis² / 2.
+    let semi_a = (2.0 * lambda1).sqrt();
+    let semi_b = (2.0 * lambda2).sqrt();
+
+    if semi_a < 1e-12 || semi_b < 1e-12 {
+        return None;
+    }
+
+    Some(EllipseParams {
+        center: centroid,
+        axis_u: semi_a * d1,
+        axis_v: semi_b * d2,
+    })
+}
+
 /// Compute the intersection of a plane and sphere.
 ///
 /// The intersection is always a circle (or empty/tangent point).
@@ -770,14 +1662,46 @@ fn sample_ellipse(ellipse: &EllipseParams, n_segments: usize) -> PolylineCurve<P
     PolylineCurve(points)
 }
 
+/// Parameters for a detected revolution surface axis.
+///
+/// A surface of revolution has one periodic direction (period ≈ 2π) sweeping
+/// circles around an axis. This struct captures just the axis, which is
+/// sufficient for per-point refinement when paired with a plane.
+#[derive(Debug, Clone)]
+struct RevolutionAxisParams {
+    axis_point: Point3, // a point on the revolution axis
+    axis_dir: Vector3,  // unit direction along the axis
+}
+
+/// Parameters for revolution-surface + plane per-point refinement.
+///
+/// Instead of computing global intersection curves (which requires full torus
+/// parameters that are hard to extract from partial-arc faces), this stores
+/// just the revolution axis and plane. Refinement works per-point by:
+/// 1. Finding the revolution circle through the point
+/// 2. Intersecting that circle with the plane
+/// 3. Picking the closest intersection point
+#[derive(Debug, Clone)]
+struct RevSurfPlaneParams {
+    axis_point: Point3,
+    axis_dir: Vector3,
+    plane_origin: Point3,
+    plane_normal: Vector3,
+}
+
 /// Opaque handle to one or more analytical intersection curves (ellipses/circles).
 ///
 /// Used to refine mesh-based polylines by projecting their points onto
 /// the closest exact intersection curve. Most surface pairs produce a single
 /// ellipse; cylinder-cylinder produces two.
+///
+/// For revolution-surface + plane pairs where full surface parameters can't
+/// be determined (e.g., partial torus arcs), `revsurf_plane` provides
+/// per-point refinement using circle-plane intersection.
 #[derive(Debug, Clone)]
 pub struct AnalyticalIC {
     ellipses: Vec<EllipseParams>,
+    revsurf_plane: Option<RevSurfPlaneParams>,
 }
 
 /// Try to detect an analytical plane-cylinder intersection.
@@ -805,6 +1729,7 @@ where
     let ellipse = compute_plane_cylinder_intersection(&plane, &cyl)?;
     Some(AnalyticalIC {
         ellipses: vec![ellipse],
+        revsurf_plane: None,
     })
 }
 
@@ -834,6 +1759,7 @@ where
     let ellipse = compute_plane_cone_intersection(&plane, &cone)?;
     Some(AnalyticalIC {
         ellipses: vec![ellipse],
+        revsurf_plane: None,
     })
 }
 
@@ -863,6 +1789,7 @@ where
     let ellipse = compute_sphere_plane_intersection(&plane, &sphere)?;
     Some(AnalyticalIC {
         ellipses: vec![ellipse],
+        revsurf_plane: None,
     })
 }
 
@@ -1006,7 +1933,70 @@ where
     let cyl0 = detect_cylinder(surface0)?;
     let cyl1 = detect_cylinder(surface1)?;
     let ellipses = compute_cylinder_cylinder_intersection(&cyl0, &cyl1)?;
-    Some(AnalyticalIC { ellipses })
+    Some(AnalyticalIC {
+        ellipses,
+        revsurf_plane: None,
+    })
+}
+
+/// Try to detect an analytical torus/revolution-surface + plane intersection.
+///
+/// Two paths:
+/// 1. Full torus detection → ellipse-based refinement (works for analytical `Torus` type)
+/// 2. Revolution axis detection → per-point circle-plane refinement (works for
+///    partial-arc `RevolutedCurve<NurbsCurve>` faces from the revolve pipeline)
+///
+/// Returns an `AnalyticalIC` that can be used to refine mesh-based polylines,
+/// or None if neither surface pair is a recognizable torus/revsurf + plane.
+pub fn try_analytical_torus_plane_ic<S0, S1>(
+    surface0: &S0,
+    surface1: &S1,
+    _tol: f64,
+) -> Option<AnalyticalIC>
+where
+    S0: ParametricSurface3D,
+    S1: ParametricSurface3D,
+{
+    // Path 1: Full torus detection → ellipse-based refinement
+    let p0 = detect_plane(surface0);
+    let p1 = detect_plane(surface1);
+    let t0 = detect_torus(surface0);
+    let t1 = detect_torus(surface1);
+
+    if let Some((plane, torus)) = match (&p0, &t0, &p1, &t1) {
+        (Some(p), _, _, Some(t)) => Some((p.clone(), t.clone())),
+        (_, Some(t), Some(p), _) => Some((p.clone(), t.clone())),
+        _ => None,
+    } {
+        if let Some(ellipses) = compute_torus_plane_intersection(&plane, &torus) {
+            return Some(AnalyticalIC {
+                ellipses,
+                revsurf_plane: None,
+            });
+        }
+    }
+
+    // Path 2: Revolution axis detection → per-point refinement
+    // This handles partial-arc faces where detect_torus fails (can't determine R, r)
+    // but we can still detect the revolution axis and do per-point circle-plane refinement.
+    let r0 = detect_revolution_axis(surface0);
+    let r1 = detect_revolution_axis(surface1);
+
+    let (plane, rev) = match (&p0, &r1, &p1, &r0) {
+        (Some(p), Some(r), _, _) => (p, r),
+        (_, _, Some(p), Some(r)) => (p, r),
+        _ => return None,
+    };
+
+    Some(AnalyticalIC {
+        ellipses: Vec::new(),
+        revsurf_plane: Some(RevSurfPlaneParams {
+            axis_point: rev.axis_point,
+            axis_dir: rev.axis_dir,
+            plane_origin: plane.origin,
+            plane_normal: plane.normal,
+        }),
+    })
 }
 
 /// Select the ellipse closest to a polyline from a set of candidates.
@@ -1051,6 +2041,20 @@ pub fn refine_polyline(
     mesh_polyline: &PolylineCurve<Point3>,
     analytical: &AnalyticalIC,
 ) -> PolylineCurve<Point3> {
+    // Prefer per-point revolution-surface refinement when available
+    if let Some(rsp) = &analytical.revsurf_plane {
+        let points: Vec<Point3> = mesh_polyline
+            .0
+            .iter()
+            .map(|pt| refine_point_on_revsurf_plane(pt, rsp))
+            .collect();
+        return PolylineCurve(points);
+    }
+
+    // Fall back to ellipse projection
+    if analytical.ellipses.is_empty() {
+        return mesh_polyline.clone();
+    }
     let ellipse = pick_closest_ellipse(mesh_polyline, &analytical.ellipses);
     let points: Vec<Point3> = mesh_polyline
         .0
@@ -1350,6 +2354,7 @@ mod tests {
                 axis_u: Vector3::new(2.0, 0.0, 0.0),
                 axis_v: Vector3::new(0.0, 2.0, 0.0),
             }],
+            revsurf_plane: None,
         };
 
         let mesh_poly = PolylineCurve(vec![
@@ -2498,7 +3503,10 @@ mod tests {
         };
 
         let ellipses = compute_cylinder_cylinder_intersection(&cyl0, &cyl1).unwrap();
-        let analytical = AnalyticalIC { ellipses };
+        let analytical = AnalyticalIC {
+            ellipses,
+            revsurf_plane: None,
+        };
 
         // Create a noisy polyline near the first ellipse
         let ell0 = &analytical.ellipses[0];
@@ -2610,5 +3618,478 @@ mod tests {
             .iter()
             .map(|ell| (*pt - project_to_ellipse(pt, ell)).magnitude())
             .fold(f64::MAX, f64::min)
+    }
+
+    // --- Torus-Plane tests (Sprint 47 / Phase B) ---
+
+    /// Helper: verify all sampled points lie on both the plane and the torus.
+    fn assert_points_on_plane_and_torus(
+        ellipse: &EllipseParams,
+        plane_origin: Point3,
+        plane_normal: Vector3,
+        torus: &TorusParams,
+        tol: f64,
+    ) {
+        let poly = sample_ellipse(ellipse, 128);
+        for (i, pt) in poly.0.iter().enumerate() {
+            // On the plane
+            let d = plane_normal.dot(*pt - plane_origin).abs();
+            assert!(d < tol, "point[{}] not on plane: dist = {:.2e}", i, d);
+            // On the torus
+            let td = torus_distance(pt, torus);
+            assert!(td < tol, "point[{}] not on torus: dist = {:.2e}", i, td);
+        }
+    }
+
+    /// TP1: Detect torus from truck's Torus surface type.
+    #[test]
+    fn test_tp1_detect_torus_from_truck_torus() {
+        // Torus centered at origin, R=5, r=1, axis along Z
+        let torus_surface = Torus::new(Point3::origin(), 5.0, 1.0);
+
+        let detected = detect_torus(&torus_surface);
+        assert!(detected.is_some(), "Failed to detect torus");
+        let params = detected.unwrap();
+        assert!(
+            (params.axis - Vector3::unit_z()).magnitude() < 0.1
+                || (params.axis + Vector3::unit_z()).magnitude() < 0.1,
+            "axis = {:?}, expected Z-axis",
+            params.axis
+        );
+        assert!(
+            (params.major_radius - 5.0).abs() < 0.3,
+            "major_radius = {}, expected 5.0",
+            params.major_radius
+        );
+        assert!(
+            (params.minor_radius - 1.0).abs() < 0.15,
+            "minor_radius = {}, expected 1.0",
+            params.minor_radius
+        );
+    }
+
+    /// TP2: Cylinder should not be detected as torus.
+    #[test]
+    fn test_tp2_cylinder_not_detected_as_torus() {
+        let line = Line(Point3::new(2.0, 0.0, 0.0), Point3::new(2.0, 0.0, 10.0));
+        let cylinder = RevolutedCurve::by_revolution(line, Point3::origin(), Vector3::unit_z());
+        assert!(
+            detect_torus(&cylinder).is_none(),
+            "Cylinder should not be detected as torus"
+        );
+    }
+
+    /// TP3: Plane should not be detected as torus.
+    #[test]
+    fn test_tp3_plane_not_detected_as_torus() {
+        let plane = Plane::new(
+            Point3::origin(),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        );
+        assert!(
+            detect_torus(&plane).is_none(),
+            "Plane should not be detected as torus"
+        );
+    }
+
+    /// TP4: Cone should not be detected as torus.
+    #[test]
+    fn test_tp4_cone_not_detected_as_torus() {
+        let line = Line(Point3::new(0.0, 0.0, 0.0), Point3::new(2.0, 0.0, 5.0));
+        let cone = RevolutedCurve::by_revolution(line, Point3::origin(), Vector3::unit_z());
+        assert!(
+            detect_torus(&cone).is_none(),
+            "Cone should not be detected as torus"
+        );
+    }
+
+    /// TP5: Torus-plane perpendicular intersection (2 circles).
+    #[test]
+    fn test_tp5_torus_perpendicular_plane_two_circles() {
+        let torus = TorusParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            major_radius: 5.0,
+            minor_radius: 1.0,
+        };
+        let plane = PlaneParams {
+            origin: Point3::origin(),
+            normal: Vector3::unit_z(),
+        };
+
+        let ellipses = compute_torus_plane_intersection(&plane, &torus).unwrap();
+
+        // Plane through center, perpendicular to axis → 2 circles
+        // Outer: R + r = 6, Inner: R - r = 4
+        assert_eq!(ellipses.len(), 2, "Expected 2 circles");
+
+        let r0 = ellipses[0].axis_u.magnitude();
+        let r1 = ellipses[1].axis_u.magnitude();
+        let (outer, inner) = if r0 > r1 { (r0, r1) } else { (r1, r0) };
+
+        assert!(
+            (outer - 6.0).abs() < 1e-10,
+            "outer radius = {outer}, expected 6.0"
+        );
+        assert!(
+            (inner - 4.0).abs() < 1e-10,
+            "inner radius = {inner}, expected 4.0"
+        );
+
+        for ell in &ellipses {
+            assert_points_on_plane_and_torus(
+                ell,
+                Point3::origin(),
+                Vector3::unit_z(),
+                &torus,
+                1e-6,
+            );
+        }
+    }
+
+    /// TP6: Torus-plane perpendicular offset (plane above center).
+    #[test]
+    fn test_tp6_torus_perpendicular_plane_offset() {
+        let torus = TorusParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            major_radius: 5.0,
+            minor_radius: 2.0,
+        };
+        // Plane at z=1 (within minor radius)
+        let plane = PlaneParams {
+            origin: Point3::new(0.0, 0.0, 1.0),
+            normal: Vector3::unit_z(),
+        };
+
+        let ellipses = compute_torus_plane_intersection(&plane, &torus).unwrap();
+        assert_eq!(ellipses.len(), 2, "Expected 2 circles for offset plane");
+
+        // h = sqrt(r² - d²) = sqrt(4 - 1) = sqrt(3)
+        // outer = R + h ≈ 5 + 1.732 = 6.732
+        // inner = R - h ≈ 5 - 1.732 = 3.268
+        let h = 3.0_f64.sqrt();
+        let expected_outer = 5.0 + h;
+        let expected_inner = 5.0 - h;
+
+        let r0 = ellipses[0].axis_u.magnitude();
+        let r1 = ellipses[1].axis_u.magnitude();
+        let (outer, inner) = if r0 > r1 { (r0, r1) } else { (r1, r0) };
+
+        assert!(
+            (outer - expected_outer).abs() < 1e-8,
+            "outer = {outer}, expected {expected_outer}"
+        );
+        assert!(
+            (inner - expected_inner).abs() < 1e-8,
+            "inner = {inner}, expected {expected_inner}"
+        );
+
+        for ell in &ellipses {
+            assert_points_on_plane_and_torus(
+                ell,
+                Point3::new(0.0, 0.0, 1.0),
+                Vector3::unit_z(),
+                &torus,
+                1e-6,
+            );
+        }
+    }
+
+    /// TP7: Torus-plane perpendicular plane beyond extent → None.
+    #[test]
+    fn test_tp7_torus_perpendicular_no_intersection() {
+        let torus = TorusParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            major_radius: 5.0,
+            minor_radius: 1.0,
+        };
+        // Plane at z=2 — beyond minor radius (1.0)
+        let plane = PlaneParams {
+            origin: Point3::new(0.0, 0.0, 2.0),
+            normal: Vector3::unit_z(),
+        };
+
+        assert!(
+            compute_torus_plane_intersection(&plane, &torus).is_none(),
+            "Plane beyond torus should return None"
+        );
+    }
+
+    /// TP8: Torus-plane axial intersection (plane contains axis).
+    #[test]
+    fn test_tp8_torus_axial_plane() {
+        let torus = TorusParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            major_radius: 5.0,
+            minor_radius: 1.0,
+        };
+        // XZ plane (contains the Z axis)
+        let plane = PlaneParams {
+            origin: Point3::origin(),
+            normal: Vector3::unit_y(),
+        };
+
+        let ellipses = compute_torus_plane_intersection(&plane, &torus).unwrap();
+
+        // Axial plane → 2 circles of radius r=1
+        assert_eq!(ellipses.len(), 2, "Expected 2 circles for axial plane");
+
+        for ell in &ellipses {
+            let r = ell.axis_u.magnitude();
+            assert!(
+                (r - 1.0).abs() < 1e-8,
+                "circle radius = {r}, expected 1.0 (minor radius)"
+            );
+            assert_points_on_plane_and_torus(
+                ell,
+                Point3::origin(),
+                Vector3::unit_y(),
+                &torus,
+                1e-6,
+            );
+        }
+
+        // Centers should be at distance R=5 from origin along X
+        let c0_dist = (ellipses[0].center - Point3::origin()).magnitude();
+        let c1_dist = (ellipses[1].center - Point3::origin()).magnitude();
+        assert!(
+            (c0_dist - 5.0).abs() < 1e-8,
+            "center0 dist = {c0_dist}, expected 5.0"
+        );
+        assert!(
+            (c1_dist - 5.0).abs() < 1e-8,
+            "center1 dist = {c1_dist}, expected 5.0"
+        );
+    }
+
+    /// TP9: Torus-plane oblique intersection.
+    #[test]
+    fn test_tp9_torus_oblique_plane() {
+        let torus = TorusParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            major_radius: 5.0,
+            minor_radius: 1.5,
+        };
+        // Plane tilted 45° from Z axis
+        let normal = Vector3::new(0.0, 1.0, 1.0).normalize();
+        let plane = PlaneParams {
+            origin: Point3::origin(),
+            normal,
+        };
+
+        let result = compute_torus_plane_intersection(&plane, &torus);
+        assert!(
+            result.is_some(),
+            "Oblique torus-plane should produce curves"
+        );
+
+        let ellipses = result.unwrap();
+        assert!(!ellipses.is_empty(), "Should produce at least one curve");
+
+        // All sampled points should lie on both the plane and the torus
+        for (i, ell) in ellipses.iter().enumerate() {
+            let poly = sample_ellipse(ell, 64);
+            for pt in &poly.0 {
+                // On the plane
+                let d = normal.dot(*pt - Point3::origin()).abs();
+                // Oblique fit is approximate, allow larger tolerance
+                assert!(d < 0.5, "ellipse[{i}] point not on plane: dist = {d:.4}");
+                // On the torus
+                let td = torus_distance(pt, &torus);
+                assert!(td < 0.5, "ellipse[{i}] point not on torus: dist = {td:.4}");
+            }
+        }
+    }
+
+    /// TP10: Torus torus_distance function sanity check.
+    #[test]
+    fn test_tp10_torus_distance() {
+        let torus = TorusParams {
+            center: Point3::origin(),
+            axis: Vector3::unit_z(),
+            major_radius: 5.0,
+            minor_radius: 1.0,
+        };
+
+        // Point on the torus: at angle theta=0, phi=0 → (R+r, 0, 0) = (6, 0, 0)
+        let on_torus = Point3::new(6.0, 0.0, 0.0);
+        assert!(
+            torus_distance(&on_torus, &torus) < 1e-10,
+            "Point on torus should have distance ~0"
+        );
+
+        // Point on torus: (R-r, 0, 0) = (4, 0, 0)
+        let on_torus_inner = Point3::new(4.0, 0.0, 0.0);
+        assert!(
+            torus_distance(&on_torus_inner, &torus) < 1e-10,
+            "Point on inner torus should have distance ~0"
+        );
+
+        // Point on torus: (0, R+r, 0) = (0, 6, 0)
+        let on_torus_y = Point3::new(0.0, 6.0, 0.0);
+        assert!(
+            torus_distance(&on_torus_y, &torus) < 1e-10,
+            "Point on torus Y-direction should have distance ~0"
+        );
+
+        // Point on torus: (R, 0, r) = (5, 0, 1)
+        let on_torus_top = Point3::new(5.0, 0.0, 1.0);
+        assert!(
+            torus_distance(&on_torus_top, &torus) < 1e-10,
+            "Point on top of torus tube should have distance ~0"
+        );
+
+        // Point outside torus: (10, 0, 0) → distance from tube = |10-5| - 1 = 4
+        let outside = Point3::new(10.0, 0.0, 0.0);
+        assert!(
+            (torus_distance(&outside, &torus) - 4.0).abs() < 1e-10,
+            "Point outside should have distance 4"
+        );
+    }
+
+    /// TP11: Full pipeline — detect torus from truck Torus + plane → analytical IC.
+    #[test]
+    fn test_tp11_full_pipeline_torus_plane() {
+        // Torus centered at origin, R=3, r=1, axis along Z
+        let torus_surface = Torus::new(Point3::origin(), 3.0, 1.0);
+
+        // Plane perpendicular to Z at z=0
+        let plane = Plane::new(
+            Point3::new(-10.0, -10.0, 0.0),
+            Point3::new(10.0, -10.0, 0.0),
+            Point3::new(-10.0, 10.0, 0.0),
+        );
+
+        let result = try_analytical_torus_plane_ic(&plane, &torus_surface, 0.05);
+        assert!(
+            result.is_some(),
+            "Failed to detect torus-plane pair from truck surfaces"
+        );
+
+        let ic = result.unwrap();
+        // Perpendicular plane through center → 2 circles: R+r=4, R-r=2
+        assert!(
+            ic.ellipses.len() >= 1,
+            "Expected at least 1 circle, got {}",
+            ic.ellipses.len()
+        );
+    }
+
+    /// TP12: Torus pipeline accepts cylinder as revolution surface (valid fallback).
+    ///
+    /// A cylinder IS a valid revolution surface, so the revolution-axis fallback
+    /// correctly detects it. In the real dispatch chain, the earlier
+    /// `try_analytical_plane_cylinder_ic` takes priority and produces better
+    /// ellipse-based refinement. But the fallback is still correct.
+    #[test]
+    fn test_tp12_torus_pipeline_cylinder_as_revsurf() {
+        let plane = Plane::new(
+            Point3::new(-5.0, -5.0, 3.0),
+            Point3::new(5.0, -5.0, 3.0),
+            Point3::new(-5.0, 5.0, 3.0),
+        );
+        let line = Line(Point3::new(2.0, 0.0, 0.0), Point3::new(2.0, 0.0, 10.0));
+        let cylinder = RevolutedCurve::by_revolution(line, Point3::origin(), Vector3::unit_z());
+
+        // The revolution-axis fallback detects this (cylinder is a revolution surface)
+        let result = try_analytical_torus_plane_ic(&plane, &cylinder, 0.05);
+        assert!(
+            result.is_some(),
+            "Cylinder is a valid revolution surface for revsurf_plane refinement"
+        );
+        // Full torus detection should NOT fire (cylinder is not a torus)
+        let ic = result.unwrap();
+        assert!(
+            ic.ellipses.is_empty(),
+            "No torus ellipses — this was detected via revolution axis fallback"
+        );
+        assert!(
+            ic.revsurf_plane.is_some(),
+            "Should have revsurf_plane params"
+        );
+    }
+
+    /// TP13: Revolution axis detection on a RevolutedCurve (torus).
+    #[test]
+    fn test_tp13_detect_revolution_axis_from_torus() {
+        let torus_surface = Torus::new(Point3::origin(), 5.0, 1.0);
+        let axis = detect_revolution_axis(&torus_surface);
+        assert!(axis.is_some(), "Should detect revolution axis on torus");
+        let params = axis.unwrap();
+        // Axis direction should be Z
+        assert!(
+            (params.axis_dir - Vector3::unit_z()).magnitude() < 0.1
+                || (params.axis_dir + Vector3::unit_z()).magnitude() < 0.1,
+            "axis_dir = {:?}, expected Z",
+            params.axis_dir
+        );
+    }
+
+    /// TP14: Revolution axis detection on a RevolutedCurve line (cylinder).
+    #[test]
+    fn test_tp14_detect_revolution_axis_from_cylinder() {
+        let line = Line(Point3::new(2.0, 0.0, 0.0), Point3::new(2.0, 0.0, 10.0));
+        let cyl = RevolutedCurve::by_revolution(line, Point3::origin(), Vector3::unit_z());
+        let axis = detect_revolution_axis(&cyl);
+        assert!(axis.is_some(), "Should detect revolution axis on cylinder");
+        let params = axis.unwrap();
+        assert!(
+            (params.axis_dir - Vector3::unit_z()).magnitude() < 0.1
+                || (params.axis_dir + Vector3::unit_z()).magnitude() < 0.1,
+            "axis_dir = {:?}, expected Z",
+            params.axis_dir
+        );
+    }
+
+    /// TP15: Plane should not be detected as revolution surface.
+    #[test]
+    fn test_tp15_plane_not_detected_as_revsurf() {
+        let plane = Plane::new(
+            Point3::origin(),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        );
+        assert!(
+            detect_revolution_axis(&plane).is_none(),
+            "Plane should not be detected as revolution surface"
+        );
+    }
+
+    /// TP16: Per-point revsurf refinement projects onto circle-plane intersection.
+    #[test]
+    fn test_tp16_revsurf_plane_refinement() {
+        let rsp = RevSurfPlaneParams {
+            axis_point: Point3::origin(),
+            axis_dir: Vector3::unit_z(),
+            plane_origin: Point3::new(0.0, 0.0, 3.0),
+            plane_normal: Vector3::unit_z(),
+        };
+
+        // A point near the torus at z≈3, radius≈5 from Z-axis
+        let noisy_pt = Point3::new(5.1, 0.2, 2.8);
+        let refined = refine_point_on_revsurf_plane(&noisy_pt, &rsp);
+
+        // Refined point should be exactly on the plane (z = 3)
+        assert!(
+            (refined.z - 3.0).abs() < 1e-10,
+            "refined.z = {}, expected 3.0",
+            refined.z
+        );
+
+        // Refined point should preserve the revolution radius
+        // (perpendicular distance from axis = same as original point)
+        let orig_r = (noisy_pt.x * noisy_pt.x + noisy_pt.y * noisy_pt.y).sqrt();
+        let refined_r = (refined.x * refined.x + refined.y * refined.y).sqrt();
+        assert!(
+            (refined_r - orig_r).abs() < 0.01,
+            "refined_r = {}, orig_r = {}",
+            refined_r,
+            orig_r
+        );
     }
 }
