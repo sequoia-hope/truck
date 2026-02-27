@@ -548,7 +548,66 @@ fn populate_face_interference_basic() {
 }
 
 // -----------------------------------------------------------------------
-// Test 13: interference_to_boundary_wires fallback
+// Test 13: find_corner_touch_snap — corner vertex detection
+// -----------------------------------------------------------------------
+
+#[test]
+fn corner_touch_detected_at_vertex() {
+    let boundary_verts = vec![
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(10.0, 0.0, 0.0),
+        Point3::new(10.0, 10.0, 0.0),
+        Point3::new(0.0, 10.0, 0.0),
+    ];
+    let tol = 0.01;
+
+    // IC endpoint exactly at origin
+    let result = find_corner_touch_snap(Point3::new(0.0, 0.0, 0.0), &boundary_verts, tol);
+    assert!(result.is_some(), "Exact corner should snap");
+    let snapped = result.unwrap();
+    assert!(
+        (snapped - Point3::new(0.0, 0.0, 0.0)).magnitude() < 1e-15,
+        "Should snap to exact origin"
+    );
+
+    // IC endpoint near origin (within tol)
+    let result = find_corner_touch_snap(Point3::new(0.001, 0.001, 0.001), &boundary_verts, tol);
+    assert!(result.is_some(), "Near-corner should snap");
+    let snapped = result.unwrap();
+    assert!(
+        (snapped - Point3::new(0.0, 0.0, 0.0)).magnitude() < 1e-15,
+        "Should snap to origin, got {:?}",
+        snapped
+    );
+}
+
+#[test]
+fn interior_crossing_not_corner_touch() {
+    let boundary_verts = vec![
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(10.0, 0.0, 0.0),
+        Point3::new(10.0, 10.0, 0.0),
+        Point3::new(0.0, 10.0, 0.0),
+    ];
+    let tol = 0.01;
+
+    // IC endpoint at edge midpoint — far from any vertex
+    let result = find_corner_touch_snap(Point3::new(5.0, 0.0, 0.0), &boundary_verts, tol);
+    assert!(
+        result.is_none(),
+        "Edge midpoint should NOT snap to a vertex"
+    );
+
+    // IC endpoint in face interior
+    let result = find_corner_touch_snap(Point3::new(3.0, 4.0, 0.0), &boundary_verts, tol);
+    assert!(
+        result.is_none(),
+        "Face interior point should NOT snap to a vertex"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Test 14: interference_to_boundary_wires fallback
 // -----------------------------------------------------------------------
 
 #[test]

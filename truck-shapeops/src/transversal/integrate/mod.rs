@@ -2339,6 +2339,19 @@ fn assemble_boolean_shell_v2<C: ShapeOpsCurve<S>, S: ShapeOpsSurface>(
             level, label, shell.len(), open.len(),
         );
 
+        // Diagnostic: log open edge positions at level 2 for debugging
+        if level == 2 && !open.is_empty() {
+            for (idx, oe) in open.iter().enumerate() {
+                eprintln!(
+                    "[v2_assembly] open_edge[{}]: ({:.4},{:.4},{:.4})->({:.4},{:.4},{:.4}) refs={}",
+                    idx,
+                    oe.front.x, oe.front.y, oe.front.z,
+                    oe.back.x, oe.back.y, oe.back.z,
+                    oe.face_count,
+                );
+            }
+        }
+
         if open.is_empty() {
             // Try Solid::try_new first (strict check).
             let boundaries = shell.connected_components();

@@ -1,4 +1,4 @@
-// Phase 1 infrastructure — not yet wired into the boolean hot path.
+// Phase 1 infrastructure — types used in interference.rs tests and future pipeline.
 #![allow(dead_code)]
 
 //! Pave Block types for the deterministic boolean pipeline.

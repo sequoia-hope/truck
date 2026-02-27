@@ -629,6 +629,14 @@ fn inject_coplanar_boundary_loops<C, S>(
                     inject_boundary_wire(wire, &mut poly_loops_store1[j], status);
                 }
             }
+
+            // Partial overlap: neither face fully contains the other, but
+            // at least one vertex of either face is inside the other.
+            // We do NOT inject full boundary wires here because they extend
+            // beyond the receiving face and cause face division to fail.
+            // Instead, let coplanar_adj_skip NOT skip adjacencies for partial
+            // overlap, so IC processing from adjacent non-coplanar pairs
+            // provides the correct boundary intersection curves.
         }
     }
 }
@@ -869,6 +877,10 @@ where
                     }
                 }
             }
+            // Partial overlap: do NOT skip adjacencies. Without boundary
+            // injection, ICs from adjacent non-coplanar face pairs provide
+            // the correct boundary intersection curves needed to divide
+            // both coplanar faces at their overlap boundary.
         }
 
         skip
@@ -1008,18 +1020,21 @@ where
                 )
                 .is_some()
             {
+                eprintln!("[ic_loop] SKIP coplanar pair ({},{})", face_index0, face_index1);
                 return Some(());
             }
             // Skip coplanar-adjacent pairs when containment holds.
             // These produce intersection curves that duplicate the coplanar
             // boundary injection, causing non-manifold topology.
             if coplanar_adj_skip.contains(&(face_index0, face_index1)) {
+                eprintln!("[ic_loop] SKIP adj pair ({},{})", face_index0, face_index1);
                 return Some(());
             }
             // Phase 1B: Skip face pairs that share a coincident edge.
             // SSI between such pairs produces degenerate ICs along the shared
             // edge that corrupt loop stores with biangle wires.
             if edge_coincident_skip.contains(&(face_index0, face_index1)) {
+                eprintln!("[ic_loop] SKIP edge-coincident pair ({},{})", face_index0, face_index1);
                 return Some(());
             }
             // AABB culling: skip face pairs whose bounding boxes don't overlap.
@@ -1041,6 +1056,12 @@ where
                 &polygon1,
                 tol,
             )?;
+            if !ics.is_empty() {
+                eprintln!(
+                    "[ic_loop] face pair ({},{}) produced {} ICs",
+                    face_index0, face_index1, ics.len()
+                );
+            }
             ics.into_iter()
                 .try_for_each(|(polyline, intersection_curve)| {
                     let mut intersection_curve = intersection_curve.into();
@@ -1123,7 +1144,15 @@ where
 
                             // Case 1: shared-edge artifact — both endpoints on BOTH faces' boundaries.
                             // This is a degenerate IC along an already-shared edge. Skip it.
-                            if (front_on_b0 && front_on_b1) && (back_on_b0 && back_on_b1) {
+                            // Guard: only reliable when ic_length > boundary_tol. When the IC is
+                            // much shorter than boundary_tol, ALL points on the IC are within
+                            // boundary_tol of both boundaries regardless of whether it runs along
+                            // a shared edge or crosses at a boundary intersection. The boundary
+                            // proximity check is meaningless in that regime.
+                            if ic_length > boundary_tol
+                                && (front_on_b0 && front_on_b1)
+                                && (back_on_b0 && back_on_b1)
+                            {
                                 eprintln!(
                                     "[boolean] Phase 1C: Skipping shared-edge artifact IC \
                                      (length {:.2e} < tol {:.2e}, both endpoints on both boundaries)",
@@ -1236,11 +1265,55 @@ where
                         // projection fails (e.g., at coplanar face boundaries), skip
                         // this curve rather than aborting the entire pipeline.
                         let _ = (|| -> Option<()> {
-                            // Phase 1C: Use snapped polyline endpoints for vertex
-                            // creation. If endpoints were snapped to coincident
-                            // vertex positions above, this ensures add_polygon_vertex
-                            // finds the correct boundary vertex (Front/Back) rather
-                            // than splitting an edge at a near-duplicate position.
+                            // Invariant INV-A1: Corner-touch vertex snapping prevents
+                            // figure-8 wires. When an IC endpoint is within tau_model
+                            // of a boundary vertex, we snap to the exact corner
+                            // position so add_polygon_vertex returns Front/Back
+                            // instead of Inner(near-boundary-t).
+                            let bverts0: Vec<Point3> = geom_shell0[face_index0]
+                                .absolute_boundaries()
+                                .iter()
+                                .flat_map(|w| w.vertex_iter().map(|v| v.point()))
+                                .collect();
+                            let bverts1: Vec<Point3> = geom_shell1[face_index1]
+                                .absolute_boundaries()
+                                .iter()
+                                .flat_map(|w| w.vertex_iter().map(|v| v.point()))
+                                .collect();
+
+                            let mut front_pt = polyline.front();
+                            let mut back_pt = polyline.back();
+
+                            // Snap IC front endpoint to boundary vertices of both faces
+                            if let Some(snapped) = interference::find_corner_touch_snap(
+                                front_pt, &bverts0, tol,
+                            ) {
+                                front_pt = snapped;
+                                *polyline.0.first_mut().unwrap() = snapped;
+                            }
+                            if let Some(snapped) = interference::find_corner_touch_snap(
+                                front_pt, &bverts1, tol,
+                            ) {
+                                front_pt = snapped;
+                                *polyline.0.first_mut().unwrap() = snapped;
+                            }
+
+                            // Snap IC back endpoint to boundary vertices of both faces
+                            if let Some(snapped) = interference::find_corner_touch_snap(
+                                back_pt, &bverts0, tol,
+                            ) {
+                                back_pt = snapped;
+                                *polyline.0.last_mut().unwrap() = snapped;
+                            }
+                            if let Some(snapped) = interference::find_corner_touch_snap(
+                                back_pt, &bverts1, tol,
+                            ) {
+                                back_pt = snapped;
+                                *polyline.0.last_mut().unwrap() = snapped;
+                            }
+
+                            let _ = (front_pt, back_pt); // used for snapping above
+
                             let pv0 = Vertex::new(polyline.front());
                             let pv1 = Vertex::new(polyline.back());
                             let gv0 = Vertex::new(polyline.front());

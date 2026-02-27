@@ -1,4 +1,7 @@
-// Phase 1 infrastructure — not yet wired into the boolean hot path.
+// Infrastructure for IC-edge crossing computation and pave block assembly.
+// Most items are used only in tests for now; find_corner_touch_snap is wired
+// into the hot path (loops_store). Suppress dead_code for the rest until
+// full Phase 1 integration.
 #![allow(dead_code)]
 
 //! IC-edge crossing computation and pave block assembly.
@@ -491,6 +494,43 @@ pub fn interference_to_boundary_wires<C: Clone>(
         original_wire.clone(),
         ShapesOpStatus::Unknown,
     )]
+}
+
+// ---------------------------------------------------------------------------
+// Corner-touch snap for IC endpoints (MV3 fix)
+// ---------------------------------------------------------------------------
+
+/// Check if an IC endpoint is within `tol` of any face boundary vertex.
+///
+/// When an IC endpoint lands near a face boundary corner vertex, the normal
+/// `search_parameter` → `ParameterKind::try_new` path may return `Inner(t)`
+/// with t near 0 or 1 instead of `Front`/`Back`. This creates a near-duplicate
+/// vertex that produces a figure-8 (self-intersecting) wire.
+///
+/// Returns the exact boundary vertex position if the IC endpoint is within
+/// `tol` of any vertex in `boundary_vertex_positions`. The caller should use
+/// this exact position when creating the IC vertex, ensuring `search_parameter`
+/// returns `Front`/`Back`.
+///
+/// # Invariant INV-A1
+/// Corner-touch vertex snapping prevents figure-8 wires by ensuring
+/// `add_polygon_vertex` classifies the endpoint as Front/Back (vertex reuse)
+/// rather than Inner (edge split at near-boundary parameter).
+pub fn find_corner_touch_snap(
+    ic_endpoint: Point3,
+    boundary_vertex_positions: &[Point3],
+    tol: f64,
+) -> Option<Point3> {
+    let mut best_dist = tol;
+    let mut best_pos = None;
+    for &bv_pos in boundary_vertex_positions {
+        let dist = (ic_endpoint - bv_pos).magnitude();
+        if dist < best_dist {
+            best_dist = dist;
+            best_pos = Some(bv_pos);
+        }
+    }
+    best_pos
 }
 
 // ---------------------------------------------------------------------------
